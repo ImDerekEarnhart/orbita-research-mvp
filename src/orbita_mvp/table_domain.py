@@ -11,6 +11,8 @@ import pandas as pd
 
 from orbita_discovery.core import Candidate
 
+from .artifacts import detect_structural_relations, structural_for
+
 
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:48]
@@ -82,9 +84,33 @@ def generate_table_candidates(
     goal_columns = _goal_columns(goal, [str(c) for c in df.columns]) if goal.strip() else []
     scored: list[tuple[float, dict[str, Any]]] = []
 
+    # Detect structural / transform artifacts up front (column vs its own log,
+    # duplicates, unit conversions, derived fields) so they are recorded as
+    # artifacts rather than mined as ordinary scientific hypotheses.
+    structural = detect_structural_relations(df, numeric_columns=numeric_columns)
+    structural_relations: list[dict[str, Any]] = []
+    seen_structural: set[str] = set()
+
     for i, x in enumerate(numeric_columns):
         for y in numeric_columns[i + 1 :]:
             if goal_columns and not ({x, y} & set(goal_columns)):
+                continue
+            artifact = structural_for(structural, x, y)
+            if artifact is not None:
+                key = _candidate_id("structural", x, y)
+                if key not in seen_structural:
+                    seen_structural.add(key)
+                    structural_relations.append({
+                        "id": key,
+                        "statement": (
+                            f"{x} and {y} are structurally related "
+                            f"({artifact['kind']}): {artifact.get('detail', '')}."
+                        ),
+                        "kind": "structural_relation",
+                        "artifact_kind": artifact["kind"],
+                        "detail": artifact.get("detail", ""),
+                        "columns": [x, y],
+                    })
                 continue
             pair = scout[[x, y]].apply(pd.to_numeric, errors="coerce").dropna()
             if len(pair) < 5 or pair[x].nunique() < 3 or pair[y].nunique() < 3:
@@ -160,6 +186,8 @@ def generate_table_candidates(
         "goal_columns": goal_columns,
         "generated_candidates": len(candidates),
         "candidate_budget": max_candidates,
+        "structural_relations": structural_relations,
+        "structural_relation_count": len(structural_relations),
     }
     return candidates, generation
 

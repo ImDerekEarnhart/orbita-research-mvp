@@ -79,6 +79,7 @@ class ResearchCompiler:
             "quality_findings": quality_findings,
             "excluded_from_candidate_generation": identifier_columns,
             "candidate_generation": generation,
+            "structural_relations": generation.get("structural_relations", []),
             "routes": ["uploaded_table_association", "data_quality_audit", "belief_graph_import"],
             "thresholds": {
                 "commit_at": 0.25,

@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS case_claims (
     claim_id TEXT NOT NULL REFERENCES claims(id),
     finding_type TEXT NOT NULL,
     source_candidate_id TEXT,
+    finding_detail_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     PRIMARY KEY(case_id, claim_id, source_candidate_id)
 );
@@ -109,7 +110,23 @@ class CaseStore:
         self.workspace = Path(workspace).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.ledger.db.conn.executescript(CASE_SCHEMA)
+        self._migrate()
         self.ledger.db.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first deployed schema.
+
+        The Railway volume holds databases created before finding_detail_json
+        existed; CREATE TABLE IF NOT EXISTS will not add the column to them.
+        """
+        cols = {
+            row["name"]
+            for row in self.ledger.db.conn.execute("PRAGMA table_info(case_claims)").fetchall()
+        }
+        if "finding_detail_json" not in cols:
+            self.ledger.db.conn.execute(
+                "ALTER TABLE case_claims ADD COLUMN finding_detail_json TEXT NOT NULL DEFAULT '{}'"
+            )
 
     def create_case(
         self,
@@ -313,23 +330,95 @@ class CaseStore:
         claim_id: str,
         finding_type: str,
         source_candidate_id: str | None,
+        finding_detail: dict[str, Any] | None = None,
     ) -> None:
         self.ledger.db.conn.execute(
             """INSERT OR IGNORE INTO case_claims
-               (case_id, run_id, claim_id, finding_type, source_candidate_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (case_id, run_id, claim_id, finding_type, source_candidate_id, utcnow()),
+               (case_id, run_id, claim_id, finding_type, source_candidate_id, finding_detail_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (case_id, run_id, claim_id, finding_type, source_candidate_id,
+             stable_json(finding_detail or {}), utcnow()),
+        )
+        # If the row already existed (re-run), refresh its finding detail so the
+        # public verdict reflects the most recent evaluation.
+        self.ledger.db.conn.execute(
+            """UPDATE case_claims SET finding_type = ?, finding_detail_json = ?, run_id = ?
+               WHERE case_id = ? AND claim_id = ?
+                 AND IFNULL(source_candidate_id, '') = IFNULL(?, '')""",
+            (finding_type, stable_json(finding_detail or {}), run_id,
+             case_id, claim_id, source_candidate_id),
         )
         self.ledger.db.conn.commit()
 
     def case_claims(self, case_id: str) -> list[dict[str, Any]]:
+        from .semantics import public_state
+
         rows = self.ledger.db.conn.execute(
             """SELECT cc.*, c.canonical_text, c.status
                FROM case_claims cc JOIN claims c ON c.id = cc.claim_id
                WHERE cc.case_id = ? ORDER BY cc.created_at""",
             (case_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            detail = json.loads(item.pop("finding_detail_json", "{}") or "{}")
+            finding_type = item.get("finding_type")
+            verdict = public_state(finding_type)
+            # Keep the raw claim lifecycle status under internal_status; the
+            # public verdict is the spec-mandated state derived from finding_type.
+            item["internal_status"] = item.get("status")
+            item["verdict"] = verdict
+            # Affirmative candidate text must be labelled as a hypothesis once it
+            # is anything other than a committed finding.
+            item["hypothesis_text"] = detail.get("hypothesis_text") or item.get("canonical_text")
+            item["display_label"] = (
+                "Committed finding" if verdict == "committed" else "Candidate hypothesis"
+            )
+            # Surface the structured verdict fields at the top level.
+            for key in (
+                "verdict_reason", "passed_checks", "failed_checks", "candidate_score",
+                "baseline_score", "held_out_score", "cross_seed_summary",
+                "influence_warning", "final_status", "is_candidate_hypothesis",
+            ):
+                if key in detail:
+                    item[key] = detail[key]
+            item["finding_detail"] = detail
+            out.append(item)
+        return out
+
+    def case_claim_counts(self, case_id: str) -> dict[str, Any]:
+        """Aggregate counts for the case dashboard, including run candidate totals."""
+        from .semantics import public_state
+
+        claims = self.case_claims(case_id)
+        counts = {"committed": 0, "rejected": 0, "artifact": 0, "provisional": 0, "unresolved": 0}
+        for claim in claims:
+            state = public_state(claim.get("finding_type"))
+            counts[state] = counts.get(state, 0) + 1
+
+        # generated_candidates comes from the most recent run's engine metadata,
+        # never reported as zero when the run actually screened candidates.
+        generated = 0
+        structural = 0
+        runs = self.list_runs(case_id)
+        if runs:
+            result = runs[0].get("result", {}) or {}
+            generated = int(result.get("candidate_count", 0) or 0)
+            belief = result.get("belief_import", {}) or {}
+            structural = int(belief.get("artifact_count", 0) or 0)
+        persisted = len(claims)
+        return {
+            "generated_candidates": max(generated, persisted),
+            "persisted_findings": persisted,
+            "committed_count": counts["committed"],
+            "rejected_count": counts["rejected"],
+            "artifact_count": counts["artifact"],
+            "provisional_count": counts["provisional"],
+            "unresolved_count": counts["unresolved"],
+            "filtered_count": max(0, max(generated, persisted) - persisted),
+            "structural_relations_detected": structural,
+        }
 
     def add_report(self, case_id: str, run_id: str | None, *, format: str, path: str, content_hash: str) -> dict[str, Any]:
         report_id = new_id("report")

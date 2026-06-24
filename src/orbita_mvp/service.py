@@ -139,6 +139,7 @@ class ResearchMVP:
                 dataset_file=selected_file,
                 plan=plan,
                 result=engine_result,
+                dataframe=df,
             )
             graph = self.ledger.capture_graph(
                 name=f"Case {case_id} after run {run_record['id']}",
@@ -192,7 +193,11 @@ class ResearchMVP:
         dataset_file: dict[str, Any],
         plan: dict[str, Any],
         result: dict[str, Any],
+        dataframe: "pd.DataFrame | None" = None,
     ) -> dict[str, Any]:
+        from .influence import linear_influence_warning
+        from .semantics import derive_finding_record
+
         candidate_to_claim: dict[str, str] = {}
         claim_ids: list[str] = []
         for finding in result.get("findings", []):
@@ -250,9 +255,26 @@ class ResearchMVP:
             )
             finding_type = (
                 "robust_relation" if support and final_status == "supported"
-                else "candidate_relation" if support
+                else "promising_candidate" if support
                 else "falsified_candidate" if final_status == "refuted"
-                else "unresolved_candidate"
+                else "untestable_candidate"
+            )
+            # Flag findings that pass the thresholds but lean on a few
+            # high-leverage observations, so a leverage-dominated raw relation is
+            # not silently shown as strong as a transform-stable result.
+            influence_warning = None
+            if (
+                dataframe is not None
+                and payload.get("kind") == "linear_association"
+                and finding_type in {"robust_relation", "promising_candidate"}
+            ):
+                influence_warning = linear_influence_warning(
+                    dataframe,
+                    str(payload.get("predictor")),
+                    str(payload.get("outcome")),
+                )
+            detail = derive_finding_record(
+                finding, finding_type, influence_warning=influence_warning
             )
             self.store.link_claim(
                 case_id=case_id,
@@ -260,6 +282,7 @@ class ResearchMVP:
                 claim_id=claim_id,
                 finding_type=finding_type,
                 source_candidate_id=candidate["id"],
+                finding_detail=detail,
             )
 
         # Populate derivation edges after every candidate has a durable claim ID.
@@ -304,7 +327,55 @@ class ResearchMVP:
                 finding_type=item.get("type", "data_quality"),
                 source_candidate_id=f"quality:{index}",
             )
-        return {"claim_ids": list(dict.fromkeys(claim_ids)), "candidate_to_claim": candidate_to_claim}
+
+        # Record structural / transform artifacts (column vs its own log,
+        # duplicates, unit conversions, derived fields) as artifact claims so
+        # they are visible but never mined or displayed as scientific findings.
+        artifact_count = 0
+        for artifact in plan.get("structural_relations", []):
+            claim_id, _ = self.memory.resolve_or_create_claim(
+                artifact["statement"],
+                scope={
+                    "dataset_sha256": dataset_file["sha256"],
+                    "artifact_kind": artifact.get("artifact_kind"),
+                    "columns": artifact.get("columns"),
+                },
+                claim_type="structural_artifact",
+                metadata={"case_id": case_id, "artifact_kind": artifact.get("artifact_kind")},
+            )
+            evidence = self.ledger.add_evidence(
+                f"file://{dataset_file['stored_path']}",
+                artifact["statement"],
+                source_kind=EvidenceKind.DATASET,
+                independence_key=f"dataset:{dataset_file['sha256']}:{artifact['id']}",
+                content=json.dumps(artifact, sort_keys=True),
+                metadata={"case_id": case_id, "artifact_kind": artifact.get("artifact_kind")},
+            )
+            # Artifacts are structural facts about the table, not contested claims.
+            self.ledger.attest(claim_id, evidence, Stance.SUPPORT, actor="artifact-detector", actor_role=ActorRole.TOOL)
+            claim_ids.append(claim_id)
+            self.store.link_claim(
+                case_id=case_id,
+                run_id=case_run_id,
+                claim_id=claim_id,
+                finding_type="artifact",
+                source_candidate_id=artifact["id"],
+                finding_detail={
+                    "hypothesis_text": artifact["statement"],
+                    "finding_type": "artifact",
+                    "verdict": "artifact",
+                    "artifact_kind": artifact.get("artifact_kind"),
+                    "detail": artifact.get("detail", ""),
+                    "is_candidate_hypothesis": True,
+                },
+            )
+            artifact_count += 1
+
+        return {
+            "claim_ids": list(dict.fromkeys(claim_ids)),
+            "candidate_to_claim": candidate_to_claim,
+            "artifact_count": artifact_count,
+        }
 
     # ------------------------------------------------------------------
     # Belief memory facade

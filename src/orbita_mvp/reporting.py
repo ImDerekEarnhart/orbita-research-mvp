@@ -147,12 +147,17 @@ class ReportCompiler:
             "",
         ]
         if claim_rows:
-            lines.append("| Claim ID | Status | Finding type | Statement |")
+            lines.append("| Claim ID | Verdict | Finding type | Statement |")
             lines.append("|---|---|---|---|")
             for row in claim_rows:
                 safe_text = row['canonical_text'].replace('|', r'\|')
+                # Prefer the public verdict; for non-committed findings the
+                # affirmative text is a candidate hypothesis, not a conclusion.
+                verdict = row.get('verdict', row.get('status'))
+                if verdict != 'committed':
+                    safe_text = f"_(candidate)_ {safe_text}"
                 lines.append(
-                    f"| `{row['claim_id']}` | {row['status']} | {row['finding_type']} | {safe_text} |"
+                    f"| `{row['claim_id']}` | {verdict} | {row['finding_type']} | {safe_text} |"
                 )
         if reexamination:
             lines += ["", "### Re-examination queue", ""]

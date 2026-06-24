@@ -243,7 +243,10 @@ def claim_history(claim_id: str) -> dict[str, Any]:
 @app.get("/cases/{case_id}/claims")
 def case_claims(case_id: str) -> dict[str, Any]:
     _guard(service.store.get_case, case_id)
-    return {"claims": service.store.case_claims(case_id)}
+    return {
+        "claims": service.store.case_claims(case_id),
+        "counts": service.store.case_claim_counts(case_id),
+    }
 
 
 @app.get("/claims/{claim_id}/impact")

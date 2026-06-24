@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from .semantics import public_state
+
 
 # ---------------------------------------------------------------------------
 # Data builders
@@ -16,7 +18,8 @@ def build_graph_data(case_id: str, conn: Any) -> dict[str, Any]:
 
     claim_rows = conn.execute(
         """SELECT cc.claim_id, cc.finding_type, cc.run_id AS case_run_id,
-                  c.canonical_text, c.status, c.claim_type, c.created_at
+                  cc.finding_detail_json, c.canonical_text, c.status,
+                  c.claim_type, c.created_at
            FROM case_claims cc
            JOIN claims c ON c.id = cc.claim_id
            WHERE cc.case_id = ?
@@ -39,15 +42,31 @@ def build_graph_data(case_id: str, conn: Any) -> dict[str, Any]:
     for r in claim_rows:
         text = r["canonical_text"]
         label = (text[:55] + "…") if len(text) > 55 else text
+        state = public_state(r["finding_type"])
+        # Affirmative candidate text is only an established conclusion once
+        # committed; otherwise label it as a candidate hypothesis.
+        display_label = "Committed finding" if state == "committed" else "Candidate hypothesis"
+        try:
+            detail = json.loads(r["finding_detail_json"] or "{}")
+        except (TypeError, ValueError):
+            detail = {}
         add_node({
             "id": r["claim_id"],
             "label": label,
             "type": "claim",
             "status": r["status"],
+            "public_state": state,
+            "display_label": display_label,
             "finding_type": r["finding_type"],
             "full_text": text,
             "claim_type": r["claim_type"],
             "created_at": r["created_at"],
+            "candidate_score": detail.get("candidate_score"),
+            "baseline_score": detail.get("baseline_score"),
+            "held_out_score": detail.get("held_out_score"),
+            "cross_seed_summary": detail.get("cross_seed_summary"),
+            "verdict_reason": detail.get("verdict_reason"),
+            "influence_warning": detail.get("influence_warning"),
         })
 
     # --- Source file nodes ---
@@ -430,6 +449,9 @@ body{background:var(--bg);color:var(--text);font-family:Inter,"Segoe UI",Arial,s
 #case-sel{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;font-size:12px;min-width:200px;cursor:pointer}
 #case-sel:focus{outline:none;border-color:var(--accent)}
 #graph-info{font-size:11px;color:var(--dim);white-space:nowrap}
+#filter-toggle{background:var(--bg);border:1px solid var(--border);color:var(--dim);padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer;white-space:nowrap;transition:all .15s;font-family:inherit}
+#filter-toggle:hover{color:var(--text);border-color:var(--accent)}
+#filter-toggle.on{background:#0e2433;color:var(--accent);border-color:var(--accent)}
 #status{margin-left:auto;font-size:11px;padding:3px 10px;border-radius:12px;background:#0e2010;color:#4ade80;border:1px solid #16a34a44;white-space:nowrap;transition:all .3s}
 #status.offline{background:#200e0e;color:#f87171;border-color:#dc262644}
 #status.connecting{background:#1e1a08;color:#fbbf24;border-color:#d9770644}
@@ -486,6 +508,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
   <div id="hdr-logo">ORBITA <span>·</span> Belief Graph</div>
   <select id="case-sel" onchange="switchCase(this.value)"><option value="">Select case…</option></select>
   <span id="graph-info"></span>
+  <button id="filter-toggle" onclick="toggleCandidates()">Show all candidates</button>
   <div id="status" class="connecting">● Connecting…</div>
 </div>
 
@@ -501,15 +524,15 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
     <div id="network"></div>
     <div id="legend">
       <div class="lg-grp">
-        <h4>Nodes</h4>
-        <div class="lg-item"><div class="ld" style="background:#22c55e"></div>Claim – supported</div>
-        <div class="lg-item"><div class="ld" style="background:#3b82f6"></div>Claim – committed</div>
-        <div class="lg-item"><div class="ld" style="background:#f59e0b"></div>Claim – challenged</div>
-        <div class="lg-item"><div class="ld" style="background:#ef4444"></div>Claim – refuted</div>
+        <h4>Findings</h4>
+        <div class="lg-item"><div class="ld" style="background:#22c55e"></div>Committed</div>
+        <div class="lg-item"><div class="ld" style="background:#ef4444"></div>Rejected</div>
+        <div class="lg-item"><div class="ld" style="background:#f97316"></div>Artifact</div>
+        <div class="lg-item"><div class="ld" style="background:#eab308"></div>Provisional</div>
+        <div class="lg-item"><div class="ld" style="background:#6b7280"></div>Unresolved</div>
         <div class="lg-item"><div class="ld" style="background:#8b5cf6"></div>Evidence</div>
         <div class="lg-item"><div class="ld" style="background:#0ea5e9"></div>Analysis Run</div>
         <div class="lg-item"><div class="ld" style="background:#14b8a6"></div>Source File</div>
-        <div class="lg-item"><div class="ld" style="background:#f97316"></div>Re-examination</div>
       </div>
       <div class="lg-grp">
         <h4>Edges</h4>
@@ -547,21 +570,23 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 var caseId = null, network = null, nodesDS = null, edgesDS = null;
 var selNodeId = null, selNodeData = null, curTab = 'overview';
 var evCursor = '', graphTimer = null, evTimer = null, graphData = null;
+var showAllCandidates = false;
+var REPRESENTATIVE_SUBSET = 6;  // rejected/artifact shown by default
 
 // ---- Node/edge styling ----
 var NODE_CLR = {
-  claim_supported:  {background:'#22c55e',border:'#16a34a'},
-  claim_committed:  {background:'#3b82f6',border:'#2563eb'},
-  claim_challenged: {background:'#f59e0b',border:'#d97706'},
-  claim_refuted:    {background:'#ef4444',border:'#dc2626'},
-  claim_superseded: {background:'#6b21a8',border:'#581c87'},
-  claim_pending:    {background:'#4b5568',border:'#374151'},
-  claim_:           {background:'#4b5568',border:'#374151'},
+  // Public epistemic states (spec colors).
+  state_committed:   {background:'#22c55e',border:'#16a34a'},  // green
+  state_rejected:    {background:'#ef4444',border:'#dc2626'},  // red
+  state_artifact:    {background:'#f97316',border:'#ea580c'},  // orange
+  state_provisional: {background:'#eab308',border:'#ca8a04'},  // yellow
+  state_unresolved:  {background:'#6b7280',border:'#4b5563'},  // gray
+  state_:            {background:'#6b7280',border:'#4b5563'},
   evidence:         {background:'#8b5cf6',border:'#7c3aed'},
   evidence_rev:     {background:'#3b2b6b',border:'#2b1b5b'},
   analysis_run:     {background:'#0ea5e9',border:'#0284c7'},
   source:           {background:'#14b8a6',border:'#0d9488'},
-  reexamination:    {background:'#f97316',border:'#ea580c'},
+  reexamination:    {background:'#f59e0b',border:'#d97706'},
 };
 var EDGE_CLR = {
   supports:     '#22c55e', refutes:      '#ef4444',
@@ -571,12 +596,12 @@ var EDGE_CLR = {
   source_of:    '#14b8a6',
 };
 var STATUS_CLR = {
-  supported:  {bg:'#14532d',fg:'#4ade80',brd:'#16a34a'},
-  committed:  {bg:'#1e3a5f',fg:'#60a5fa',brd:'#2563eb'},
-  challenged: {bg:'#451a03',fg:'#fcd34d',brd:'#d97706'},
-  refuted:    {bg:'#450a0a',fg:'#f87171',brd:'#dc2626'},
-  superseded: {bg:'#2e1065',fg:'#c084fc',brd:'#7c3aed'},
-  pending:    {bg:'#1f2937',fg:'#9ca3af',brd:'#4b5563'},
+  committed:   {bg:'#14532d',fg:'#4ade80',brd:'#16a34a'},
+  rejected:    {bg:'#450a0a',fg:'#f87171',brd:'#dc2626'},
+  artifact:    {bg:'#431407',fg:'#fb923c',brd:'#ea580c'},
+  provisional: {bg:'#422006',fg:'#facc15',brd:'#ca8a04'},
+  unresolved:  {bg:'#1f2937',fg:'#9ca3af',brd:'#4b5563'},
+  pending:     {bg:'#1f2937',fg:'#9ca3af',brd:'#4b5563'},
 };
 
 // ---- Init vis.js ----
@@ -605,15 +630,38 @@ function initNetwork() {
 }
 
 // ---- Vis node/edge builders ----
-function visNode(n) {
-  var ck = n.type==='claim' ? 'claim_'+(n.status||'') : n.type==='evidence' ? (n.active===false?'evidence_rev':'evidence') : n.type;
-  var clr = NODE_CLR[ck] || NODE_CLR['claim_'];
+function visNode(n, hidden) {
+  var ck = n.type==='claim' ? 'state_'+(n.public_state||'') : n.type==='evidence' ? (n.active===false?'evidence_rev':'evidence') : n.type;
+  var clr = NODE_CLR[ck] || NODE_CLR['state_'];
   var shapes = {claim:'ellipse',evidence:'box',analysis_run:'diamond',source:'triangleDown',reexamination:'star'};
   var lbl = (n.label||n.id||'');
   if(lbl.length>34) lbl=lbl.substring(0,32)+'…';
   return {id:n.id,label:lbl,shape:shapes[n.type]||'ellipse',color:clr,
           size:n.type==='analysis_run'?22:n.type==='source'?18:16,
+          hidden:!!hidden,
           title:n.full_text||n.label||n.id,_raw:n};
+}
+
+// Default view: every committed finding, plus a representative subset of
+// rejected/artifact/other candidates. Supporting nodes (evidence, runs,
+// sources) stay visible only when wired to a visible claim.
+function computeVisible(d) {
+  if(showAllCandidates) return null;  // null => everything visible
+  var visible = new Set();
+  var shown = {rejected:0, artifact:0, provisional:0, unresolved:0};
+  d.nodes.forEach(function(n){
+    if(n.type!=='claim') return;
+    var st = n.public_state||'unresolved';
+    if(st==='committed'){ visible.add(n.id); return; }
+    if(shown[st]!==undefined && shown[st]<REPRESENTATIVE_SUBSET){ shown[st]++; visible.add(n.id); }
+  });
+  // Always keep runs and sources; keep evidence/reexam attached to a visible claim.
+  d.nodes.forEach(function(n){ if(n.type==='analysis_run'||n.type==='source') visible.add(n.id); });
+  d.edges.forEach(function(e){
+    if(visible.has(e.from)) visible.add(e.to);
+    if(visible.has(e.to)) visible.add(e.from);
+  });
+  return visible;
 }
 function visEdge(e) {
   var c = EDGE_CLR[e.type]||'#4b5568';
@@ -679,7 +727,9 @@ async function loadGraph() {
 }
 
 function applyGraph(d) {
-  var vn=d.nodes.map(visNode), ve=d.edges.map(visEdge);
+  var visible = computeVisible(d);
+  var vn=d.nodes.map(function(n){return visNode(n, visible && !visible.has(n.id));});
+  var ve=d.edges.map(visEdge);
   var exN=new Set(nodesDS.getIds()), exE=new Set(edgesDS.getIds());
   var addN=[],updN=[],addE=[],updE=[];
   vn.forEach(function(n){(exN.has(n.id)?updN:addN).push(n);});
@@ -716,6 +766,15 @@ function prependEvents(evs) {
   while(list.children.length>120) list.removeChild(list.lastChild);
 }
 
+// ---- Candidate filter ----
+function toggleCandidates(){
+  showAllCandidates=!showAllCandidates;
+  var btn=document.getElementById('filter-toggle');
+  btn.textContent=showAllCandidates?'Showing all candidates':'Show all candidates';
+  btn.className=showAllCandidates?'on':'';
+  if(graphData) applyGraph(graphData);
+}
+
 // ---- Polling ----
 function startPolling(){
   graphTimer=setInterval(loadGraph,5000);
@@ -730,9 +789,10 @@ function openDrawer(nodeId) {
   selNodeId=nodeId; selNodeData=n;
   document.getElementById('drawer').classList.add('open');
   document.getElementById('drw-title-text').textContent=n.full_text||n.label||nodeId;
-  var sc = STATUS_CLR[n.status]||STATUS_CLR.pending;
+  var verdict = n.type==='claim' ? (n.public_state||'unresolved') : n.status;
+  var sc = STATUS_CLR[verdict]||STATUS_CLR.pending;
   var badge=document.getElementById('drw-badge');
-  badge.textContent=(n.type||'')+(n.status?' · '+n.status:'');
+  badge.textContent=(n.type||'')+(verdict?' · '+verdict:'');
   badge.style.cssText='background:'+sc.bg+';color:'+sc.fg+';border:1px solid '+sc.brd+';font-size:10px;padding:2px 7px;border-radius:10px;display:inline-block;margin-top:5px';
   switchTab('overview');
 }
@@ -756,10 +816,25 @@ function switchTab(tab) {
 function renderOverview(n) {
   var h='';
   if(n.type==='claim'){
-    h+=row('Status','<span style="color:'+((STATUS_CLR[n.status]||STATUS_CLR.pending).fg)+'">'+esc(n.status||'—')+'</span>');
+    var st=n.public_state||'unresolved';
+    var scf=(STATUS_CLR[st]||STATUS_CLR.pending).fg;
+    h+=row('Verdict','<span style="color:'+scf+';font-weight:600">'+esc(st)+'</span>');
+    var stmtLabel = st==='committed' ? 'Statement' : 'Candidate hypothesis';
+    h+=row(stmtLabel,'<span style="line-height:1.55">'+esc(n.full_text||'')+'</span>');
     h+=row('Finding type',esc(n.finding_type||'—'));
+    if(n.verdict_reason) h+=row('Why','<span style="line-height:1.5;color:var(--dim)">'+esc(n.verdict_reason)+'</span>');
+    if(n.influence_warning){
+      var iw=n.influence_warning;
+      h+='<div class="dr"><div class="dl" style="color:#fb923c">⚠ Influence warning</div><div class="dv" style="line-height:1.5">'+esc(iw.message||'High-leverage dominance')+
+         '<div style="color:var(--dim);font-size:10px;margin-top:4px">R² full '+esc(iw.r2_full)+' → '+esc(iw.r2_without_dominant)+' without dominant point · Cook&#39;s D '+esc(iw.max_cooks_distance)+'</div></div></div>';
+    }
+    var scores=[];
+    if(n.candidate_score!=null) scores.push('candidate '+(+n.candidate_score).toFixed(3));
+    if(n.baseline_score!=null) scores.push('baseline '+(+n.baseline_score).toFixed(3));
+    if(n.held_out_score!=null) scores.push('held-out '+(+n.held_out_score).toFixed(3));
+    if(n.cross_seed_summary&&n.cross_seed_summary.median!=null) scores.push('cross-seed median '+(+n.cross_seed_summary.median).toFixed(3));
+    if(scores.length) h+=row('Check scores','<span style="color:var(--dim)">'+esc(scores.join(' · '))+'</span>');
     h+=row('Claim type',esc(n.claim_type||'—'));
-    h+=row('Statement','<span style="line-height:1.55">'+esc(n.full_text||'')+'</span>');
     h+=row('Created',fmt(n.created_at));
     h+='<div style="margin-top:8px"><a href="/claims/'+n.id+'/history" target="_blank">Full history →</a>&nbsp;&nbsp;<a href="/claims/'+n.id+'/impact" target="_blank">Impact →</a></div>';
   } else if(n.type==='evidence'){
