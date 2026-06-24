@@ -15,8 +15,9 @@ from orbita import EvidenceKind, Stance
 from .service import ResearchMVP
 
 
-DB_PATH = Path(os.getenv("ORBITA_MVP_DB", "/data/orbita_mvp.db"))
-WORKSPACE = Path(os.getenv("ORBITA_MVP_WORKSPACE", "/data/orbita_workspace"))
+_data_dir = Path("/data") if Path("/data").exists() else Path(".")
+DB_PATH = Path(os.getenv("ORBITA_MVP_DB", str(_data_dir / "orbita_mvp.db")))
+WORKSPACE = Path(os.getenv("ORBITA_MVP_WORKSPACE", str(_data_dir / "orbita_workspace")))
 service = ResearchMVP(DB_PATH, WORKSPACE)
 
 app = FastAPI(
@@ -28,6 +29,11 @@ app = FastAPI(
         "an expert-readable dossier."
     ),
 )
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"service": "Orbita Research MVP", "version": "0.1.0", "docs": "/docs"}
 
 
 class CaseCreate(BaseModel):
