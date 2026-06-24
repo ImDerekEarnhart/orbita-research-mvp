@@ -31,11 +31,6 @@ class ResearchCompiler:
             }
         selected = max(tables, key=lambda item: int(item.get("profile", {}).get("rows", 0)))
         df = pd.read_csv(Path(selected["extracted_path"]))
-        candidates, generation = generate_table_candidates(
-            df,
-            goal=case.get("goal", ""),
-            max_candidates=max_candidates,
-        )
         profile = selected.get("profile", {})
         assumptions = [
             {
@@ -60,6 +55,12 @@ class ResearchCompiler:
         identifier_columns = [
             c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "identifier"
         ]
+        candidates, generation = generate_table_candidates(
+            df,
+            goal=case.get("goal", ""),
+            max_candidates=max_candidates,
+            exclude_columns=identifier_columns,
+        )
         quality_findings = self._quality_findings(profile)
         return {
             "schema_version": "orbita-research-plan/0.1",

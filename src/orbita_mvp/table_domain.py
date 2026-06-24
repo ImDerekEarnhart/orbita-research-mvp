@@ -61,9 +61,11 @@ def generate_table_candidates(
     max_candidates: int = 60,
     scout_fraction: float = 0.6,
     seed: int = 20260623,
+    exclude_columns: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if len(df) < 6:
         raise ValueError("At least 6 rows are required for discovery and held-out checking")
+    _exclude: set[str] = set(exclude_columns or [])
     rng = random.Random(seed)
     indices = list(range(len(df)))
     rng.shuffle(indices)
@@ -73,6 +75,8 @@ def generate_table_candidates(
     numeric_columns = []
     categorical_columns = []
     for column in df.columns:
+        if str(column) in _exclude:
+            continue
         name = str(column)
         numeric_fraction = float(pd.to_numeric(df[column], errors="coerce").notna().mean())
         unique = int(df[column].nunique(dropna=True))

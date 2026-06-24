@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import csv
+import io
 import os
 import secrets
 import shutil
@@ -8,8 +10,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from orbita import EvidenceKind, Stance
@@ -289,6 +293,146 @@ def download_report_artifact(case_id: str, role: str):
             media = {"html": "text/html", "markdown": "text/markdown", "json": "application/json"}.get(role, "application/octet-stream")
             return FileResponse(artifact["path"], media_type=media, filename=Path(artifact["path"]).name)
     raise HTTPException(status_code=404, detail=f"No {role} report artifact exists for this case")
+
+
+@app.get("/runs/{run_id}/ledger")
+def download_ledger(run_id: str):
+    """Download the hash-chained JSONL discovery ledger for a run."""
+    run = _guard(service.store.get_run, run_id)
+    ledger_path = run.get("result", {}).get("ledger_path") or run.get("ledger_path")
+    if not ledger_path or not Path(ledger_path).exists():
+        raise HTTPException(status_code=404, detail="Ledger file not found for this run")
+    return FileResponse(ledger_path, media_type="application/x-ndjson", filename=f"{run_id}_ledger.jsonl")
+
+
+@app.post("/runs/{run_id}/predict")
+async def predict(
+    run_id: str,
+    file: UploadFile = File(...),
+    target_column: str = Query(..., description="Name of the outcome column to predict (must match training data)"),
+    identifier_column: str = Query("row_id", description="Column to use as row identifier in output (not used as a feature)"),
+) -> StreamingResponse:
+    """Apply committed survivors from a run to a new dataset; returns row_id,predicted_y CSV.
+
+    Re-reads the original training CSV and refits each surviving linear model on the full
+    training set to produce final coefficients. For group-difference survivors, uses the
+    group means from the full training set. The top-scoring survivor predicting target_column
+    is used. Row identifier is preserved in output; it is never used as a predictor.
+    """
+    run = _guard(service.store.get_run, run_id)
+    result = run.get("result", {})
+    findings = result.get("findings", [])
+    if not findings:
+        raise HTTPException(status_code=422, detail="Run has no findings (run may have failed)")
+
+    # Identify survivors whose outcome is the requested target
+    accepted = {"supported", "challenged", "provisional"}
+    target_survivors = [
+        f for f in findings
+        if f["final_status"] in accepted
+        and not any(a["killed"] for a in f["falsifications"])
+        and f["candidate"]["payload"].get("outcome") == target_column
+    ]
+    if not target_survivors:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No surviving candidate predicts '{target_column}'. "
+                   f"Available outcomes in survivors: "
+                   f"{sorted({f['candidate']['payload'].get('outcome') for f in findings if f['final_status'] in accepted and not any(a['killed'] for a in f['falsifications'])})}"
+        )
+
+    # Pick best survivor (highest verdict score)
+    best = max(target_survivors, key=lambda f: f["verdict"]["score"])
+    payload = best["candidate"]["payload"]
+    kind = payload["kind"]
+
+    # Re-read training data and refit on full training set
+    plan_record = service.store.get_plan(run["plan_id"]) if run.get("plan_id") else None
+    if not plan_record:
+        # fall back: find plan via case
+        case_id = run.get("case_id")
+        if case_id:
+            case = service.store.get_case(case_id)
+            if case.get("plans"):
+                plan_record = case["plans"][0]
+    if not plan_record:
+        raise HTTPException(status_code=422, detail="Cannot locate training plan for this run")
+
+    train_path = plan_record["plan"].get("selected_dataset", {}).get("normalized_path")
+    if not train_path or not Path(train_path).exists():
+        raise HTTPException(status_code=422, detail="Training CSV is no longer available on this server")
+
+    train_df = pd.read_csv(train_path)
+
+    # Refit on full training set (not just scout partition)
+    from .table_domain import UploadedTableDomain
+    from orbita_discovery.core import Candidate
+    c = Candidate(id=best["candidate"]["id"], statement=best["candidate"]["statement"], payload=payload)
+
+    domain = UploadedTableDomain(train_df, [best["candidate"]])
+    model = domain.refit(c, train_df)
+    if not model.get("valid"):
+        raise HTTPException(status_code=422, detail="Refitting the survivor on training data produced an invalid model")
+
+    # Load test CSV
+    suffix = Path(file.filename or "test.csv").suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = Path(tmp.name)
+    try:
+        test_df = pd.read_csv(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if identifier_column not in test_df.columns:
+        raise HTTPException(status_code=422, detail=f"identifier_column '{identifier_column}' not found in test file")
+
+    # Generate predictions row by row
+    row_ids = test_df[identifier_column].tolist()
+    predictions: list[float | None] = []
+
+    if kind == "linear_association":
+        predictor = payload["predictor"]
+        if predictor not in test_df.columns:
+            raise HTTPException(status_code=422, detail=f"Predictor column '{predictor}' not found in test file")
+        xs = pd.to_numeric(test_df[predictor], errors="coerce")
+        preds = model["intercept"] + model["slope"] * xs
+        predictions = [None if not np.isfinite(v) else round(float(v), 8) for v in preds]
+
+    elif kind == "group_difference":
+        group_col = payload["group"]
+        if group_col not in test_df.columns:
+            raise HTTPException(status_code=422, detail=f"Group column '{group_col}' not found in test file")
+        predictions = [
+            model["means"].get(str(g), model["overall"])
+            for g in test_df[group_col].astype(str)
+        ]
+    else:
+        raise HTTPException(status_code=422, detail=f"Unsupported survivor kind for prediction: {kind}")
+
+    # Build CSV output
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([identifier_column, f"predicted_{target_column}"])
+    for rid, pred in zip(row_ids, predictions):
+        writer.writerow([rid, pred if pred is not None else ""])
+    output.seek(0)
+
+    provenance_header = (
+        f"run_id={run_id}; "
+        f"candidate_id={best['candidate']['id']}; "
+        f"kind={kind}; "
+        f"verdict_score={best['verdict']['score']:.6f}; "
+        f"candidate_sha256={best['sha256']}"
+    )
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode()),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{run_id}_predictions.csv"',
+            "X-Orbita-Provenance": provenance_header,
+        },
+    )
 
 
 @app.get("/claims/{claim_id}/history")
