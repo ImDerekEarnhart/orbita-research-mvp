@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import base64
 import os
+import secrets
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from orbita import EvidenceKind, Stance
@@ -30,6 +32,30 @@ app = FastAPI(
         "an expert-readable dossier."
     ),
 )
+
+_DEMO_USER = os.getenv("ORBITA_DEMO_USER", "")
+_DEMO_PASS = os.getenv("ORBITA_DEMO_PASS", "")
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    # Auth only enforced when both env vars are set.
+    if not (_DEMO_USER and _DEMO_PASS):
+        return await call_next(request)
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth[6:]).decode("utf-8")
+            user, _, pw = decoded.partition(":")
+            if secrets.compare_digest(user, _DEMO_USER) and secrets.compare_digest(pw, _DEMO_PASS):
+                return await call_next(request)
+        except Exception:
+            pass
+    return Response(
+        content="Unauthorized",
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="Orbita Demo"'},
+    )
 
 
 @app.get("/")
