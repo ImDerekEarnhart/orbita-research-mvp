@@ -150,8 +150,9 @@ class ReportCompiler:
             lines.append("| Claim ID | Status | Finding type | Statement |")
             lines.append("|---|---|---|---|")
             for row in claim_rows:
+                safe_text = row['canonical_text'].replace('|', r'\|')
                 lines.append(
-                    f"| `{row['claim_id']}` | {row['status']} | {row['finding_type']} | {row['canonical_text'].replace('|', '\\|')} |"
+                    f"| `{row['claim_id']}` | {row['status']} | {row['finding_type']} | {safe_text} |"
                 )
         if reexamination:
             lines += ["", "### Re-examination queue", ""]
