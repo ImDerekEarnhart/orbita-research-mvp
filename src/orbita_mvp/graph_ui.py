@@ -644,8 +644,9 @@ async function loadCases() {
     var urlCase = params.get('case_id');
     if(urlCase && caseId!==urlCase){sel.value=urlCase;switchCase(urlCase);}
     else if(!caseId && cases.length===1){sel.value=cases[0].id;switchCase(cases[0].id);}
+    else if(!caseId){document.getElementById('loading').className='hidden';if(!cases.length)document.getElementById('no-case').className='show';}
     setStatus('live');
-  } catch(e){setStatus('offline');}
+  } catch(e){console.error('loadCases:',e);setStatus('offline');document.getElementById('loading').className='hidden';}
 }
 
 function switchCase(id) {
@@ -670,7 +671,11 @@ async function loadGraph() {
     document.getElementById('loading').className='hidden';
     var m=graphData.meta||{};
     document.getElementById('graph-info').textContent = (m.claim_count||0)+' claims · '+graphData.nodes.length+' nodes · '+graphData.edges.length+' edges';
-  } catch(e){setStatus('offline');}
+  } catch(e){
+    console.error('loadGraph:',e);setStatus('offline');
+    document.getElementById('loading').className='hidden';
+    if(!graphData){var nc=document.getElementById('no-case');nc.className='show';nc.innerHTML='<h2 style="color:var(--text);font-size:18px">Graph Unavailable</h2><p style="max-width:290px;margin-top:6px">Could not reach <code>/cases/{id}/graph</code>. The service may still be deploying, or the case ID may not exist in this database.<br><br><a href="javascript:void(0)" onclick="document.getElementById(\'no-case\').className=\'\';document.getElementById(\'loading\').className=\'\';loadGraph()" style="color:var(--accent)">Retry →</a></p>';}
+  }
 }
 
 function applyGraph(d) {
