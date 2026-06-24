@@ -1,0 +1,8 @@
+[phases.install]
+cmds = ["pip install --upgrade build setuptools"]
+
+[phases.build]
+cmds = ["pip install ."]
+
+[start]
+cmd = "orbita-research-api"
