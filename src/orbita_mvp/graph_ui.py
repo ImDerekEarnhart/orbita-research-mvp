@@ -722,7 +722,7 @@ async function loadGraph() {
   } catch(e){
     console.error('loadGraph:',e);setStatus('offline');
     document.getElementById('loading').className='hidden';
-    if(!graphData){var nc=document.getElementById('no-case');nc.className='show';nc.innerHTML='<h2 style="color:var(--text);font-size:18px">Graph Unavailable</h2><p style="max-width:290px;margin-top:6px">Could not reach <code>/cases/{id}/graph</code>. The service may still be deploying, or the case ID may not exist in this database.<br><br><a href="javascript:void(0)" onclick="document.getElementById(\'no-case\').className=\'\';document.getElementById(\'loading\').className=\'\';loadGraph()" style="color:var(--accent)">Retry →</a></p>';}
+    if(!graphData){var nc=document.getElementById('no-case');nc.className='show';nc.innerHTML='<h2 style="color:var(--text);font-size:18px">Graph Unavailable</h2><p style="max-width:290px;margin-top:6px">Could not reach <code>/cases/{id}/graph</code>. The service may still be deploying, or the case ID may not exist in this database.<br><br><a href="javascript:void(0)" onclick="retryGraph()" style="color:var(--accent)">Retry →</a></p>';}
   }
 }
 
@@ -940,6 +940,7 @@ function jumpTo(nodeId) {
 }
 
 // ---- Utils ----
+function retryGraph(){document.getElementById('no-case').className='';document.getElementById('loading').className='';loadGraph();}
 function row(lbl,val){return '<div class="dr"><div class="dl">'+lbl+'</div><div class="dv">'+val+'</div></div>';}
 function setBody(h){document.getElementById('drw-body').innerHTML=h;}
 function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
