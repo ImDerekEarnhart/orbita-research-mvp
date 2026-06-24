@@ -39,8 +39,9 @@ _DEMO_PASS = os.getenv("ORBITA_DEMO_PASS", "")
 
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
-    # Auth only enforced when both env vars are set.
     if not (_DEMO_USER and _DEMO_PASS):
+        return await call_next(request)
+    if request.url.path in ("/health", "/healthz"):
         return await call_next(request)
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Basic "):
