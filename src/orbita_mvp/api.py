@@ -151,6 +151,21 @@ def update_case(case_id: str, request: CaseUpdate) -> dict[str, Any]:
     return _guard(service.store.get_case, case_id)
 
 
+class FileUpdate(BaseModel):
+    original_name: str
+
+
+@app.patch("/cases/{case_id}/files/{file_id}")
+def update_file(case_id: str, file_id: str, request: FileUpdate) -> dict[str, Any]:
+    _guard(service.store.get_case, case_id)
+    service.store.ledger.db.conn.execute(
+        "UPDATE case_files SET original_name = ? WHERE id = ? AND case_id = ?",
+        (request.original_name.strip(), file_id, case_id),
+    )
+    service.store.ledger.db.conn.commit()
+    return _guard(service.store.get_case, case_id)
+
+
 @app.post("/cases/{case_id}/files")
 def upload_file(case_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
     suffix = Path(file.filename or "upload.bin").suffix
