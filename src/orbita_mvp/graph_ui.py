@@ -547,6 +547,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 var caseId = null, network = null, nodesDS = null, edgesDS = null;
 var selNodeId = null, selNodeData = null, curTab = 'overview';
 var evCursor = '', graphTimer = null, evTimer = null, graphData = null;
+var graphFirstLoaded = false;
 
 // ---- Node/edge styling ----
 var NODE_CLR = {
@@ -590,9 +591,9 @@ function initNetwork() {
            smooth:{enabled:true,type:'curvedCW',roundness:.12}},
     physics:{solver:'forceAtlas2Based',forceAtlas2Based:{gravitationalConstant:-90,centralGravity:.012,
            springLength:130,springConstant:.05,damping:.55,avoidOverlap:.8},
-           stabilization:{iterations:220,updateInterval:25}},
+           stabilization:{iterations:150,updateInterval:50}},
     interaction:{hover:true,tooltipDelay:150},
-    layout:{improvedLayout:true},
+    layout:{improvedLayout:false},
   };
   network = new vis.Network(document.getElementById('network'),{nodes:nodesDS,edges:edgesDS},opts);
   network.on('click',function(p){
@@ -601,6 +602,10 @@ function initNetwork() {
   });
   network.on('stabilizationIterationsDone',function(){
     network.setOptions({physics:{stabilization:false}});
+    if(!graphFirstLoaded){
+      graphFirstLoaded=true;
+      document.getElementById('loading').className='hidden';
+    }
   });
 }
 
@@ -652,7 +657,7 @@ async function loadCases() {
 function switchCase(id) {
   if(!id){document.getElementById('no-case').className='show';document.getElementById('loading').className='hidden';return;}
   document.getElementById('no-case').className='';
-  caseId=id; evCursor='';
+  caseId=id; evCursor=''; graphFirstLoaded=false;
   var url=new URL(window.location); url.searchParams.set('case_id',id); window.history.replaceState({},'',url);
   stopPolling();
   document.getElementById('loading').className='';
@@ -668,7 +673,11 @@ async function loadGraph() {
     graphData = await r.json();
     applyGraph(graphData);
     setStatus('live');
-    document.getElementById('loading').className='hidden';
+    // Loading overlay is hidden by stabilizationIterationsDone on first load.
+    // For subsequent polls, graphFirstLoaded is already true so we skip it.
+    if(graphFirstLoaded) document.getElementById('loading').className='hidden';
+    // Safety: if stabilization hasn't fired in 8s, force-hide anyway.
+    if(!graphFirstLoaded) setTimeout(function(){if(!graphFirstLoaded){graphFirstLoaded=true;document.getElementById('loading').className='hidden';}},8000);
     var m=graphData.meta||{};
     document.getElementById('graph-info').textContent = (m.claim_count||0)+' claims · '+graphData.nodes.length+' nodes · '+graphData.edges.length+' edges';
   } catch(e){
