@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from orbita import EvidenceKind, Stance
 
+from .graph_ui import GRAPH_HTML, build_events, build_graph_data
 from .service import ResearchMVP
 
 
@@ -315,6 +316,23 @@ def reexamination() -> dict[str, Any]:
 @app.post("/reexamination/{queue_id}/resolve")
 def resolve_reexamination(queue_id: str, request: ResolveRequest) -> dict[str, Any]:
     return _guard(service.memory.resolve_reexamination, queue_id, resolution=request.resolution, actor=request.actor)
+
+
+@app.get("/graph", response_class=HTMLResponse)
+def graph_page() -> str:
+    return GRAPH_HTML
+
+
+@app.get("/cases/{case_id}/graph")
+def case_graph(case_id: str) -> dict[str, Any]:
+    _guard(service.store.get_case, case_id)
+    return build_graph_data(case_id, service.ledger.db.conn)
+
+
+@app.get("/cases/{case_id}/events")
+def case_events(case_id: str, since: str = "") -> dict[str, Any]:
+    _guard(service.store.get_case, case_id)
+    return build_events(case_id, service.ledger.db.conn, since)
 
 
 def main() -> None:
