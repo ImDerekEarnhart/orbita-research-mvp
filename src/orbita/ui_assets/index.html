@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="orbita-csrf" content="__ORBITA_CSRF_TOKEN__">
+  <title>Orbita Epistemic Intelligence</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">O</div>
+        <div><strong>Orbita</strong><span>Epistemic Intelligence</span></div>
+      </div>
+      <nav aria-label="Primary navigation">
+        <button class="nav-item active" data-view="overview"><span>◫</span>Overview</button>
+        <button class="nav-item" data-view="language"><span>◉</span>Warranted language</button>
+        <button class="nav-item" data-view="claims"><span>◇</span>Claims</button>
+        <button class="nav-item" data-view="analyses"><span>⌁</span>Analyses</button>
+        <button class="nav-item" data-view="discoveries"><span>◎</span>Discoveries</button>
+        <button class="nav-item" data-view="evaluations"><span>◈</span>Evaluations</button>
+        <button class="nav-item" data-view="executions"><span>▣</span>Executions</button>
+        <button class="nav-item" data-view="automation"><span>⚙</span>Automation</button>
+        <button class="nav-item" data-view="proposals"><span>✦</span>Proposals</button>
+        <button class="nav-item" data-view="graphs"><span>⌘</span>Collapse graphs</button>
+        <button class="nav-item" data-view="audit"><span>≡</span>Audit trail</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="status-line"><i></i><span id="health-label">Checking runtime…</span></div>
+        <small>Local evidence-governed workspace</small>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="view-eyebrow">System state</p>
+          <h1 id="view-title">Overview</h1>
+        </div>
+        <div class="top-actions">
+          <button class="button ghost" id="refresh-button">Refresh</button>
+          <button class="button primary" id="global-add-claim">New typed claim</button>
+        </div>
+      </header>
+
+      <div id="flash" class="flash" role="status" aria-live="polite"></div>
+
+      <section class="view active" id="view-overview">
+        <div class="metric-grid" id="overview-metrics"></div>
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Warrant state</p><h2>Claims by support</h2></div></div>
+            <div id="support-bars" class="bar-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Latest changes</p><h2>Recent epistemic events</h2></div></div>
+            <div id="recent-events" class="timeline compact"></div>
+          </article>
+        </div>
+        <article class="panel manifesto">
+          <p class="eyebrow">Runtime contract</p>
+          <h2>Models may propose. Evidence decides.</h2>
+          <p>Every claim, analysis, contradiction, proof dependency, review, and collapse remains inspectable. A fluent answer is never treated as warrant by itself.</p>
+        </article>
+      </section>
+
+
+      <section class="view" id="view-language">
+        <div class="two-column analysis-layout">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Meaning-first interface</p><h2>Ask Orbita</h2></div></div>
+            <p class="muted">Orbita parses the request into a semantic frame, queries typed claims and proof paths, then realizes only warranted meaning. It does not use next-token generation.</p>
+            <form id="language-form" class="form-grid">
+              <label class="field span-2">Question<textarea id="language-utterance" rows="5" required placeholder="What is a dog?&#10;Is marker A positively correlated with recovery?&#10;Why is dog warm-blooded?"></textarea></label>
+              <button class="button primary span-2" type="submit">Generate warranted answer</button>
+            </form>
+          </article>
+          <article class="panel" id="language-answer">
+            <div class="empty-state"><div class="empty-icon">◉</div><h3>No answer yet</h3><p>Each generated sentence will show its semantic act, support state, claim IDs, evidence IDs, and proof IDs.</p></div>
+          </article>
+        </div>
+        <article class="panel" id="language-trace">
+          <div class="empty-state horizontal"><div class="empty-icon">≡</div><div><h3>Semantic trace</h3><p>The parsed frame and grounding report will appear here.</p></div></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-claims">
+        <div class="toolbar panel slim">
+          <label class="search"><span>⌕</span><input id="claim-search" placeholder="Search claim text or ID"></label>
+          <select id="claim-state-filter" aria-label="Support state filter">
+            <option value="">All support states</option><option>supported</option><option>challenged</option><option>unknown</option><option>unsupported</option>
+          </select>
+          <select id="claim-status-filter" aria-label="Claim status filter">
+            <option value="">All lifecycle states</option><option>provisional</option><option>committed</option><option>challenged</option><option>rejected</option><option>superseded</option>
+          </select>
+          <button class="button primary" id="claims-add">Add claim</button>
+        </div>
+        <div class="split-layout">
+          <article class="panel list-panel">
+            <div class="panel-head"><div><p class="eyebrow">Knowledge ledger</p><h2>Typed claims</h2></div><span class="count" id="claim-count">0</span></div>
+            <div id="claim-list" class="record-list"></div>
+          </article>
+          <article class="panel detail-panel" id="claim-detail">
+            <div class="empty-state"><div class="empty-icon">◇</div><h3>Select a claim</h3><p>Inspect its typed structure, evidence, proof sets, contradictions, and full event history.</p></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-analyses">
+        <div class="two-column analysis-layout">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Receipt-producing computation</p><h2>Run dataset analysis</h2></div></div>
+            <form id="analysis-form" class="form-grid">
+              <label class="field span-2">CSV dataset<input type="file" id="analysis-file" accept=".csv,text/csv" required></label>
+              <label class="field">Analysis type<select id="analysis-type"><option value="pearson_correlation">Pearson correlation</option><option value="group_mean_difference">Group mean difference</option><option value="column_summary">Numeric column summary</option></select></label>
+              <label class="field">Missing value tokens<input id="analysis-missing" value="NA,N/A,null,None" placeholder="NA,N/A,null"></label>
+              <div id="analysis-parameter-fields" class="span-2 nested-grid"></div>
+              <label class="field span-2">Optional claim tests (JSON array)<textarea id="analysis-claim-tests" rows="6" spellcheck="false" placeholder='[{"claim_id":"clm_…","metric_path":"pearson_r","support_condition":{"operator":">=","value":0.8}}]'></textarea></label>
+              <button class="button primary span-2" type="submit">Run and issue receipt</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Hash-bound records</p><h2>Analysis receipts</h2></div><span class="count" id="analysis-count">0</span></div>
+            <div id="analysis-list" class="record-list tall"></div>
+          </article>
+        </div>
+        <article class="panel" id="analysis-detail">
+          <div class="empty-state horizontal"><div class="empty-icon">⌁</div><div><h3>Select a receipt</h3><p>View dataset, code, environment, outputs, diagnostics, claim assessments, and integrity checks.</p></div></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-discoveries">
+        <div class="two-column analysis-layout">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Counterexample-first research</p><h2>Start governed investigation</h2></div></div>
+            <p class="muted">Candidate mining uses only a discovery split and creates no warrant. Confirmation and replication run through exact, human-approved container manifests.</p>
+            <form id="discovery-form" class="form-grid">
+              <label class="field span-2">Research question<input id="discovery-question" required placeholder="Does marker A co-vary with response?"></label>
+              <label class="field span-2">Primary CSV<input type="file" id="discovery-file" accept=".csv,text/csv" required></label>
+              <label class="field span-2">Independent replication CSV (optional)<input type="file" id="discovery-replication-file" accept=".csv,text/csv"></label>
+              <label class="field span-2">Digest-pinned Python image<input id="discovery-image" required value="python@sha256:0000000000000000000000000000000000000000000000000000000000000000"></label>
+              <label class="field">Minimum complete rows<input id="discovery-min-rows" type="number" min="6" value="12"></label>
+              <label class="field">Discovery |r| threshold<input id="discovery-min-r" type="number" min="0" max="1" step="0.01" value="0.45"></label>
+              <label class="field">Confirmation |r| threshold<input id="discovery-confirm-r" type="number" min="0" max="1" step="0.01" value="0.35"></label>
+              <label class="field">Permutation trials<input id="discovery-permutations" type="number" min="19" value="199"></label>
+              <button class="button primary span-2" type="submit">Mine candidates and stage confirmation</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Durable state machine</p><h2>Investigations</h2></div><span class="count" id="discovery-count">0</span></div>
+            <div id="discovery-list" class="record-list tall"></div>
+          </article>
+        </div>
+        <article class="panel" id="discovery-detail">
+          <div class="empty-state horizontal"><div class="empty-icon">◎</div><div><h3>Select an investigation</h3><p>Inspect preregistered hypotheses, exact execution manifests, falsification gates, replication state, budgets, and final report integrity.</p></div></div>
+        </article>
+      </section>
+
+
+      <section class="view" id="view-evaluations">
+        <div class="toolbar panel slim">
+          <div><p class="eyebrow">Comparative evidence</p><strong>Measure whether governance actually improves AI behavior</strong></div>
+          <div class="toolbar-spacer"></div>
+          <button class="button primary" id="evaluation-create-default">Create adversarial benchmark</button>
+        </div>
+        <div class="split-layout">
+          <article class="panel list-panel">
+            <div class="panel-head"><div><p class="eyebrow">Sealed benchmarks</p><h2>Evaluation suites</h2></div><span class="count" id="evaluation-count">0</span></div>
+            <div id="evaluation-list" class="record-list"></div>
+          </article>
+          <article class="panel detail-panel" id="evaluation-detail">
+            <div class="empty-state"><div class="empty-icon">◈</div><h3>Select an evaluation suite</h3><p>Compare base LLM, RAG, final-answer verification, and full Orbita on the same hash-bound tasks.</p></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-executions">
+        <div class="two-column analysis-layout">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Proof-carrying computation</p><h2>Stage container execution</h2></div></div>
+            <p class="muted">Submission only stages immutable code, inputs, image digest, limits, and proof obligations. A separate human approval is mandatory before anything runs.</p>
+            <form id="execution-form" class="form-grid">
+              <label class="field span-2">Execution specification (JSON)<textarea id="execution-spec" rows="20" spellcheck="false" required>{
+  "name": "verified calculation",
+  "image": "python@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "command": ["python", "main.py"],
+  "code_files": [{
+    "target": "main.py",
+    "text": "import json\nfrom pathlib import Path\nPath('/workspace/output/result.json').write_text(json.dumps({'score': 0.91}))\n",
+    "media_type": "text/x-python"
+  }],
+  "outputs": [{
+    "path": "result.json",
+    "required": true,
+    "media_type": "application/json",
+    "json_schema": {
+      "type": "object",
+      "required": ["score"],
+      "properties": {"score": {"type": "number"}}
+    }
+  }],
+  "limits": {"timeout_seconds": 60, "memory_mb": 256, "cpus": 1, "pids": 64},
+  "network": false
+}</textarea></label>
+              <button class="button primary span-2" type="submit">Stage manifest for review</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">OCI boundary</p><h2>Runtime status</h2></div><button class="button ghost small" id="execution-refresh">Reload</button></div>
+            <div id="execution-runtime" class="kv-grid"></div>
+            <div class="detail-section"><h3>Hard guarantees</h3><div class="chip-row"><span class="chip">digest-pinned image</span><span class="chip">network none</span><span class="chip">read-only root</span><span class="chip">drop all capabilities</span><span class="chip">non-root user</span><span class="chip">one-time approval</span></div></div>
+          </article>
+        </div>
+        <div class="split-layout">
+          <article class="panel list-panel">
+            <div class="panel-head"><div><p class="eyebrow">Execution ledger</p><h2>Container runs</h2></div><span class="count" id="execution-count">0</span></div>
+            <div id="execution-list" class="record-list"></div>
+          </article>
+          <article class="panel detail-panel" id="execution-detail">
+            <div class="empty-state"><div class="empty-icon">▣</div><h3>Select an execution</h3><p>Inspect the exact manifest hash, approval, security controls, outputs, checks, receipt, and claim assessments.</p></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-automation">
+        <div class="two-column analysis-layout">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Draft-first integrations</p><h2>Create external-action draft</h2></div></div>
+            <p class="muted">Creating a draft never sends a message or creates an event. External execution requires a separate exact-payload approval and an authenticated capability provider.</p>
+            <form id="automation-draft-form" class="form-grid">
+              <label class="field">Draft kind<select id="automation-draft-kind"><option value="email">Email</option><option value="calendar">Calendar event</option></select></label>
+              <label class="field">Recipient / attendees<input id="automation-draft-target" required placeholder="person@example.com"></label>
+              <label class="field span-2">Subject / title<input id="automation-draft-title" required></label>
+              <label class="field span-2">Body / description<textarea id="automation-draft-body" rows="5"></textarea></label>
+              <label class="field automation-calendar hidden">Start (ISO 8601)<input id="automation-calendar-start" placeholder="2026-06-20T14:00:00-04:00"></label>
+              <label class="field automation-calendar hidden">End (ISO 8601)<input id="automation-calendar-end" placeholder="2026-06-20T15:00:00-04:00"></label>
+              <label class="field automation-calendar hidden">Timezone<input id="automation-calendar-timezone" value="America/New_York"></label>
+              <label class="field automation-calendar hidden">Location<input id="automation-calendar-location"></label>
+              <button class="button primary span-2" type="submit">Create local draft</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Durable background work</p><h2>Schedule computer task</h2></div><button class="button ghost small" id="automation-tick">Run due tasks</button></div>
+            <form id="automation-schedule-form" class="form-grid">
+              <label class="field">Name<input id="automation-schedule-name" required></label>
+              <label class="field">Kind<select id="automation-schedule-kind"><option value="once">One time</option><option value="interval">Interval</option></select></label>
+              <label class="field span-2">Typed computer goal<input id="automation-schedule-goal" required placeholder='copy source.txt to backup/source.txt'></label>
+              <label class="field automation-once">Run at (ISO 8601)<input id="automation-run-at" placeholder="2026-06-20T09:00:00-04:00"></label>
+              <label class="field automation-interval hidden">Every seconds<input id="automation-every-seconds" type="number" min="60" value="3600"></label>
+              <label class="field">Workspace<input id="automation-workspace" placeholder="Uses configured workspace"></label>
+              <label class="field">Max runs<input id="automation-max-runs" type="number" min="1" placeholder="Unlimited"></label>
+              <button class="button primary span-2" type="submit">Create reboot-safe schedule</button>
+            </form>
+          </article>
+        </div>
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Review queue</p><h2>Email and calendar drafts</h2></div><span class="count" id="automation-draft-count">0</span></div>
+            <div id="automation-drafts" class="record-list tall"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Scheduler state</p><h2>Scheduled tasks</h2></div><span class="count" id="automation-schedule-count">0</span></div>
+            <div id="automation-schedules" class="record-list tall"></div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p class="eyebrow">Capability boundary</p><h2>Integration status</h2></div></div>
+          <div id="automation-status" class="kv-grid"></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-proposals">
+        <div class="toolbar panel slim">
+          <div><p class="eyebrow">Quarantined model boundary</p><strong>LLM proposals never count as warrant</strong></div>
+          <div class="toolbar-spacer"></div>
+          <select id="proposal-status-filter"><option value="">All batches</option><option value="needs_review">Needs review</option><option value="applied">Applied</option><option value="rejected">Rejected</option></select>
+          <button class="button primary" id="proposal-import-button">Import model response</button>
+        </div>
+        <div class="split-layout">
+          <article class="panel list-panel">
+            <div class="panel-head"><div><p class="eyebrow">Proposal batches</p><h2>Model output ledger</h2></div><span class="count" id="proposal-count">0</span></div>
+            <div id="proposal-list" class="record-list"></div>
+          </article>
+          <article class="panel detail-panel" id="proposal-detail">
+            <div class="empty-state"><div class="empty-icon">✦</div><h3>Select a proposal batch</h3><p>Review exact prompts, model identity, raw response hash, validation errors, and quarantined items.</p></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-graphs">
+        <div class="two-column graph-controls">
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Snapshot</p><h2>Capture epistemic graph</h2></div></div>
+            <form id="snapshot-form" class="form-grid">
+              <label class="field span-2">Name<input id="snapshot-name" value="UI epistemic snapshot"></label>
+              <label class="field span-2">Root claim IDs (comma-separated)<input id="snapshot-roots" placeholder="Blank captures the complete ledger"></label>
+              <label class="check span-2"><input type="checkbox" id="snapshot-descendants"><span>Include downstream dependent claims</span></label>
+              <button class="button primary span-2" type="submit">Capture and render</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p class="eyebrow">Before / after</p><h2>Generate collapse diff</h2></div></div>
+            <form id="diff-form" class="form-grid">
+              <label class="field">Before snapshot<select id="diff-before"></select></label>
+              <label class="field">After snapshot<select id="diff-after"></select></label>
+              <label class="field span-2">Name<input id="diff-name" value="UI epistemic collapse diff"></label>
+              <button class="button secondary span-2" type="submit">Compare snapshots</button>
+            </form>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p class="eyebrow">Interactive evidence map</p><h2 id="graph-viewer-title">Graph viewer</h2></div><select id="graph-selector"><option value="">Choose a snapshot or diff</option></select></div>
+          <div id="graph-summary" class="chip-row"></div>
+          <div id="graph-viewer" class="graph-viewer"><div class="empty-state"><div class="empty-icon">⌘</div><h3>No graph selected</h3><p>Capture a graph to see claims, evidence, proofs, contradictions, receipts, and proposal provenance in one view.</p></div></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-audit">
+        <article class="panel">
+          <div class="panel-head"><div><p class="eyebrow">Append-only history</p><h2>Audit trail</h2></div><button class="button ghost" id="audit-refresh">Reload</button></div>
+          <div id="audit-events" class="timeline"></div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="claim-dialog">
+    <form id="claim-form" method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Structured proposition</p><h2>New typed claim</h2></div><button class="icon-button" value="cancel" formmethod="dialog" aria-label="Close">×</button></div>
+      <div class="form-grid">
+        <label class="field">Subject<input id="claim-subject" required placeholder="Marker A"></label>
+        <label class="field">Subject type<input id="claim-subject-type" value="thing"></label>
+        <label class="field span-2">Predicate<input id="claim-predicate" required placeholder="positively_correlates_with"></label>
+        <label class="field">Object kind<select id="claim-object-kind"><option value="entity">Entity</option><option value="literal">Typed literal</option></select></label>
+        <label class="field" id="claim-object-type-field">Object type<input id="claim-object-type" value="thing"></label>
+        <label class="field span-2">Object value<input id="claim-object-value" required placeholder="Response"></label>
+        <label class="field hidden" id="claim-datatype-field">Literal datatype<select id="claim-datatype"><option>string</option><option>integer</option><option>float</option><option>boolean</option><option>date</option><option>datetime</option><option>uri</option><option>json</option></select></label>
+        <label class="field hidden" id="claim-unit-field">Unit<input id="claim-unit" placeholder="degC"></label>
+        <label class="field">Valid from<input id="claim-valid-from" placeholder="2026-06-19T00:00:00Z"></label>
+        <label class="field">Valid to<input id="claim-valid-to" placeholder="Optional"></label>
+        <label class="field span-2">Qualifiers (JSON object)<textarea id="claim-qualifiers" rows="4" spellcheck="false">{}</textarea></label>
+        <label class="check span-2"><input type="checkbox" id="claim-polarity" checked><span>Positive polarity</span></label>
+      </div>
+      <div class="dialog-actions"><button class="button ghost" value="cancel" formmethod="dialog">Cancel</button><button class="button primary" type="submit" value="default">Create provisional claim</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="evidence-dialog">
+    <form id="evidence-form" method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Source attestation</p><h2>Add evidence</h2></div><button class="icon-button" value="cancel" formmethod="dialog">×</button></div>
+      <input type="hidden" id="evidence-claim-id">
+      <div class="form-grid">
+        <label class="field">Stance<select id="evidence-stance"><option value="support">Supports</option><option value="refute">Refutes</option></select></label>
+        <label class="field">Evidence kind<select id="evidence-kind"><option value="web_source">Web source</option><option value="dataset">Dataset</option><option value="experiment_receipt">Experiment receipt</option><option value="formal_proof">Formal proof</option><option value="human_testimony">Human testimony</option><option value="code_test">Code test</option></select></label>
+        <label class="field span-2">Source URI<input id="evidence-uri" required placeholder="doi:… or file://…"></label>
+        <label class="field span-2">Independence key<input id="evidence-independence" required placeholder="publisher-or-experiment-identity"></label>
+        <label class="field span-2">Excerpt / observation<textarea id="evidence-excerpt" rows="6" required></textarea></label>
+        <label class="field span-2">Confidence<input id="evidence-confidence" type="number" min="0" max="1" step="0.01" value="1"></label>
+      </div>
+      <div class="dialog-actions"><button class="button ghost" value="cancel" formmethod="dialog">Cancel</button><button class="button primary" type="submit" value="default">Attach evidence</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="discovery-review-dialog">
+    <form id="discovery-review-form" method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Preregistered experiment gate</p><h2>Approve current discovery manifest</h2></div><button class="icon-button" value="cancel" formmethod="dialog">×</button></div>
+      <input type="hidden" id="discovery-review-id">
+      <div class="form-grid">
+        <label class="field">Reviewer<input id="discovery-reviewer" value="Derek Earnhart" required></label>
+        <label class="field span-2">Rationale<textarea id="discovery-rationale" rows="6" required placeholder="I reviewed the exact data hash, image digest, generated worker, thresholds, split, resource limits, and output obligations."></textarea></label>
+      </div>
+      <div class="dialog-actions"><button class="button ghost" value="cancel" formmethod="dialog">Cancel</button><button class="button primary" type="submit" value="default">Approve exact manifest</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="execution-review-dialog">
+    <form id="execution-review-form" method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Exact manifest gate</p><h2>Review execution</h2></div><button class="icon-button" value="cancel" formmethod="dialog">×</button></div>
+      <input type="hidden" id="execution-review-id">
+      <input type="hidden" id="execution-review-decision" value="approve">
+      <div class="form-grid">
+        <label class="field">Reviewer<input id="execution-reviewer" value="Derek Earnhart" required></label>
+        <label class="field span-2">Rationale<textarea id="execution-rationale" rows="6" required placeholder="I reviewed the exact image digest, code hashes, command, inputs, limits, and output obligations."></textarea></label>
+      </div>
+      <div class="dialog-actions"><button class="button ghost" value="cancel" formmethod="dialog">Cancel</button><button class="button primary" id="execution-review-submit" type="submit" value="default">Approve exact manifest</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="proposal-import-dialog">
+    <form id="proposal-import-form" method="dialog" class="dialog-card wide">
+      <div class="dialog-head"><div><p class="eyebrow">Strict schema ingestion</p><h2>Import model response</h2></div><button class="icon-button" value="cancel" formmethod="dialog">×</button></div>
+      <div class="form-grid">
+        <label class="field">Provider<input id="proposal-provider" value="manual-import"></label>
+        <label class="field">Model name<input id="proposal-model" required placeholder="model-name"></label>
+        <label class="field span-2">Raw schema-constrained JSON response<textarea id="proposal-raw" rows="18" spellcheck="false" required></textarea></label>
+      </div>
+      <div class="dialog-actions"><button class="button ghost" value="cancel" formmethod="dialog">Cancel</button><button class="button primary" type="submit" value="default">Validate and ingest</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="review-dialog">
+    <form id="review-form" method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Human gate</p><h2>Review proposal item</h2></div><button class="icon-button" value="cancel" formmethod="dialog">×</button></div>
+      <input type="hidden" id="review-item-id">
+      <div class="form-grid">
+        <label class="field">Decision<select id="review-decision"><option value="approve">Approve into provisional ledger</option><option value="reject">Reject</option></select></label>
+        <label class="field">Reviewer<input id="review-reviewer" value="Derek Earnhart" required></label>
+        <label class="field span-2">Rationale<textarea id="review-rationale" rows="5" required></textarea></label>
+      </div>
+      <div class="dialog-actions"><button class="button ghost" value="cancel" formmethod="dialog">Cancel</button><button class="button primary" type="submit" value="default">Record review</button></div>
+    </form>
+  </dialog>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

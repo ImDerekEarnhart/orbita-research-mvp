@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Orbita Research MVP</title>
+<style>
+:root{--bg:#08101e;--panel:#111a2d;--line:#273451;--text:#edf4ff;--muted:#9fb0c9;--accent:#69dcff;--good:#65e6a6;--bad:#ff8c9b}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#142747,#08101e 38%);color:var(--text);font:15px/1.5 Inter,Segoe UI,Arial,sans-serif}
+main{max-width:1120px;margin:auto;padding:42px 22px 100px}h1{font-size:38px;margin:0}.sub{color:var(--muted);max-width:850px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:24px}.panel{background:rgba(17,26,45,.92);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 20px 55px rgba(0,0,0,.2)}.wide{grid-column:1/-1}
+label{display:block;color:#cbd8ec;font-size:12px;margin:12px 0 6px}input,textarea,button{font:inherit}input,textarea{width:100%;background:#091222;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:11px}textarea{min-height:100px}textarea.code{min-height:440px;font:12px/1.45 Consolas,monospace}button{border:0;border-radius:10px;padding:10px 14px;background:var(--accent);color:#03101a;font-weight:700;cursor:pointer;margin:8px 6px 0 0}button.secondary{background:#253451;color:var(--text)}button:disabled{opacity:.45;cursor:not-allowed}.status{color:var(--muted);white-space:pre-wrap}.ok{color:var(--good)}.error{color:var(--bad)}pre{background:#07101e;border:1px solid var(--line);padding:14px;border-radius:12px;max-height:440px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#cce0f6}a{color:var(--accent)}.steps{display:flex;gap:8px;flex-wrap:wrap}.chip{border:1px solid var(--line);border-radius:99px;padding:5px 9px;color:var(--muted);font-size:12px}.chip.active{color:var(--text);border-color:var(--accent)}
+@media(max-width:800px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
+</style>
+</head>
+<body><main>
+<h1>Orbita Research MVP</h1>
+<p class="sub">Upload a table and optional supporting sources. Leave the goal blank for Open Discovery, or state a specific question. Orbita profiles the material, freezes candidate relationships, stress-tests them, imports the results into persistent belief memory, and writes a research dossier.</p>
+<div class="steps"><span class="chip active">1 Create case</span><span class="chip">2 Upload</span><span class="chip">3 Compile</span><span class="chip">4 Approve</span><span class="chip">5 Run</span><span class="chip">6 Review</span></div>
+<div class="grid">
+<section class="panel"><h2>New case</h2>
+<label>Case name</label><input id="name" value="Open discovery case">
+<label>What are you trying to learn? <em>(optional)</em></label><textarea id="goal" placeholder="Leave blank to let Orbita map the data and identify what is worth testing."></textarea>
+<button onclick="createCase()">Create case</button><p id="caseStatus" class="status"></p></section>
+<section class="panel"><h2>Upload materials</h2>
+<label>CSV, Excel, JSON, JSONL, PDF, DOCX, text, notebook, ZIP</label><input id="file" type="file">
+<button id="uploadBtn" onclick="uploadFile()" disabled>Upload</button><p id="uploadStatus" class="status"></p></section>
+<section class="panel wide"><h2>Compile and run</h2>
+<button id="compileBtn" onclick="compileCase()" disabled>Compile research plan</button>
+<button id="savePlanBtn" class="secondary" onclick="savePlan()" disabled>Save plan edits as new version</button>
+<button id="approveBtn" class="secondary" onclick="approvePlan()" disabled>Approve plan</button>
+<button id="runBtn" onclick="runCase()" disabled>Run governed discovery</button>
+<a id="reportLink" target="_blank" style="display:none;margin-left:12px">Open research dossier</a>
+<p id="runStatus" class="status"></p></section>
+<section class="panel"><h2>Plan</h2><p class="sub">Review or edit this JSON before approval. Saving creates a new immutable version and hash.</p><textarea id="planOut" class="code">No plan yet.</textarea></section>
+<section class="panel"><h2>Results</h2><pre id="resultOut">No run yet.</pre></section>
+</div></main>
+<script>
+let caseId=null, planId=null;
+function show(id,text,ok=true){const el=document.getElementById(id);el.textContent=text;el.className='status '+(ok?'ok':'error')}
+async function jsonFetch(url,opts={}){const r=await fetch(url,opts);const t=await r.text();let data;try{data=JSON.parse(t)}catch{data={detail:t}}if(!r.ok)throw new Error(data.detail||t);return data}
+async function createCase(){try{const data=await jsonFetch('/cases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('name').value,goal:document.getElementById('goal').value})});caseId=data.id;show('caseStatus','Created '+caseId+' in '+data.mode+' mode.');document.getElementById('uploadBtn').disabled=false;document.getElementById('compileBtn').disabled=false}catch(e){show('caseStatus',e.message,false)}}
+async function uploadFile(){try{const f=document.getElementById('file').files[0];if(!f)throw new Error('Choose a file first.');const form=new FormData();form.append('file',f);show('uploadStatus','Uploading and profiling…');const data=await jsonFetch(`/cases/${caseId}/files`,{method:'POST',body:form});show('uploadStatus',`${data.original_name}: ${data.parse_status}, ${data.artifact_kind}`)}catch(e){show('uploadStatus',e.message,false)}}
+async function compileCase(){try{show('runStatus','Compiling a frozen plan…');const data=await jsonFetch(`/cases/${caseId}/compile`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_candidates:60})});planId=data.id;document.getElementById('planOut').value=JSON.stringify(data.plan,null,2);document.getElementById('savePlanBtn').disabled=false;document.getElementById('approveBtn').disabled=false;show('runStatus',`Plan ${planId} is ready for review.`)}catch(e){show('runStatus',e.message,false)}}
+async function savePlan(){try{const plan=JSON.parse(document.getElementById('planOut').value);const data=await jsonFetch(`/plans/${planId}/revise`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan,compiler:'browser-human-review'})});planId=data.id;document.getElementById('planOut').value=JSON.stringify(data.plan,null,2);document.getElementById('runBtn').disabled=true;show('runStatus',`Saved revised plan ${planId}. New hash: ${data.plan_hash}`)}catch(e){show('runStatus',e.message,false)}}
+async function approvePlan(){try{const data=await jsonFetch(`/plans/${planId}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewer:'local-user'})});document.getElementById('runBtn').disabled=false;show('runStatus',`Plan approved. Hash: ${data.plan_hash}`)}catch(e){show('runStatus',e.message,false)}}
+async function runCase(){try{show('runStatus','Running held-out and cross-seed falsification checks. This may take a moment…');const data=await jsonFetch(`/cases/${caseId}/run`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_id:planId})});document.getElementById('resultOut').textContent=JSON.stringify(data.result,null,2);show('runStatus',`Completed. ${data.result.survivor_count}/${data.result.candidate_count} candidates survived.`);const link=document.getElementById('reportLink');link.href=`/cases/${caseId}/report`;link.style.display='inline'}catch(e){show('runStatus',e.message,false)}}
+</script></body></html>

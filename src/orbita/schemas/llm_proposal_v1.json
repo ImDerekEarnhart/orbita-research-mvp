@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orbita.local/schemas/llm-proposal-v1.json",
+  "title": "Orbita LLM Proposal Batch",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "proposals"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "task_summary": {"type": "string", "maxLength": 4000},
+    "proposals": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {"$ref": "#/$defs/proposal"}
+    }
+  },
+  "$defs": {
+    "localId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
+    },
+    "metadata": {
+      "type": "object",
+      "maxProperties": 64,
+      "additionalProperties": true
+    },
+    "entityRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["local_ref"],
+          "properties": {"local_ref": {"$ref": "#/$defs/localId"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entity_id"],
+          "properties": {"entity_id": {"type": "string", "pattern": "^ent_[A-Fa-f0-9]{16}$"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 500},
+            "entity_type": {"type": "string", "minLength": 1, "maxLength": 100}
+          }
+        }
+      ]
+    },
+    "predicateRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["local_ref"],
+          "properties": {"local_ref": {"$ref": "#/$defs/localId"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["predicate_id"],
+          "properties": {"predicate_id": {"type": "string", "pattern": "^prd_[A-Fa-f0-9]{16}$"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 200}}
+        }
+      ]
+    },
+    "literal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "datatype"],
+      "properties": {
+        "kind": {"const": "literal"},
+        "value": {},
+        "datatype": {
+          "enum": ["string", "integer", "float", "boolean", "date", "datetime", "uri", "json"]
+        },
+        "unit": {"type": ["string", "null"], "maxLength": 100}
+      }
+    },
+    "entityObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "entity"],
+      "properties": {
+        "kind": {"const": "entity"},
+        "entity": {"$ref": "#/$defs/entityRef"}
+      }
+    },
+    "relationPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "predicate", "object"],
+      "properties": {
+        "subject": {"$ref": "#/$defs/entityRef"},
+        "predicate": {"$ref": "#/$defs/predicateRef"},
+        "object": {"oneOf": [{"$ref": "#/$defs/entityObject"}, {"$ref": "#/$defs/literal"}]},
+        "polarity": {"type": "boolean", "default": true},
+        "valid_from": {"type": ["string", "null"], "maxLength": 100},
+        "valid_to": {"type": ["string", "null"], "maxLength": 100},
+        "qualifiers": {"$ref": "#/$defs/metadata"},
+        "scope": {"$ref": "#/$defs/metadata"},
+        "metadata": {"$ref": "#/$defs/metadata"},
+        "semantic_claim_type": {"type": "string", "maxLength": 100}
+      }
+    },
+    "entityProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "local_id", "canonical_name", "entity_type", "rationale"],
+      "properties": {
+        "type": {"const": "entity"},
+        "local_id": {"$ref": "#/$defs/localId"},
+        "canonical_name": {"type": "string", "minLength": 1, "maxLength": 500},
+        "entity_type": {"type": "string", "minLength": 1, "maxLength": 100},
+        "aliases": {"type": "array", "maxItems": 20, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "uniqueItems": true},
+        "metadata": {"$ref": "#/$defs/metadata"},
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4000}
+      }
+    },
+    "predicateProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "local_id", "canonical_name", "range_kind", "rationale"],
+      "properties": {
+        "type": {"const": "predicate"},
+        "local_id": {"$ref": "#/$defs/localId"},
+        "canonical_name": {"type": "string", "minLength": 1, "maxLength": 200},
+        "domain_type": {"type": ["string", "null"], "maxLength": 100},
+        "range_kind": {"enum": ["entity", "literal", "either"]},
+        "range_type": {"type": ["string", "null"], "maxLength": 100},
+        "symmetric": {"type": "boolean", "default": false},
+        "metadata": {"$ref": "#/$defs/metadata"},
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4000}
+      }
+    },
+    "claimProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "local_id", "claim_format", "rationale"],
+      "properties": {
+        "type": {"const": "claim"},
+        "local_id": {"$ref": "#/$defs/localId"},
+        "claim_format": {"enum": ["relation", "text"]},
+        "relation": {"$ref": "#/$defs/relationPayload"},
+        "canonical_text": {"type": "string", "minLength": 1, "maxLength": 10000},
+        "claim_type": {"type": "string", "maxLength": 100, "default": "fact"},
+        "scope": {"$ref": "#/$defs/metadata"},
+        "metadata": {"$ref": "#/$defs/metadata"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4000}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"claim_format": {"const": "relation"}}},
+          "then": {"required": ["relation"], "not": {"required": ["canonical_text"]}},
+          "else": {"required": ["canonical_text"], "not": {"required": ["relation"]}}
+        }
+      ]
+    },
+    "proofProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "local_id", "conclusion_ref", "premise_refs", "rule", "rationale"],
+      "properties": {
+        "type": {"const": "proof"},
+        "local_id": {"$ref": "#/$defs/localId"},
+        "conclusion_ref": {"type": "string", "minLength": 1, "maxLength": 100},
+        "premise_refs": {"type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}},
+        "rule": {"type": "string", "minLength": 1, "maxLength": 500},
+        "metadata": {"$ref": "#/$defs/metadata"},
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4000}
+      }
+    },
+    "extractionProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "local_id", "relation", "source_text", "rationale"],
+      "properties": {
+        "type": {"const": "extraction"},
+        "local_id": {"$ref": "#/$defs/localId"},
+        "relation": {"$ref": "#/$defs/relationPayload"},
+        "source_text": {"type": "string", "minLength": 1, "maxLength": 20000},
+        "source_locator": {"type": ["string", "null"], "maxLength": 1000},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4000}
+      }
+    },
+    "proposal": {
+      "oneOf": [
+        {"$ref": "#/$defs/entityProposal"},
+        {"$ref": "#/$defs/predicateProposal"},
+        {"$ref": "#/$defs/claimProposal"},
+        {"$ref": "#/$defs/proofProposal"},
+        {"$ref": "#/$defs/extractionProposal"}
+      ]
+    }
+  }
+}
