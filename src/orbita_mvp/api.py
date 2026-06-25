@@ -32,7 +32,7 @@ service = ResearchMVP(DB_PATH, WORKSPACE)
 
 app = FastAPI(
     title="Orbita Research MVP",
-    version="0.2.0",
+    version="0.2.1",
     description=(
         "Upload research material, compile an explicit governed plan, run frozen "
         "discovery candidates, persist findings in an epistemic graph, and produce "
@@ -160,9 +160,9 @@ def home() -> str:
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "0.2.0",
+        "version": "0.2.1",
         "git_commit": _GIT_COMMIT,
-        "plan_schema": "orbita-research-plan/0.2",
+        "plan_schema": "orbita-research-plan/0.3",
         "db": str(DB_PATH.resolve()),
         "workspace": str(WORKSPACE.resolve()),
     }
@@ -432,7 +432,7 @@ async def predict(
     artifact_path_str = artifact_info.get("model_artifact_path")
     model: dict
     if artifact_path_str and Path(artifact_path_str).exists():
-        from .model_artifact import load_model_artifact
+        from .model_artifact import load_model_artifact, model_from_artifact
         try:
             artifact = load_model_artifact(artifact_path_str)
         except Exception as _art_err:
@@ -440,38 +440,24 @@ async def predict(
                 status_code=500,
                 detail=f"Model artifact integrity check failed: {_art_err}"
             )
-        # Build a model dict compatible with the prediction code below
-        if kind == "linear_association":
-            predictor = payload["predictor"]
-            model = {
-                "kind": kind, "valid": True,
-                "intercept": artifact["intercept"],
-                "slope": artifact["coefficients"].get(predictor, 0.0),
-                "target_transform": artifact.get("target_transform"),
-            }
-        elif kind == "composite_linear":
-            model = {
-                "kind": kind, "valid": True,
-                "intercept": artifact["intercept"],
-                "coefficients": artifact["coefficients"],
-                "predictors": artifact["predictor_order"],
-                "target_transform": artifact.get("target_transform"),
-            }
-        else:
-            raise HTTPException(status_code=422,
-                                detail=f"Unsupported kind in frozen artifact: {kind}")
+        model = model_from_artifact(artifact, payload)
+        if not model.get("valid"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Frozen artifact for '{target_column}' could not be reconstructed (kind={kind!r})"
+            )
     else:
         # No artifact — this run predates artifact serialization or artifact was lost.
         # Refuse to silently refit; require the artifact to be present.
-        artifact_missing_hint = (
-            "Model artifact not found. "
-            "Runs created before v0.2.1 do not have frozen artifacts. "
-            "Re-run the case to generate a frozen artifact before calling /predict."
-        )
         if artifact_path_str:
             artifact_missing_hint = (
                 f"Model artifact expected at {artifact_path_str!r} but file is missing. "
                 "The volume may have been remounted or the artifact was deleted."
+            )
+        else:
+            artifact_missing_hint = (
+                "This historical run predates serialized deployment artifacts and cannot "
+                "be used for new inference. Create a new case and run under plan schema 0.3."
             )
         raise HTTPException(status_code=422, detail=artifact_missing_hint)
 

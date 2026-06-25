@@ -33,7 +33,7 @@ from orbita_mvp.falsifiers import AblationFalsifier
 from orbita_mvp.model_artifact import (
     load_model_artifact,
     save_model_artifact,
-    serialize_model_artifact,
+    serialize_deployment_artifact,
 )
 from orbita_mvp.table_domain import UploadedTableDomain
 
@@ -228,12 +228,15 @@ def test_refit_ablation_key_is_diagnostic_only():
 # ---------------------------------------------------------------------------
 
 def test_plan_hash_changes_with_ablation_metric():
-    """ablation_metric is in IMMUTABLE_PLAN_FIELDS; changing it must change plan_hash."""
+    """ablation_metric is in the v0.3 immutable field set; changing it must change plan_hash."""
+    from orbita_mvp.compiler import PLAN_SCHEMA_V03
     base_plan = {
+        "schema_version": PLAN_SCHEMA_V03,
         "target_transform": "log1p",
         "outcome_domain": "nonneg",
         "evaluation_metric": "rmsle",
         "ablation_metric": "rmsle",
+        "composition_strategy": "composition_v1_1_backward_elimination",
         "thresholds": {"commit_at": 0.25, "ablation_min_contribution": 0.01,
                         "ablation_min_absolute_improvement": 0.01,
                         "ablation_min_relative_improvement": None},
@@ -419,22 +422,24 @@ def test_model_artifact_serialize_load_verify(tmp_path):
         "falsifications": [],
     }
 
-    artifact = serialize_model_artifact(
+    artifact = serialize_deployment_artifact(
         run_id="run_test",
         plan=plan,
         finding=finding,
-        training_df_path=csv_path,
         normalized_path=csv_path,
+        selection_artifact_id="sel:y:run_test",
+        final_validation_score=0.95,
         production_commit="deadbeef",
     )
-    assert artifact["schema_version"] == "orbita-model-artifact/0.1"
+    assert artifact["schema_version"] == "orbita-deployment-artifact/0.1"
+    assert artifact["artifact_kind"] == "deployment"
     assert "artifact_sha256" in artifact
     assert artifact["run_id"] == "run_test"
     assert artifact["selected_model_id"] == "linear:x_y:test"
     assert "intercept" in artifact
     assert "x" in artifact["coefficients"]
 
-    saved_path = save_model_artifact(artifact, tmp_path / "run_dir")
+    saved_path = save_model_artifact(artifact, tmp_path / "run_dir", kind="deployment")
     assert saved_path.exists()
 
     loaded = load_model_artifact(saved_path)
@@ -472,14 +477,15 @@ def test_model_artifact_tamper_detection(tmp_path):
         "falsifications": [],
     }
 
-    artifact = serialize_model_artifact(
+    artifact = serialize_deployment_artifact(
         run_id="run_tamper",
         plan=plan,
         finding=finding,
-        training_df_path=csv_path,
         normalized_path=csv_path,
+        selection_artifact_id="sel:y:run_tamper",
+        final_validation_score=0.90,
     )
-    saved_path = save_model_artifact(artifact, tmp_path / "run_dir")
+    saved_path = save_model_artifact(artifact, tmp_path / "run_dir", kind="deployment")
 
     # Tamper with intercept
     tampered = artifact.copy()

@@ -12,10 +12,15 @@ from orbita_discovery.core import Candidate, Engine, Ledger, finding_to_dict, su
 from orbita_discovery.falsifiers import BaselineFalsifier, CrossSeedFalsifier, HeldOutFalsifier
 from orbita_discovery.judges import GatedJudge
 
-from .compiler import ResearchCompiler, compute_plan_hash
+from .compiler import ResearchCompiler, compute_plan_hash, verify_plan_schema_executable
 from .composition import build_backward_eliminated_composites, build_composite_candidates
 from .falsifiers import AblationFalsifier, ImprovementFalsifier
-from .model_artifact import save_model_artifact, serialize_model_artifact
+from .model_artifact import (
+    model_from_artifact,
+    save_model_artifact,
+    serialize_deployment_artifact,
+    serialize_selection_artifact,
+)
 from .ingestion import ArtifactIngestor
 from .memory import BeliefMemory
 from .metrics import higher_is_better, select_best_finding, validate_metric
@@ -171,6 +176,10 @@ class ResearchMVP:
                     f"does not match current hash {current_hash[:12]}…. "
                     "The plan may have been modified after compilation."
                 )
+
+        # Guard: only v0.3 plans are executable under this engine version.
+        # Historical v0.2 plans remain auditable; their hashes still verify.
+        verify_plan_schema_executable(plan)
 
         selected_file = self.store.get_file(plan["selected_dataset"]["file_id"])
         df = pd.read_csv(selected_file["extracted_path"])
@@ -350,61 +359,84 @@ class ResearchMVP:
                 all_findings, all_selection_scores, evaluation_metric, hib
             )
 
-            # Serialize frozen model artifacts immediately after selection freeze.
-            # /predict loads these artifacts and MUST NOT call lstsq at inference.
-            # Artifact metadata goes into model_artifacts (separate from selected_models
-            # so selected_models remains a deterministic, run-independent record of
-            # which model won the selection phase).
+            # Step A: Selection artifacts — scout-fitted, created BEFORE final-validation
+            # exposure.  Created for all survivors so FV scoring never needs to refit.
+            # model_artifacts (keyed by outcome_col) is populated here with selection
+            # metadata and updated after FV with deployment artifact paths.
+            selection_artifacts_by_cid: dict[str, dict[str, Any]] = {}
             model_artifacts: dict[str, dict[str, Any]] = {}
             selected_file_path = selected_file["extracted_path"]
-            for outcome_col, sel_info in selected_models.items():
-                sel_id = sel_info["selected_model_id"]
-                sel_finding = next(
-                    (f for f in all_findings if f["candidate"]["id"] == sel_id),
-                    None,
+            for finding in all_findings:
+                is_surv = (
+                    finding["final_status"] != "refuted"
+                    and not any(a["killed"] for a in finding["falsifications"])
                 )
-                if sel_finding is None:
+                if not is_surv:
                     continue
+                cid = finding["candidate"]["id"]
+                kind_str = finding["candidate"]["payload"].get("kind", "")
+                dom_for_sel = (
+                    composite_domain if kind_str == "composite_linear" and composite_specs
+                    else domain
+                )
                 try:
-                    artifact = serialize_model_artifact(
+                    sel_art = serialize_selection_artifact(
                         run_id=run_record["id"],
                         plan=plan,
-                        finding=sel_finding,
-                        training_df_path=selected_file_path,
-                        normalized_path=selected_file_path,
+                        finding=finding,
+                        domain=dom_for_sel,
                     )
-                    artifact_path = save_model_artifact(artifact, run_dir)
+                    sel_art_path = save_model_artifact(sel_art, run_dir, kind="selection")
+                    selection_artifacts_by_cid[cid] = {
+                        "selection_artifact_id": sel_art["selection_artifact_id"],
+                        "selection_artifact_path": str(sel_art_path),
+                        "selection_artifact_sha256": sel_art["artifact_sha256"],
+                        "artifact": sel_art,
+                    }
+                except Exception as _sel_err:
+                    selection_artifacts_by_cid[cid] = {"error": str(_sel_err)}
+
+            for outcome_col, sel_info in selected_models.items():
+                sel_id = sel_info["selected_model_id"]
+                art_entry = selection_artifacts_by_cid.get(sel_id, {})
+                if "error" not in art_entry and art_entry:
                     model_artifacts[outcome_col] = {
-                        "model_artifact_id": artifact["model_artifact_id"],
-                        "model_artifact_path": str(artifact_path),
-                        "model_artifact_sha256": artifact["artifact_sha256"],
+                        "selection_artifact_id": art_entry["selection_artifact_id"],
+                        "selection_artifact_path": art_entry["selection_artifact_path"],
+                        "selection_artifact_sha256": art_entry["selection_artifact_sha256"],
                         "selected_model_id": sel_id,
                     }
-                except Exception as _art_err:
+                else:
                     model_artifacts[outcome_col] = {
-                        "error": str(_art_err),
+                        "error": art_entry.get("error", "no selection artifact created"),
                         "selected_model_id": sel_id,
                     }
 
             # ----------------------------------------------------------
-            # Final validation: compute unbiased scores for survivors on
-            # the held-out final_validation partition.
+            # Step B: Final validation — apply stored selection-artifact
+            # coefficients to the held-out final_validation partition.
             # REPORT-ONLY — these scores do NOT alter selected_model_id,
             # model precedence, feature sets, or coefficients.
+            # No fitting occurs here; model_from_artifact reconstructs the
+            # model dict from stored intercept and coefficients only.
             # ----------------------------------------------------------
-            def _compute_final_validation_score(
+            def _score_from_artifact(
                 finding: dict[str, Any],
+                artifact: dict[str, Any],
                 dom: UploadedTableDomain,
             ) -> float | None:
-                candidate_dict = finding["candidate"]
-                c_obj = Candidate(
-                    id=candidate_dict["id"],
-                    statement=candidate_dict["statement"],
-                    payload=candidate_dict["payload"],
-                )
-                model = dom.refit(c_obj, dom.scout)
-                if not model.get("valid") or len(dom.final_validation) < 3:
+                """Apply stored selection-artifact coefficients to the FV partition."""
+                if len(dom.final_validation) < 3:
                     return None
+                payload = finding["candidate"]["payload"]
+                model = model_from_artifact(artifact, payload)
+                if not model.get("valid"):
+                    return None
+                c_obj = Candidate(
+                    id=finding["candidate"]["id"],
+                    statement=finding["candidate"]["statement"],
+                    payload=payload,
+                )
                 return dom.score_metric(c_obj, model, dom.final_validation)
 
             for finding in all_findings:
@@ -413,10 +445,16 @@ class ResearchMVP:
                     and not any(a["killed"] for a in finding["falsifications"])
                 )
                 if is_survivor:
-                    kind = finding["candidate"]["payload"].get("kind", "")
-                    dom = composite_domain if kind == "composite_linear" and composite_specs else domain
+                    cid = finding["candidate"]["id"]
+                    kind_str = finding["candidate"]["payload"].get("kind", "")
+                    dom = (
+                        composite_domain if kind_str == "composite_linear" and composite_specs
+                        else domain
+                    )
+                    art_entry = selection_artifacts_by_cid.get(cid, {})
+                    sel_art = art_entry.get("artifact") if "error" not in art_entry else None
                     try:
-                        fvs = _compute_final_validation_score(finding, dom)
+                        fvs = _score_from_artifact(finding, sel_art, dom) if sel_art else None
                     except Exception:
                         fvs = None
                     finding["final_validation_metric_score"] = fvs
@@ -428,6 +466,37 @@ class ResearchMVP:
                     finding["final_validation_metric"] = evaluation_metric
                     finding["final_validation_report_only"] = True
                     finding["evaluation_metric"] = evaluation_metric
+
+            # Step C: Deployment artifacts — refit on full CSV, created AFTER FV
+            # scoring has been recorded.  /predict loads deployment artifacts.
+            # They are distinct from selection artifacts and reference them by ID.
+            for outcome_col, sel_info in selected_models.items():
+                sel_id = sel_info["selected_model_id"]
+                sel_finding = next(
+                    (f for f in all_findings if f["candidate"]["id"] == sel_id), None
+                )
+                if sel_finding is None:
+                    continue
+                art_entry = selection_artifacts_by_cid.get(sel_id, {})
+                sel_artifact_id = art_entry.get("selection_artifact_id", "")
+                fv_score = sel_finding.get("final_validation_metric_score")
+                try:
+                    dep_art = serialize_deployment_artifact(
+                        run_id=run_record["id"],
+                        plan=plan,
+                        finding=sel_finding,
+                        normalized_path=selected_file_path,
+                        selection_artifact_id=sel_artifact_id,
+                        final_validation_score=fv_score,
+                    )
+                    dep_art_path = save_model_artifact(dep_art, run_dir, kind="deployment")
+                    model_artifacts.setdefault(outcome_col, {}).update({
+                        "model_artifact_id": dep_art["model_artifact_id"],
+                        "model_artifact_path": str(dep_art_path),
+                        "model_artifact_sha256": dep_art["artifact_sha256"],
+                    })
+                except Exception as _dep_err:
+                    model_artifacts.setdefault(outcome_col, {})["deployment_error"] = str(_dep_err)
 
             all_survivor_ids = [
                 f["candidate"]["id"] for f in all_findings
