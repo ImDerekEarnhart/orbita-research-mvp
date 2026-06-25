@@ -16,6 +16,7 @@ IMMUTABLE_PLAN_FIELDS = (
     "target_transform",
     "outcome_domain",
     "evaluation_metric",
+    "ablation_metric",
     "thresholds",
     "candidate_generation",
 )
@@ -39,10 +40,14 @@ class ResearchCompiler:
         target_transform: str | None = None,
         outcome_domain: str | None = None,
         evaluation_metric: str = "r2",
+        ablation_metric: str | None = None,
         confirmation_fraction: float = 0.25,
         final_validation_fraction: float = 0.15,
     ) -> dict[str, Any]:
         validate_metric(evaluation_metric)
+        if ablation_metric is not None:
+            validate_metric(ablation_metric)
+        resolved_ablation_metric = ablation_metric if ablation_metric is not None else evaluation_metric
         files = case.get("files", [])
         tables = [f for f in files if f.get("artifact_kind") == "table" and f.get("extracted_path")]
         texts = [f for f in files if f.get("artifact_kind") == "text" and f.get("extracted_path")]
@@ -131,7 +136,8 @@ class ResearchCompiler:
             "target_transform": target_transform,
             "outcome_domain": outcome_domain,
             "evaluation_metric": evaluation_metric,
-            "composition_strategy": "composition_v1",
+            "ablation_metric": resolved_ablation_metric,
+            "composition_strategy": "composition_v1_1_backward_elimination",
             "thresholds": {
                 "commit_at": 0.25,
                 "baseline_margin": 0.05,
@@ -143,6 +149,8 @@ class ResearchCompiler:
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,
                 "ablation_min_contribution": 0.01,
+                "ablation_min_absolute_improvement": 0.01,
+                "ablation_min_relative_improvement": None,
             },
             "candidates": candidates,
             "assumptions": assumptions,

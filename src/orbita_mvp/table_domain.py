@@ -350,7 +350,8 @@ class UploadedTableDomain:
             X = np.column_stack([np.ones(len(sub))] + [sub[p].to_numpy(float) for p in predictors])
             y = _apply_transform(sub[y_name].to_numpy(float), self.target_transform)
             beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-            # Per-predictor marginal R² (ablation contributions)
+            # R² ablation contributions — report-only diagnostic.
+            # AblationFalsifier uses its own metric-aware, selection-partition logic.
             ablation: dict[str, float] = {}
             full_pred = X @ beta
             full_r2 = _r2(y, full_pred)
@@ -365,7 +366,7 @@ class UploadedTableDomain:
                 "intercept": float(beta[0]),
                 "coefficients": {p: float(beta[i + 1]) for i, p in enumerate(predictors)},
                 "predictors": predictors,
-                "ablation_contributions": ablation,
+                "ablation_contributions_r2_diagnostic": ablation,
                 "target_transform": self.target_transform,
             }
         if kind == "group_difference":

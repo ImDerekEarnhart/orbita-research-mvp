@@ -13,8 +13,9 @@ from orbita_discovery.falsifiers import BaselineFalsifier, CrossSeedFalsifier, H
 from orbita_discovery.judges import GatedJudge
 
 from .compiler import ResearchCompiler, compute_plan_hash
-from .composition import build_composite_candidates
+from .composition import build_backward_eliminated_composites, build_composite_candidates
 from .falsifiers import AblationFalsifier, ImprovementFalsifier
+from .model_artifact import save_model_artifact, serialize_model_artifact
 from .ingestion import ArtifactIngestor
 from .memory import BeliefMemory
 from .metrics import higher_is_better, select_best_finding, validate_metric
@@ -240,10 +241,14 @@ class ResearchMVP:
                     survivor_metric_scores[cid] = ms
 
             # Phase 2: composite candidate generation and falsification
+            composite_min_predictors = int(thresholds.get("composite_min_predictors", 2))
+            composite_max_predictors = int(thresholds.get("composite_max_predictors", 10))
+            ablation_min_contribution = float(thresholds.get("ablation_min_contribution", 0.01))
+
             composite_specs = build_composite_candidates(
                 [finding_to_dict(s) for s in phase1_survivors],
-                min_predictors=int(thresholds.get("composite_min_predictors", 2)),
-                max_predictors=int(thresholds.get("composite_max_predictors", 10)),
+                min_predictors=composite_min_predictors,
+                max_predictors=composite_max_predictors,
                 metric_scores=survivor_metric_scores,
             )
             # Fix best_individual_metric_score direction: build_composite_candidates
@@ -257,6 +262,30 @@ class ResearchMVP:
                         sm["best_individual_metric_score"] = (
                             round(max(vals), 6) if hib else round(min(vals), 6)
                         )
+
+            # Add backward-eliminated composites when strategy requests it
+            composition_strategy = plan.get("composition_strategy", "composition_v1")
+            if composite_specs and "backward_elimination" in composition_strategy:
+                # Build a temporary domain for elimination (same partitions as composite_domain)
+                # We need the domain before composite_domain is built, so create it now.
+                _be_domain = UploadedTableDomain(
+                    df,
+                    composite_specs,
+                    scout_fraction=scout_fraction,
+                    confirmation_fraction=confirmation_fraction,
+                    final_validation_fraction=final_validation_fraction,
+                    seed=seed,
+                    target_transform=target_transform,
+                    evaluation_metric=evaluation_metric,
+                )
+                reduced_specs = build_backward_eliminated_composites(
+                    composite_specs,
+                    _be_domain,
+                    min_contribution=ablation_min_contribution,
+                    min_predictors=composite_min_predictors,
+                )
+                # Add reduced specs after full specs so full composites are tested first
+                composite_specs = composite_specs + reduced_specs
 
             phase2_findings: list[dict[str, Any]] = []
             if composite_specs:
@@ -321,6 +350,42 @@ class ResearchMVP:
                 all_findings, all_selection_scores, evaluation_metric, hib
             )
 
+            # Serialize frozen model artifacts immediately after selection freeze.
+            # /predict loads these artifacts and MUST NOT call lstsq at inference.
+            # Artifact metadata goes into model_artifacts (separate from selected_models
+            # so selected_models remains a deterministic, run-independent record of
+            # which model won the selection phase).
+            model_artifacts: dict[str, dict[str, Any]] = {}
+            selected_file_path = selected_file["extracted_path"]
+            for outcome_col, sel_info in selected_models.items():
+                sel_id = sel_info["selected_model_id"]
+                sel_finding = next(
+                    (f for f in all_findings if f["candidate"]["id"] == sel_id),
+                    None,
+                )
+                if sel_finding is None:
+                    continue
+                try:
+                    artifact = serialize_model_artifact(
+                        run_id=run_record["id"],
+                        plan=plan,
+                        finding=sel_finding,
+                        training_df_path=selected_file_path,
+                        normalized_path=selected_file_path,
+                    )
+                    artifact_path = save_model_artifact(artifact, run_dir)
+                    model_artifacts[outcome_col] = {
+                        "model_artifact_id": artifact["model_artifact_id"],
+                        "model_artifact_path": str(artifact_path),
+                        "model_artifact_sha256": artifact["artifact_sha256"],
+                        "selected_model_id": sel_id,
+                    }
+                except Exception as _art_err:
+                    model_artifacts[outcome_col] = {
+                        "error": str(_art_err),
+                        "selected_model_id": sel_id,
+                    }
+
             # ----------------------------------------------------------
             # Final validation: compute unbiased scores for survivors on
             # the held-out final_validation partition.
@@ -382,6 +447,7 @@ class ResearchMVP:
                 "findings": all_findings,
                 "composite_candidates_proposed": len(composite_specs),
                 "selected_models": selected_models,
+                "model_artifacts": model_artifacts,
             }
 
             import_summary = self._import_result(

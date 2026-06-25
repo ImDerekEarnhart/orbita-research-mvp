@@ -421,22 +421,59 @@ async def predict(
     payload = best["candidate"]["payload"]
     kind = payload["kind"]
 
-    train_path = plan_body.get("selected_dataset", {}).get("normalized_path")
-    if not train_path or not Path(train_path).exists():
-        raise HTTPException(status_code=422, detail="Training CSV is no longer available on this server")
-
-    train_df = pd.read_csv(train_path)
     target_transform = plan_body.get("target_transform") or None
     outcome_domain = plan_body.get("outcome_domain") or None
 
-    from .table_domain import UploadedTableDomain, _invert_transform
-    from orbita_discovery.core import Candidate
-    c = Candidate(id=best["candidate"]["id"], statement=best["candidate"]["statement"], payload=payload)
+    from .table_domain import _invert_transform
 
-    domain = UploadedTableDomain(train_df, [best["candidate"]], target_transform=target_transform)
-    model = domain.refit(c, train_df)
-    if not model.get("valid"):
-        raise HTTPException(status_code=422, detail="Refitting the survivor on training data produced an invalid model")
+    # Load the frozen model artifact — never refit (lstsq) at inference time.
+    model_artifacts = result.get("model_artifacts", {})
+    artifact_info = model_artifacts.get(target_column, {})
+    artifact_path_str = artifact_info.get("model_artifact_path")
+    model: dict
+    if artifact_path_str and Path(artifact_path_str).exists():
+        from .model_artifact import load_model_artifact
+        try:
+            artifact = load_model_artifact(artifact_path_str)
+        except Exception as _art_err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model artifact integrity check failed: {_art_err}"
+            )
+        # Build a model dict compatible with the prediction code below
+        if kind == "linear_association":
+            predictor = payload["predictor"]
+            model = {
+                "kind": kind, "valid": True,
+                "intercept": artifact["intercept"],
+                "slope": artifact["coefficients"].get(predictor, 0.0),
+                "target_transform": artifact.get("target_transform"),
+            }
+        elif kind == "composite_linear":
+            model = {
+                "kind": kind, "valid": True,
+                "intercept": artifact["intercept"],
+                "coefficients": artifact["coefficients"],
+                "predictors": artifact["predictor_order"],
+                "target_transform": artifact.get("target_transform"),
+            }
+        else:
+            raise HTTPException(status_code=422,
+                                detail=f"Unsupported kind in frozen artifact: {kind}")
+    else:
+        # No artifact — this run predates artifact serialization or artifact was lost.
+        # Refuse to silently refit; require the artifact to be present.
+        artifact_missing_hint = (
+            "Model artifact not found. "
+            "Runs created before v0.2.1 do not have frozen artifacts. "
+            "Re-run the case to generate a frozen artifact before calling /predict."
+        )
+        if artifact_path_str:
+            artifact_missing_hint = (
+                f"Model artifact expected at {artifact_path_str!r} but file is missing. "
+                "The volume may have been remounted or the artifact was deleted."
+            )
+        raise HTTPException(status_code=422, detail=artifact_missing_hint)
 
     # Load test CSV
     suffix = Path(file.filename or "test.csv").suffix
