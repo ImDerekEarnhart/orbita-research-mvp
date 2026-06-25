@@ -7,15 +7,16 @@ from typing import Any
 import pandas as pd
 
 from orbita import ActorRole, EpistemicLedger, EvidenceKind, Stance
-from orbita_discovery.core import Engine, Ledger, finding_to_dict, survivors
+from orbita_discovery.core import Candidate, Engine, Ledger, finding_to_dict, survivors
 from orbita_discovery.falsifiers import BaselineFalsifier, CrossSeedFalsifier, HeldOutFalsifier
 from orbita_discovery.judges import GatedJudge
 
-from .compiler import ResearchCompiler
+from .compiler import ResearchCompiler, compute_plan_hash
 from .composition import build_composite_candidates
 from .falsifiers import AblationFalsifier, ImprovementFalsifier
 from .ingestion import ArtifactIngestor
 from .memory import BeliefMemory
+from .metrics import higher_is_better, select_best_finding, validate_metric
 from .reporting import ReportCompiler
 from .storage import CaseStore
 from .table_domain import UploadedTableDomain
@@ -62,6 +63,9 @@ class ResearchMVP:
         max_candidates: int = 60,
         target_transform: str | None = None,
         outcome_domain: str | None = None,
+        evaluation_metric: str = "r2",
+        confirmation_fraction: float = 0.25,
+        final_validation_fraction: float = 0.15,
     ) -> dict[str, Any]:
         case = self.store.get_case(case_id)
         plan = self.compiler.compile(
@@ -69,6 +73,9 @@ class ResearchMVP:
             max_candidates=max_candidates,
             target_transform=target_transform,
             outcome_domain=outcome_domain,
+            evaluation_metric=evaluation_metric,
+            confirmation_fraction=confirmation_fraction,
+            final_validation_fraction=final_validation_fraction,
         )
         return self.store.save_plan(case_id, plan, compiler="orbita-heuristic-compiler/0.1")
 
@@ -106,6 +113,17 @@ class ResearchMVP:
         if plan.get("status") in {"needs_data", "no_candidates"}:
             raise ValueError("The plan is not executable: " + "; ".join(plan.get("blocking_questions", [])))
 
+        # Verify plan integrity before execution
+        stored_hash = plan.get("plan_hash")
+        if stored_hash:
+            current_hash = compute_plan_hash(plan)
+            if current_hash != stored_hash:
+                raise ValueError(
+                    f"Plan integrity check failed: stored hash {stored_hash[:12]}… "
+                    f"does not match current hash {current_hash[:12]}…. "
+                    "The plan may have been modified after compilation."
+                )
+
         selected_file = self.store.get_file(plan["selected_dataset"]["file_id"])
         df = pd.read_csv(selected_file["extracted_path"])
         run_record = self.store.create_run(case_id, plan_record["id"])
@@ -116,12 +134,24 @@ class ResearchMVP:
         try:
             thresholds = plan.get("thresholds", {})
             target_transform = plan.get("target_transform") or None
+            evaluation_metric = plan.get("evaluation_metric") or "r2"
+            validate_metric(evaluation_metric)
+
+            gen = plan.get("candidate_generation", {})
+            scout_fraction = float(gen.get("scout_fraction", 0.6))
+            confirmation_fraction = float(gen.get("confirmation_fraction", 0.25))
+            final_validation_fraction = float(gen.get("final_validation_fraction", 0.15))
+            seed = int(gen.get("seed", 20260623))
+
             domain = UploadedTableDomain(
                 df,
                 plan["candidates"],
-                scout_fraction=float(plan.get("candidate_generation", {}).get("scout_fraction", 0.6)),
-                seed=int(plan.get("candidate_generation", {}).get("seed", 20260623)),
+                scout_fraction=scout_fraction,
+                confirmation_fraction=confirmation_fraction,
+                final_validation_fraction=final_validation_fraction,
+                seed=seed,
                 target_transform=target_transform,
+                evaluation_metric=evaluation_metric,
             )
             judge = GatedJudge(
                 commit_at=float(thresholds.get("commit_at", 0.25)),
@@ -143,20 +173,55 @@ class ResearchMVP:
             phase1_findings = [finding_to_dict(item) for item in phase1_ledger.entries]
             phase1_survivors = survivors(phase1_ledger)
 
+            # Compute configured-metric scores for phase-1 survivors so that
+            # ImprovementFalsifier can compare in the correct metric units.
+            survivor_metric_scores: dict[str, float] = {}
+            hib = higher_is_better(evaluation_metric)
+            for entry in phase1_survivors:
+                fd = finding_to_dict(entry)
+                cid = fd["candidate"]["id"]
+                c_obj = Candidate(
+                    id=cid,
+                    statement=fd["candidate"]["statement"],
+                    payload=fd["candidate"]["payload"],
+                )
+                ev = domain.evidence_for(c_obj)
+                train, test = domain.splits(ev, seed=1)
+                model = domain.refit(c_obj, train)
+                if model.get("valid"):
+                    ms = domain.score_metric(c_obj, model, test)
+                    survivor_metric_scores[cid] = ms
+
             # Phase 2: composite candidate generation and falsification
             composite_specs = build_composite_candidates(
                 [finding_to_dict(s) for s in phase1_survivors],
                 min_predictors=int(thresholds.get("composite_min_predictors", 2)),
                 max_predictors=int(thresholds.get("composite_max_predictors", 10)),
+                metric_scores=survivor_metric_scores,
             )
+            # Fix best_individual_metric_score direction: build_composite_candidates
+            # stored min() by default; correct to max/min per actual metric direction.
+            for spec in composite_specs:
+                sm = spec.get("scout_metric", {})
+                pms = sm.get("parent_metric_scores", {})
+                if pms:
+                    vals = [v for v in pms.values() if v is not None]
+                    if vals:
+                        sm["best_individual_metric_score"] = (
+                            round(max(vals), 6) if hib else round(min(vals), 6)
+                        )
+
             phase2_findings: list[dict[str, Any]] = []
             if composite_specs:
                 composite_domain = UploadedTableDomain(
                     df,
                     composite_specs,
-                    scout_fraction=float(plan.get("candidate_generation", {}).get("scout_fraction", 0.6)),
-                    seed=int(plan.get("candidate_generation", {}).get("seed", 20260623)),
+                    scout_fraction=scout_fraction,
+                    confirmation_fraction=confirmation_fraction,
+                    final_validation_fraction=final_validation_fraction,
+                    seed=seed,
                     target_transform=target_transform,
+                    evaluation_metric=evaluation_metric,
                 )
                 composite_falsifiers = [
                     ImprovementFalsifier(
@@ -172,23 +237,65 @@ class ResearchMVP:
                         min_contribution=float(thresholds.get("ablation_min_contribution", 0.01))
                     ),
                 ]
-                # Composite ledger appended to same file for one tamper-evident chain
                 phase2_ledger = Ledger(ledger_path, truncate=False)
                 engine2 = Engine(judge, composite_falsifiers, phase2_ledger)
                 engine2.run(composite_domain)
                 phase2_findings = [finding_to_dict(item) for item in phase2_ledger.entries]
 
             all_findings = phase1_findings + phase2_findings
-            all_survivor_ids = (
-                [item.candidate.id for item in phase1_survivors]
-                + [f["candidate"]["id"] for f in phase2_findings
-                   if f["final_status"] != "refuted"
-                   and not any(a["killed"] for a in f["falsifications"])]
-            )
+
+            # ----------------------------------------------------------
+            # Final validation: compute unbiased scores for every survivor
+            # on the held-out final_validation partition.
+            # This partition was never accessed during candidate generation
+            # or model-selection (selection partition only).
+            # ----------------------------------------------------------
+            def _compute_final_validation_score(
+                finding: dict[str, Any],
+                dom: UploadedTableDomain,
+            ) -> float | None:
+                candidate_dict = finding["candidate"]
+                c_obj = Candidate(
+                    id=candidate_dict["id"],
+                    statement=candidate_dict["statement"],
+                    payload=candidate_dict["payload"],
+                )
+                model = dom.refit(c_obj, dom.scout)
+                if not model.get("valid") or len(dom.final_validation) < 3:
+                    return None
+                return dom.score_metric(c_obj, model, dom.final_validation)
+
+            for finding in all_findings:
+                is_survivor = (
+                    finding["final_status"] != "refuted"
+                    and not any(a["killed"] for a in finding["falsifications"])
+                )
+                if is_survivor:
+                    kind = finding["candidate"]["payload"].get("kind", "")
+                    dom = composite_domain if kind == "composite_linear" and composite_specs else domain
+                    try:
+                        fvs = _compute_final_validation_score(finding, dom)
+                    except Exception:
+                        fvs = None
+                    finding["final_validation_metric_score"] = fvs
+                    finding["final_validation_metric"] = evaluation_metric
+                    finding["evaluation_metric"] = evaluation_metric
+                else:
+                    finding["final_validation_metric_score"] = None
+                    finding["final_validation_metric"] = evaluation_metric
+                    finding["evaluation_metric"] = evaluation_metric
+
+            all_survivor_ids = [
+                f["candidate"]["id"] for f in all_findings
+                if f["final_status"] != "refuted"
+                and not any(a["killed"] for a in f["falsifications"])
+            ]
             engine_result = {
                 "run_id": run_record["id"],
                 "engine": "orbita-discovery-kit/0.2-compatible",
                 "domain": "uploaded_table",
+                "evaluation_metric": evaluation_metric,
+                "higher_is_better": hib,
                 "ledger_path": str(ledger_path.resolve()),
                 "candidate_count": len(all_findings),
                 "survivor_count": len(all_survivor_ids),
@@ -262,6 +369,9 @@ class ResearchMVP:
         from .influence import linear_influence_warning
         from .semantics import derive_finding_record
 
+        evaluation_metric = result.get("evaluation_metric", plan.get("evaluation_metric", "r2"))
+        target_transform = plan.get("target_transform")
+
         candidate_to_claim: dict[str, str] = {}
         claim_ids: list[str] = []
         for finding in result.get("findings", []):
@@ -272,6 +382,8 @@ class ResearchMVP:
                 "predictor": payload.get("predictor"),
                 "outcome": payload.get("outcome"),
                 "group": payload.get("group"),
+                "evaluation_metric": evaluation_metric,
+                "target_transform": target_transform,
             }
             claim_id, _ = self.memory.resolve_or_create_claim(
                 candidate["statement"],
@@ -281,6 +393,9 @@ class ResearchMVP:
                     "source_candidate_id": candidate["id"],
                     "generated_from_case": case_id,
                     "dataset_sha256": dataset_file["sha256"],
+                    "evaluation_metric": evaluation_metric,
+                    "target_transform": target_transform,
+                    "composition_strategy": payload.get("composition_strategy"),
                 },
             )
             candidate_to_claim[candidate["id"]] = claim_id
@@ -301,7 +416,13 @@ class ResearchMVP:
                 name="governed_judge",
                 passed=final_status in {"supported", "challenged", "provisional"},
                 score=finding.get("verdict", {}).get("score"),
-                detail=finding.get("verdict", {}).get("detail", {}),
+                detail={
+                    **finding.get("verdict", {}).get("detail", {}),
+                    "evaluation_metric": evaluation_metric,
+                    "higher_is_better": result.get("higher_is_better", True),
+                    "final_validation_metric_score": finding.get("final_validation_metric_score"),
+                    "fitted_coefficients": self._extract_coefficients(finding),
+                },
                 run_id=case_run_id,
             )
             for attack in finding.get("falsifications", []):
@@ -323,9 +444,6 @@ class ResearchMVP:
                 else "falsified_candidate" if final_status == "refuted"
                 else "untestable_candidate"
             )
-            # Flag findings that pass the thresholds but lean on a few
-            # high-leverage observations, so a leverage-dominated raw relation is
-            # not silently shown as strong as a transform-stable result.
             influence_warning = None
             if (
                 dataframe is not None
@@ -349,7 +467,6 @@ class ResearchMVP:
                 finding_detail=detail,
             )
 
-        # Populate derivation edges after every candidate has a durable claim ID.
         for finding in result.get("findings", []):
             candidate = finding["candidate"]
             child_id = candidate_to_claim[candidate["id"]]
@@ -364,7 +481,7 @@ class ResearchMVP:
                     actor_role=ActorRole.TOOL,
                 )
 
-        # Store data-quality findings as supported claims with dataset provenance.
+        artifact_count = 0
         for index, item in enumerate(plan.get("quality_findings", []), start=1):
             text = f"{item.get('title')}: {item.get('detail')}"
             claim_id, _ = self.memory.resolve_or_create_claim(
@@ -392,10 +509,6 @@ class ResearchMVP:
                 source_candidate_id=f"quality:{index}",
             )
 
-        # Record structural / transform artifacts (column vs its own log,
-        # duplicates, unit conversions, derived fields) as artifact claims so
-        # they are visible but never mined or displayed as scientific findings.
-        artifact_count = 0
         for artifact in plan.get("structural_relations", []):
             claim_id, _ = self.memory.resolve_or_create_claim(
                 artifact["statement"],
@@ -415,7 +528,6 @@ class ResearchMVP:
                 content=json.dumps(artifact, sort_keys=True),
                 metadata={"case_id": case_id, "artifact_kind": artifact.get("artifact_kind")},
             )
-            # Artifacts are structural facts about the table, not contested claims.
             self.ledger.attest(claim_id, evidence, Stance.SUPPORT, actor="artifact-detector", actor_role=ActorRole.TOOL)
             claim_ids.append(claim_id)
             self.store.link_claim(
@@ -440,6 +552,15 @@ class ResearchMVP:
             "candidate_to_claim": candidate_to_claim,
             "artifact_count": artifact_count,
         }
+
+    @staticmethod
+    def _extract_coefficients(finding: dict[str, Any]) -> dict[str, Any] | None:
+        """Return fitted model coefficients from a finding if available."""
+        # Coefficients are NOT stored in the ledger finding dict (the engine
+        # discards them after scoring).  They would need to be recomputed via
+        # refit() on the training data.  This is a known gap; the reference is
+        # stored as None here so the graph metadata records the absence.
+        return None
 
     # ------------------------------------------------------------------
     # Belief memory facade

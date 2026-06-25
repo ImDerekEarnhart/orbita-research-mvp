@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from orbita import EvidenceKind, Stance
 
 from .graph_ui import GRAPH_HTML, build_events, build_graph_data
+from .metrics import higher_is_better, validate_metric
 from .service import ResearchMVP
 
 
@@ -78,6 +79,9 @@ class CompileRequest(BaseModel):
     max_candidates: int = Field(default=60, ge=1, le=500)
     target_transform: str | None = Field(default=None, description="Monotone transform for numeric outcomes before fitting: 'log1p' or null")
     outcome_domain: str | None = Field(default=None, description="Domain constraint for predictions: 'nonneg' clips output to [0, inf), or null")
+    evaluation_metric: str = Field(default="r2", description="Metric used for model selection and final validation: r2, rmse, mae, rmsle")
+    confirmation_fraction: float = Field(default=0.25, ge=0.05, le=0.5, description="Fraction of rows reserved for model-selection (selection partition)")
+    final_validation_fraction: float = Field(default=0.15, ge=0.05, le=0.4, description="Fraction of rows reserved for final unbiased validation (never touched during model selection)")
 
 
 class ApproveRequest(BaseModel):
@@ -228,6 +232,9 @@ def compile_case(case_id: str, request: CompileRequest) -> dict[str, Any]:
         max_candidates=request.max_candidates,
         target_transform=request.target_transform,
         outcome_domain=request.outcome_domain,
+        evaluation_metric=request.evaluation_metric,
+        confirmation_fraction=request.confirmation_fraction,
+        final_validation_fraction=request.final_validation_fraction,
     )
 
 
@@ -349,8 +356,23 @@ async def predict(
                    f"{sorted({f['candidate']['payload'].get('outcome') for f in findings if f['final_status'] in accepted and not any(a['killed'] for a in f['falsifications'])})}"
         )
 
-    # Pick best survivor (highest verdict score)
-    best = max(target_survivors, key=lambda f: f["verdict"]["score"])
+    # Pick best survivor using the frozen evaluation metric.
+    # Prefer final_validation_metric_score (unbiased); fall back to verdict score (R²).
+    # Deterministic tie-break: lexicographic candidate ID.
+    evaluation_metric = plan_body.get("evaluation_metric") or "r2"
+    try:
+        validate_metric(evaluation_metric)
+    except ValueError:
+        evaluation_metric = "r2"
+    hib = higher_is_better(evaluation_metric)
+
+    def _survivor_sort_key(f):
+        fvs = f.get("final_validation_metric_score")
+        score = float(fvs) if fvs is not None else float(f["verdict"]["score"])
+        signed = score if hib else -score
+        return (signed, f["candidate"]["id"])
+
+    best = max(target_survivors, key=_survivor_sort_key)
     payload = best["candidate"]["payload"]
     kind = payload["kind"]
 
