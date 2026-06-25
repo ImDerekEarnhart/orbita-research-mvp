@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,52 @@ from .metrics import higher_is_better, select_best_finding, validate_metric
 from .reporting import ReportCompiler
 from .storage import CaseStore
 from .table_domain import UploadedTableDomain
+
+
+def _freeze_selected_models(
+    findings: list[dict[str, Any]],
+    selection_scores: dict[str, float],
+    evaluation_metric: str,
+    hib: bool,
+) -> dict[str, dict[str, Any]]:
+    """Deterministically select the winning committed model per outcome column.
+
+    Uses ONLY selection-partition scores.  Must be called BEFORE
+    final_validation scores are computed so the holdout partition cannot
+    influence model selection.
+
+    Returns a mapping of ``outcome → selection record`` containing:
+    ``selected_model_id``, ``selection_metric``, ``selection_metric_score``,
+    ``selection_higher_is_better``.
+    """
+    from .metrics import NULL_SCORE
+
+    survivors_by_outcome: dict[str, list[dict[str, Any]]] = {}
+    for f in findings:
+        if f["final_status"] == "refuted" or any(a["killed"] for a in f["falsifications"]):
+            continue
+        outcome = f["candidate"]["payload"].get("outcome")
+        if outcome:
+            survivors_by_outcome.setdefault(outcome, []).append(f)
+
+    null = NULL_SCORE.get(evaluation_metric, 0.0)
+    selected: dict[str, dict[str, Any]] = {}
+    for outcome, group in survivors_by_outcome.items():
+        def _key(f: dict[str, Any], _null: float = null, _hib: bool = hib) -> tuple:
+            sc = selection_scores.get(f["candidate"]["id"])
+            if sc is None or not math.isfinite(sc):
+                sc = _null
+            return (sc if _hib else -sc, f["candidate"]["id"])
+
+        winner = max(group, key=_key)
+        cid = winner["candidate"]["id"]
+        selected[outcome] = {
+            "selected_model_id": cid,
+            "selection_metric": evaluation_metric,
+            "selection_metric_score": selection_scores.get(cid),
+            "selection_higher_is_better": hib,
+        }
+    return selected
 
 
 class ResearchMVP:
@@ -244,11 +291,41 @@ class ResearchMVP:
 
             all_findings = phase1_findings + phase2_findings
 
+            # Collect selection-partition metric scores for all survivors.
+            # Phase-1 scores are in survivor_metric_scores (computed on the
+            # selection partition via score_metric with seed=1).
+            # Phase-2 composite scores were already computed by
+            # ImprovementFalsifier on the same partition; extract from the
+            # falsification detail to avoid a redundant refit.
+            all_selection_scores: dict[str, float] = dict(survivor_metric_scores)
+            for f in phase2_findings:
+                cid = f["candidate"]["id"]
+                if cid not in all_selection_scores:
+                    imp = next(
+                        (a for a in f["falsifications"] if a["name"] == "improvement"),
+                        None,
+                    )
+                    if imp and imp.get("detail", {}).get("composite_score") is not None:
+                        all_selection_scores[cid] = float(imp["detail"]["composite_score"])
+
+            # Stamp selection_metric_score onto every finding so it is
+            # visible in the ledger and available as a legacy fallback.
+            for f in all_findings:
+                f["selection_metric_score"] = all_selection_scores.get(f["candidate"]["id"])
+                f["selection_metric"] = evaluation_metric
+
+            # FREEZE selected model per outcome using ONLY selection-phase
+            # evidence — BEFORE final_validation scores are computed so the
+            # holdout partition cannot influence model selection.
+            selected_models = _freeze_selected_models(
+                all_findings, all_selection_scores, evaluation_metric, hib
+            )
+
             # ----------------------------------------------------------
-            # Final validation: compute unbiased scores for every survivor
-            # on the held-out final_validation partition.
-            # This partition was never accessed during candidate generation
-            # or model-selection (selection partition only).
+            # Final validation: compute unbiased scores for survivors on
+            # the held-out final_validation partition.
+            # REPORT-ONLY — these scores do NOT alter selected_model_id,
+            # model precedence, feature sets, or coefficients.
             # ----------------------------------------------------------
             def _compute_final_validation_score(
                 finding: dict[str, Any],
@@ -279,10 +356,12 @@ class ResearchMVP:
                         fvs = None
                     finding["final_validation_metric_score"] = fvs
                     finding["final_validation_metric"] = evaluation_metric
+                    finding["final_validation_report_only"] = True
                     finding["evaluation_metric"] = evaluation_metric
                 else:
                     finding["final_validation_metric_score"] = None
                     finding["final_validation_metric"] = evaluation_metric
+                    finding["final_validation_report_only"] = True
                     finding["evaluation_metric"] = evaluation_metric
 
             all_survivor_ids = [
@@ -302,6 +381,7 @@ class ResearchMVP:
                 "survivor_ids": all_survivor_ids,
                 "findings": all_findings,
                 "composite_candidates_proposed": len(composite_specs),
+                "selected_models": selected_models,
             }
 
             import_summary = self._import_result(

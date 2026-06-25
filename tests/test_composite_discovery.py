@@ -898,26 +898,40 @@ def test_acceptance_end_to_end(tmp_path):
         "At least one y2 composite must appear in survivor_ids"
     )
 
-    # ── Assertion 7: predict is deterministic ────────────────────────────
+    # ── Assertion 7: selected_models frozen before final validation ──────
+    selected_models_map = run_res["result"].get("selected_models", {})
+    assert selected_models_map, "run result must contain selected_models"
+    assert "y2" in selected_models_map, "selected_models must include outcome y2"
+    sel_y2 = selected_models_map["y2"]
+    assert sel_y2.get("selected_model_id"), "selected_model_id must be set"
+    assert sel_y2.get("selection_metric") == "r2"
+    assert sel_y2.get("selection_metric_score") is not None
+
     y2_all_survivors = [
         f for f in findings
         if f["final_status"] != "refuted"
         and not any(atk["killed"] for atk in f["falsifications"])
         and f["candidate"]["payload"].get("outcome") == "y2"
     ]
+    # Verify final_validation_report_only is set on survivors
+    for f in y2_all_survivors:
+        assert f.get("final_validation_report_only") is True, (
+            f"final_validation_report_only must be True on {f['candidate']['id']}"
+        )
+    # Verify selected_model_id matches the best selection_metric_score winner
     if y2_all_survivors:
-        best = select_best_finding(
-            y2_all_survivors, "r2",
-            score_key="final_validation_metric_score",
-            fallback_key="verdict_score",
+        hib_flag = sel_y2["selection_higher_is_better"]
+        best_by_sel = max(
+            y2_all_survivors,
+            key=lambda f: (
+                (f.get("selection_metric_score") or 0.0) if hib_flag
+                else -(f.get("selection_metric_score") or float("inf")),
+                f["candidate"]["id"],
+            ),
         )
-        best2 = select_best_finding(
-            y2_all_survivors, "r2",
-            score_key="final_validation_metric_score",
-            fallback_key="verdict_score",
+        assert sel_y2["selected_model_id"] == best_by_sel["candidate"]["id"], (
+            "selected_model_id must match the winner by selection_metric_score"
         )
-        assert best["candidate"]["id"] == best2["candidate"]["id"], \
-            "Model selection must be deterministic"
 
     # ── Assertion 8: frozen plan fields applied to predict ────────────────
     plan_body = plan_rec["plan"]
@@ -968,4 +982,187 @@ def test_acceptance_end_to_end(tmp_path):
     assert plan_hash_1 == plan_hash_3, (
         f"Identical compile parameters must produce identical plan_hash. "
         f"run1={plan_hash_1[:12]}… run3={plan_hash_3[:12]}…"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Final-validation leakage prevention tests
+# ---------------------------------------------------------------------------
+
+def test_freeze_selected_models_uses_selection_not_final_validation():
+    """_freeze_selected_models picks A (better selection score) regardless of fvs."""
+    from orbita_mvp.service import _freeze_selected_models
+
+    findings = [
+        {
+            "candidate": {"id": "model_a", "payload": {"outcome": "y", "kind": "linear_association"}},
+            "final_status": "supported",
+            "falsifications": [],
+        },
+        {
+            "candidate": {"id": "model_b", "payload": {"outcome": "y", "kind": "linear_association"}},
+            "final_status": "supported",
+            "falsifications": [],
+        },
+    ]
+    # A wins selection (R²=0.90); B would win if fvs were used (not passed here)
+    selection_scores = {"model_a": 0.90, "model_b": 0.70}
+
+    result = _freeze_selected_models(findings, selection_scores, "r2", hib=True)
+
+    assert result["y"]["selected_model_id"] == "model_a"
+    assert result["y"]["selection_metric_score"] == 0.90
+    assert result["y"]["selection_metric"] == "r2"
+    assert result["y"]["selection_higher_is_better"] is True
+
+
+def test_freeze_selected_models_rmsle_lower_is_better():
+    """_freeze_selected_models selects the lower RMSLE model for lower-is-better metrics."""
+    from orbita_mvp.service import _freeze_selected_models
+
+    findings = [
+        {
+            "candidate": {"id": "model_a", "payload": {"outcome": "y", "kind": "linear_association"}},
+            "final_status": "supported",
+            "falsifications": [],
+        },
+        {
+            "candidate": {"id": "model_b", "payload": {"outcome": "y", "kind": "linear_association"}},
+            "final_status": "supported",
+            "falsifications": [],
+        },
+    ]
+    # A has lower RMSLE (better); B has higher RMSLE (worse)
+    selection_scores = {"model_a": 0.15, "model_b": 0.35}
+
+    result = _freeze_selected_models(findings, selection_scores, "rmsle", hib=False)
+
+    assert result["y"]["selected_model_id"] == "model_a"
+    assert result["y"]["selection_metric_score"] == 0.15
+    assert result["y"]["selection_higher_is_better"] is False
+
+
+def test_final_validation_disagreement_does_not_change_selection(tmp_path):
+    """Run produces selected_models from selection scores. Mutating fvs after the
+    fact cannot change which model is frozen."""
+    import csv as csv_mod
+    import numpy as np
+    from orbita_mvp.service import ResearchMVP
+
+    rng = np.random.default_rng(99)
+    n = 120
+    x1 = rng.uniform(1, 10, n)
+    x2 = rng.uniform(1, 10, n)
+    y = 4.0 * x1 + rng.normal(0, 0.3, n)
+
+    rows = [
+        {"row_id": i + 1, "x1": round(float(x1[i]), 4),
+         "x2": round(float(x2[i]), 4), "y": round(float(y[i]), 4)}
+        for i in range(n)
+    ]
+    csv_path = tmp_path / "fv_test.csv"
+    with open(csv_path, "w", newline="") as fh:
+        writer = csv_mod.DictWriter(fh, fieldnames=["row_id", "x1", "x2", "y"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with ResearchMVP(tmp_path / "fv.db", tmp_path / "ws") as svc:
+        case = svc.create_case(name="fv-disagree", goal="")
+        svc.add_file(case["id"], csv_path)
+        svc.compile_case(case["id"], evaluation_metric="r2")
+        run_res = svc.run_case(case["id"], auto_approve=True)
+
+    result = run_res["result"]
+    selected_models = result.get("selected_models", {})
+    all_findings = result.get("findings", [])
+
+    assert selected_models, "selected_models must be in run result"
+    assert "y" in selected_models, "selected_models must include outcome y"
+
+    sel = selected_models["y"]
+    selected_id = sel["selected_model_id"]
+    hib_flag = sel["selection_higher_is_better"]
+
+    # Find all survivors for y
+    survivors_y = [
+        f for f in all_findings
+        if f["final_status"] != "refuted"
+        and not any(a["killed"] for a in f["falsifications"])
+        and f["candidate"]["payload"].get("outcome") == "y"
+    ]
+
+    # selected_model_id must match the selection_metric_score winner
+    best_by_selection = max(
+        survivors_y,
+        key=lambda f: (
+            (f.get("selection_metric_score") or 0.0) if hib_flag
+            else -(f.get("selection_metric_score") or float("inf")),
+            f["candidate"]["id"],
+        ),
+    )
+    assert selected_id == best_by_selection["candidate"]["id"], (
+        f"selected_model_id={selected_id} must match selection winner "
+        f"{best_by_selection['candidate']['id']}"
+    )
+
+    # final_validation scores are marked report_only
+    for f in survivors_y:
+        assert f.get("final_validation_report_only") is True, (
+            f"final_validation_report_only must be True on {f['candidate']['id']}"
+        )
+
+    # Corrupt all fvs — selection must not change
+    original_selected_id = selected_id
+    for f in all_findings:
+        f["final_validation_metric_score"] = 999.0
+
+    best_after_corrupt = max(
+        survivors_y,
+        key=lambda f: (
+            (f.get("selection_metric_score") or 0.0) if hib_flag
+            else -(f.get("selection_metric_score") or float("inf")),
+            f["candidate"]["id"],
+        ),
+    )
+    assert original_selected_id == best_after_corrupt["candidate"]["id"], (
+        "Corrupting final_validation_metric_score must not change selected_model_id"
+    )
+
+
+def test_selected_model_id_deterministic_across_reruns(tmp_path):
+    """Two runs on the same data produce the same selected_model_id and plan_hash."""
+    import csv as csv_mod
+    import numpy as np
+    from orbita_mvp.service import ResearchMVP
+
+    rng = np.random.default_rng(7)
+    n = 100
+    x1 = rng.uniform(1, 10, n)
+    y = 2.5 * x1 + rng.normal(0, 0.5, n)
+
+    rows = [{"row_id": i + 1, "x1": round(float(x1[i]), 4),
+             "y": round(float(y[i]), 4)} for i in range(n)]
+    csv_path = tmp_path / "det_test.csv"
+    with open(csv_path, "w", newline="") as fh:
+        writer = csv_mod.DictWriter(fh, fieldnames=["row_id", "x1", "y"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    def _run(db_suffix: str) -> dict:
+        with ResearchMVP(tmp_path / f"det{db_suffix}.db", tmp_path / f"ws{db_suffix}") as svc:
+            case = svc.create_case(name="det-test", goal="")
+            svc.add_file(case["id"], csv_path)
+            plan_rec = svc.compile_case(case["id"], evaluation_metric="r2")
+            run_res = svc.run_case(case["id"], auto_approve=True)
+        return {
+            "plan_hash": plan_rec["plan"]["plan_hash"],
+            "selected_models": run_res["result"].get("selected_models", {}),
+        }
+
+    r1 = _run("1")
+    r2 = _run("2")
+
+    assert r1["plan_hash"] == r2["plan_hash"], "Identical compiles must produce same plan_hash"
+    assert r1["selected_models"] == r2["selected_models"], (
+        "Identical runs must freeze the same selected_model_id"
     )

@@ -26,11 +26,13 @@ from .service import ResearchMVP
 _data_dir = Path("/data") if Path("/data").exists() else Path(".")
 DB_PATH = Path(os.getenv("ORBITA_MVP_DB", str(_data_dir / "orbita_mvp.db")))
 WORKSPACE = Path(os.getenv("ORBITA_MVP_WORKSPACE", str(_data_dir / "orbita_workspace")))
+# Prefer an explicit build-time SHA; fall back to Railway's injected variable.
+_GIT_COMMIT = os.getenv("GIT_COMMIT_SHA", os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"))
 service = ResearchMVP(DB_PATH, WORKSPACE)
 
 app = FastAPI(
     title="Orbita Research MVP",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Upload research material, compile an explicit governed plan, run frozen "
         "discovery candidates, persist findings in an epistemic graph, and produce "
@@ -156,7 +158,14 @@ def home() -> str:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "version": "0.1.0", "db": str(DB_PATH.resolve()), "workspace": str(WORKSPACE.resolve())}
+    return {
+        "status": "ok",
+        "version": "0.2.0",
+        "git_commit": _GIT_COMMIT,
+        "plan_schema": "orbita-research-plan/0.2",
+        "db": str(DB_PATH.resolve()),
+        "workspace": str(WORKSPACE.resolve()),
+    }
 
 
 @app.post("/cases")
@@ -369,23 +378,46 @@ async def predict(
 
     plan_body = plan_record["plan"]
 
-    # Pick best survivor using the frozen evaluation metric.
-    # Prefer final_validation_metric_score (unbiased); fall back to verdict score (R²).
-    # Deterministic tie-break: lexicographic candidate ID.
-    evaluation_metric = plan_body.get("evaluation_metric") or "r2"
-    try:
-        validate_metric(evaluation_metric)
-    except ValueError:
-        evaluation_metric = "r2"
-    hib = higher_is_better(evaluation_metric)
+    # Load the pre-frozen selected_model_id.
+    # final_validation_metric_score is report-only and must not influence
+    # which model is served — that decision was frozen before fvs was computed.
+    selected_models = result.get("selected_models", {})
+    selected_info = selected_models.get(target_column)
 
-    def _survivor_sort_key(f):
-        fvs = f.get("final_validation_metric_score")
-        score = float(fvs) if fvs is not None else float(f["verdict"]["score"])
-        signed = score if hib else -score
-        return (signed, f["candidate"]["id"])
+    if selected_info:
+        # Modern runs: read the frozen selection winner directly.
+        selected_model_id = selected_info["selected_model_id"]
+        best = next(
+            (f for f in target_survivors if f["candidate"]["id"] == selected_model_id),
+            None,
+        )
+        if best is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Frozen selected_model_id '{selected_model_id}' is not present "
+                    f"among committed survivors for outcome '{target_column}'. "
+                    "The run result may be corrupted."
+                ),
+            )
+    else:
+        # Legacy runs without selected_models: rank by selection_metric_score,
+        # then verdict score.  Never use final_validation_metric_score.
+        evaluation_metric = plan_body.get("evaluation_metric") or "r2"
+        try:
+            validate_metric(evaluation_metric)
+        except ValueError:
+            evaluation_metric = "r2"
+        hib_flag = higher_is_better(evaluation_metric)
 
-    best = max(target_survivors, key=_survivor_sort_key)
+        def _legacy_sort_key(f):
+            sc = f.get("selection_metric_score")
+            if sc is None or not isinstance(sc, (int, float)):
+                sc = float(f["verdict"]["score"])
+            return (sc if hib_flag else -sc, f["candidate"]["id"])
+
+        best = max(target_survivors, key=_legacy_sort_key)
+
     payload = best["candidate"]["payload"]
     kind = payload["kind"]
 
