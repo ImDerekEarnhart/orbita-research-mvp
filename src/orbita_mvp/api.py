@@ -356,6 +356,19 @@ async def predict(
                    f"{sorted({f['candidate']['payload'].get('outcome') for f in findings if f['final_status'] in accepted and not any(a['killed'] for a in f['falsifications'])})}"
         )
 
+    # Re-read training data plan so we can read the frozen evaluation metric.
+    plan_record = service.store.get_plan(run["plan_id"]) if run.get("plan_id") else None
+    if not plan_record:
+        case_id_run = run.get("case_id")
+        if case_id_run:
+            case_obj = service.store.get_case(case_id_run)
+            if case_obj.get("plans"):
+                plan_record = case_obj["plans"][0]
+    if not plan_record:
+        raise HTTPException(status_code=422, detail="Cannot locate training plan for this run")
+
+    plan_body = plan_record["plan"]
+
     # Pick best survivor using the frozen evaluation metric.
     # Prefer final_validation_metric_score (unbiased); fall back to verdict score (R²).
     # Deterministic tie-break: lexicographic candidate ID.
@@ -376,18 +389,6 @@ async def predict(
     payload = best["candidate"]["payload"]
     kind = payload["kind"]
 
-    # Re-read training data and refit on full training set
-    plan_record = service.store.get_plan(run["plan_id"]) if run.get("plan_id") else None
-    if not plan_record:
-        case_id_run = run.get("case_id")
-        if case_id_run:
-            case_obj = service.store.get_case(case_id_run)
-            if case_obj.get("plans"):
-                plan_record = case_obj["plans"][0]
-    if not plan_record:
-        raise HTTPException(status_code=422, detail="Cannot locate training plan for this run")
-
-    plan_body = plan_record["plan"]
     train_path = plan_body.get("selected_dataset", {}).get("normalized_path")
     if not train_path or not Path(train_path).exists():
         raise HTTPException(status_code=422, detail="Training CSV is no longer available on this server")
