@@ -1,23 +1,54 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from .metrics import validate_metric
 from .table_domain import generate_table_candidates
+
+# Fields that are frozen at compile time and must not change before execution.
+# Any modification to these fields changes the plan hash and invalidates the plan.
+IMMUTABLE_PLAN_FIELDS = (
+    "target_transform",
+    "outcome_domain",
+    "evaluation_metric",
+    "thresholds",
+    "candidate_generation",
+)
+
+
+def compute_plan_hash(plan: dict[str, Any]) -> str:
+    """SHA-256 of the canonical JSON encoding of the immutable plan fields."""
+    subset = {k: plan.get(k) for k in IMMUTABLE_PLAN_FIELDS}
+    canonical = json.dumps(subset, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class ResearchCompiler:
     """Translate a case into an explicit, reviewable, frozen analysis plan."""
 
-    def compile(self, case: dict[str, Any], *, max_candidates: int = 60) -> dict[str, Any]:
+    def compile(
+        self,
+        case: dict[str, Any],
+        *,
+        max_candidates: int = 60,
+        target_transform: str | None = None,
+        outcome_domain: str | None = None,
+        evaluation_metric: str = "r2",
+        confirmation_fraction: float = 0.25,
+        final_validation_fraction: float = 0.15,
+    ) -> dict[str, Any]:
+        validate_metric(evaluation_metric)
         files = case.get("files", [])
         tables = [f for f in files if f.get("artifact_kind") == "table" and f.get("extracted_path")]
         texts = [f for f in files if f.get("artifact_kind") == "text" and f.get("extracted_path")]
         if not tables:
             return {
-                "schema_version": "orbita-research-plan/0.1",
+                "schema_version": "orbita-research-plan/0.2",
                 "mode": case.get("mode", "open_discovery"),
                 "goal": case.get("goal", ""),
                 "status": "needs_data",
@@ -32,6 +63,14 @@ class ResearchCompiler:
         selected = max(tables, key=lambda item: int(item.get("profile", {}).get("rows", 0)))
         df = pd.read_csv(Path(selected["extracted_path"]))
         profile = selected.get("profile", {})
+
+        scout_fraction = 1.0 - confirmation_fraction - final_validation_fraction
+        if scout_fraction < 0.3:
+            raise ValueError(
+                f"scout_fraction ({scout_fraction:.3f}) is too small; "
+                "reduce confirmation_fraction or final_validation_fraction"
+            )
+
         assumptions = [
             {
                 "id": "unit_of_analysis",
@@ -61,9 +100,16 @@ class ResearchCompiler:
             max_candidates=max_candidates,
             exclude_columns=identifier_columns,
         )
+        # Augment generation dict with all partition fractions so the service
+        # can reconstruct the exact same split as candidate generation used.
+        generation["confirmation_fraction"] = confirmation_fraction
+        generation["final_validation_fraction"] = final_validation_fraction
+        generation["scout_fraction"] = scout_fraction
+
         quality_findings = self._quality_findings(profile)
-        return {
-            "schema_version": "orbita-research-plan/0.1",
+
+        plan: dict[str, Any] = {
+            "schema_version": "orbita-research-plan/0.2",
             "mode": case.get("mode", "open_discovery"),
             "goal": case.get("goal", ""),
             "status": "ready_for_review" if candidates else "no_candidates",
@@ -82,6 +128,10 @@ class ResearchCompiler:
             "candidate_generation": generation,
             "structural_relations": generation.get("structural_relations", []),
             "routes": ["uploaded_table_association", "data_quality_audit", "belief_graph_import"],
+            "target_transform": target_transform,
+            "outcome_domain": outcome_domain,
+            "evaluation_metric": evaluation_metric,
+            "composition_strategy": "composition_v1",
             "thresholds": {
                 "commit_at": 0.25,
                 "baseline_margin": 0.05,
@@ -89,6 +139,10 @@ class ResearchCompiler:
                 "cross_seed_count": 9,
                 "cross_seed_min": 0.15,
                 "cross_seed_max_spread": 0.65,
+                "composite_min_predictors": 2,
+                "composite_max_predictors": 10,
+                "composite_min_improvement": 0.01,
+                "ablation_min_contribution": 0.01,
             },
             "candidates": candidates,
             "assumptions": assumptions,
@@ -105,6 +159,8 @@ class ResearchCompiler:
                 "provenance_and_receipts",
             ],
         }
+        plan["plan_hash"] = compute_plan_hash(plan)
+        return plan
 
     def validate_external_plan(self, case: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
         required = {"schema_version", "selected_dataset", "candidates", "thresholds"}
@@ -122,6 +178,11 @@ class ResearchCompiler:
             if candidate["id"] in seen:
                 raise ValueError(f"Duplicate candidate id: {candidate['id']}")
             seen.add(candidate["id"])
+        # Validate metric if present; default to r2 for backward compatibility.
+        metric = plan.get("evaluation_metric", "r2")
+        validate_metric(metric)
+        # Always recompute plan_hash after validation so revisions get a fresh hash.
+        plan["plan_hash"] = compute_plan_hash(plan)
         return plan
 
     def _source_summary(self, item: dict[str, Any]) -> dict[str, Any]:

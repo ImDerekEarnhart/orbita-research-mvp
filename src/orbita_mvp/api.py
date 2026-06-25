@@ -19,17 +19,20 @@ from pydantic import BaseModel, Field
 from orbita import EvidenceKind, Stance
 
 from .graph_ui import GRAPH_HTML, build_events, build_graph_data
+from .metrics import higher_is_better, validate_metric
 from .service import ResearchMVP
 
 
 _data_dir = Path("/data") if Path("/data").exists() else Path(".")
 DB_PATH = Path(os.getenv("ORBITA_MVP_DB", str(_data_dir / "orbita_mvp.db")))
 WORKSPACE = Path(os.getenv("ORBITA_MVP_WORKSPACE", str(_data_dir / "orbita_workspace")))
+# Prefer an explicit build-time SHA; fall back to Railway's injected variable.
+_GIT_COMMIT = os.getenv("GIT_COMMIT_SHA", os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"))
 service = ResearchMVP(DB_PATH, WORKSPACE)
 
 app = FastAPI(
     title="Orbita Research MVP",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Upload research material, compile an explicit governed plan, run frozen "
         "discovery candidates, persist findings in an epistemic graph, and produce "
@@ -76,6 +79,11 @@ class CaseCreate(BaseModel):
 
 class CompileRequest(BaseModel):
     max_candidates: int = Field(default=60, ge=1, le=500)
+    target_transform: str | None = Field(default=None, description="Monotone transform for numeric outcomes before fitting: 'log1p' or null")
+    outcome_domain: str | None = Field(default=None, description="Domain constraint for predictions: 'nonneg' clips output to [0, inf), or null")
+    evaluation_metric: str = Field(default="r2", description="Metric used for model selection and final validation: r2, rmse, mae, rmsle")
+    confirmation_fraction: float = Field(default=0.25, ge=0.05, le=0.5, description="Fraction of rows reserved for model-selection (selection partition)")
+    final_validation_fraction: float = Field(default=0.15, ge=0.05, le=0.4, description="Fraction of rows reserved for final unbiased validation (never touched during model selection)")
 
 
 class ApproveRequest(BaseModel):
@@ -150,7 +158,14 @@ def home() -> str:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "version": "0.1.0", "db": str(DB_PATH.resolve()), "workspace": str(WORKSPACE.resolve())}
+    return {
+        "status": "ok",
+        "version": "0.2.0",
+        "git_commit": _GIT_COMMIT,
+        "plan_schema": "orbita-research-plan/0.2",
+        "db": str(DB_PATH.resolve()),
+        "workspace": str(WORKSPACE.resolve()),
+    }
 
 
 @app.post("/cases")
@@ -220,7 +235,16 @@ def upload_file(case_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.post("/cases/{case_id}/compile")
 def compile_case(case_id: str, request: CompileRequest) -> dict[str, Any]:
-    return _guard(service.compile_case, case_id, max_candidates=request.max_candidates)
+    return _guard(
+        service.compile_case,
+        case_id,
+        max_candidates=request.max_candidates,
+        target_transform=request.target_transform,
+        outcome_domain=request.outcome_domain,
+        evaluation_metric=request.evaluation_metric,
+        confirmation_fraction=request.confirmation_fraction,
+        final_validation_fraction=request.final_validation_fraction,
+    )
 
 
 @app.post("/cases/{case_id}/plans")
@@ -341,35 +365,75 @@ async def predict(
                    f"{sorted({f['candidate']['payload'].get('outcome') for f in findings if f['final_status'] in accepted and not any(a['killed'] for a in f['falsifications'])})}"
         )
 
-    # Pick best survivor (highest verdict score)
-    best = max(target_survivors, key=lambda f: f["verdict"]["score"])
-    payload = best["candidate"]["payload"]
-    kind = payload["kind"]
-
-    # Re-read training data and refit on full training set
+    # Re-read training data plan so we can read the frozen evaluation metric.
     plan_record = service.store.get_plan(run["plan_id"]) if run.get("plan_id") else None
     if not plan_record:
-        # fall back: find plan via case
-        case_id = run.get("case_id")
-        if case_id:
-            case = service.store.get_case(case_id)
-            if case.get("plans"):
-                plan_record = case["plans"][0]
+        case_id_run = run.get("case_id")
+        if case_id_run:
+            case_obj = service.store.get_case(case_id_run)
+            if case_obj.get("plans"):
+                plan_record = case_obj["plans"][0]
     if not plan_record:
         raise HTTPException(status_code=422, detail="Cannot locate training plan for this run")
 
-    train_path = plan_record["plan"].get("selected_dataset", {}).get("normalized_path")
+    plan_body = plan_record["plan"]
+
+    # Load the pre-frozen selected_model_id.
+    # final_validation_metric_score is report-only and must not influence
+    # which model is served — that decision was frozen before fvs was computed.
+    selected_models = result.get("selected_models", {})
+    selected_info = selected_models.get(target_column)
+
+    if selected_info:
+        # Modern runs: read the frozen selection winner directly.
+        selected_model_id = selected_info["selected_model_id"]
+        best = next(
+            (f for f in target_survivors if f["candidate"]["id"] == selected_model_id),
+            None,
+        )
+        if best is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Frozen selected_model_id '{selected_model_id}' is not present "
+                    f"among committed survivors for outcome '{target_column}'. "
+                    "The run result may be corrupted."
+                ),
+            )
+    else:
+        # Legacy runs without selected_models: rank by selection_metric_score,
+        # then verdict score.  Never use final_validation_metric_score.
+        evaluation_metric = plan_body.get("evaluation_metric") or "r2"
+        try:
+            validate_metric(evaluation_metric)
+        except ValueError:
+            evaluation_metric = "r2"
+        hib_flag = higher_is_better(evaluation_metric)
+
+        def _legacy_sort_key(f):
+            sc = f.get("selection_metric_score")
+            if sc is None or not isinstance(sc, (int, float)):
+                sc = float(f["verdict"]["score"])
+            return (sc if hib_flag else -sc, f["candidate"]["id"])
+
+        best = max(target_survivors, key=_legacy_sort_key)
+
+    payload = best["candidate"]["payload"]
+    kind = payload["kind"]
+
+    train_path = plan_body.get("selected_dataset", {}).get("normalized_path")
     if not train_path or not Path(train_path).exists():
         raise HTTPException(status_code=422, detail="Training CSV is no longer available on this server")
 
     train_df = pd.read_csv(train_path)
+    target_transform = plan_body.get("target_transform") or None
+    outcome_domain = plan_body.get("outcome_domain") or None
 
-    # Refit on full training set (not just scout partition)
-    from .table_domain import UploadedTableDomain
+    from .table_domain import UploadedTableDomain, _invert_transform
     from orbita_discovery.core import Candidate
     c = Candidate(id=best["candidate"]["id"], statement=best["candidate"]["statement"], payload=payload)
 
-    domain = UploadedTableDomain(train_df, [best["candidate"]])
+    domain = UploadedTableDomain(train_df, [best["candidate"]], target_transform=target_transform)
     model = domain.refit(c, train_df)
     if not model.get("valid"):
         raise HTTPException(status_code=422, detail="Refitting the survivor on training data produced an invalid model")
@@ -389,26 +453,45 @@ async def predict(
 
     # Generate predictions row by row
     row_ids = test_df[identifier_column].tolist()
-    predictions: list[float | None] = []
+    raw_preds: np.ndarray | None = None
 
     if kind == "linear_association":
         predictor = payload["predictor"]
         if predictor not in test_df.columns:
             raise HTTPException(status_code=422, detail=f"Predictor column '{predictor}' not found in test file")
-        xs = pd.to_numeric(test_df[predictor], errors="coerce")
-        preds = model["intercept"] + model["slope"] * xs
-        predictions = [None if not np.isfinite(v) else round(float(v), 8) for v in preds]
+        xs = pd.to_numeric(test_df[predictor], errors="coerce").to_numpy(float)
+        raw_preds = model["intercept"] + model["slope"] * xs
+
+    elif kind == "composite_linear":
+        predictors = model["predictors"]
+        missing = [p for p in predictors if p not in test_df.columns]
+        if missing:
+            raise HTTPException(status_code=422, detail=f"Composite predictor columns missing from test file: {missing}")
+        X = np.column_stack([np.ones(len(test_df))] + [
+            pd.to_numeric(test_df[p], errors="coerce").to_numpy(float) for p in predictors
+        ])
+        beta = np.array([model["intercept"]] + [model["coefficients"][p] for p in predictors])
+        raw_preds = X @ beta
 
     elif kind == "group_difference":
         group_col = payload["group"]
         if group_col not in test_df.columns:
             raise HTTPException(status_code=422, detail=f"Group column '{group_col}' not found in test file")
-        predictions = [
+        raw_preds = np.array([
             model["means"].get(str(g), model["overall"])
             for g in test_df[group_col].astype(str)
-        ]
+        ], dtype=float)
     else:
         raise HTTPException(status_code=422, detail=f"Unsupported survivor kind for prediction: {kind}")
+
+    # Invert transform and apply domain constraint
+    final_preds = _invert_transform(raw_preds, target_transform)
+    if outcome_domain == "nonneg":
+        final_preds = np.clip(final_preds, 0, None)
+
+    predictions: list[float | None] = [
+        None if not np.isfinite(v) else round(float(v), 8) for v in final_preds
+    ]
 
     # Build CSV output
     output = io.StringIO()

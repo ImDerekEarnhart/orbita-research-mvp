@@ -12,6 +12,7 @@ import pandas as pd
 from orbita_discovery.core import Candidate
 
 from .artifacts import detect_structural_relations, structural_for
+from .metrics import compute_metric, higher_is_better, validate_metric
 
 
 def _slug(text: str) -> str:
@@ -28,6 +29,7 @@ def _safe_numeric(df: pd.DataFrame, column: str) -> pd.Series:
 
 
 def _r2(y: np.ndarray, pred: np.ndarray) -> float:
+    """Internal R² — used by all model-fitness checks regardless of evaluation metric."""
     mask = np.isfinite(y) & np.isfinite(pred)
     y = y[mask]
     pred = pred[mask]
@@ -88,9 +90,6 @@ def generate_table_candidates(
     goal_columns = _goal_columns(goal, [str(c) for c in df.columns]) if goal.strip() else []
     scored: list[tuple[float, dict[str, Any]]] = []
 
-    # Detect structural / transform artifacts up front (column vs its own log,
-    # duplicates, unit conversions, derived fields) so they are recorded as
-    # artifacts rather than mined as ordinary scientific hypotheses.
     structural = detect_structural_relations(df, numeric_columns=numeric_columns)
     structural_relations: list[dict[str, Any]] = []
     seen_structural: set[str] = set()
@@ -123,7 +122,6 @@ def generate_table_candidates(
             if not math.isfinite(r) or abs(r) < 0.2:
                 continue
             direction = "positive" if r >= 0 else "negative"
-            # Prefer a goal-named column as outcome when possible; otherwise keep a stable order.
             if y in goal_columns and x not in goal_columns:
                 predictor, outcome = x, y
             elif x in goal_columns and y not in goal_columns:
@@ -196,13 +194,59 @@ def generate_table_candidates(
     return candidates, generation
 
 
+def _apply_transform(y: np.ndarray, transform: str | None) -> np.ndarray:
+    if transform == "log1p":
+        return np.log1p(np.clip(y, 0, None))
+    return y
+
+
+def _invert_transform(y: np.ndarray, transform: str | None) -> np.ndarray:
+    if transform == "log1p":
+        return np.expm1(y)
+    return y
+
+
 class UploadedTableDomain:
     """Fittable domain for frozen candidates compiled from an uploaded table.
 
-    Candidate generation sees only a deterministic scout partition. The judge
-    and falsifiers score frozen candidates on the locked confirmation partition.
-    Cross-seed checks bootstrap the confirmation partition rather than exposing
-    it to candidate generation.
+    Partition layout
+    ----------------
+    The full dataset is split **once** using a deterministic shuffle:
+
+    * ``scout``            (default 60 %) — candidate generation only.
+    * ``selection``        (default 25 %) — all model-selection decisions:
+                           held-out, cross-seed, ablation, improvement checks.
+    * ``final_validation`` (default 15 %) — **never** accessed during candidate
+                           generation or model selection.  Used by the service
+                           layer to compute the unbiased final reported score.
+
+    The engine and all falsifiers receive ``evidence["confirmation"] = selection``
+    through ``evidence_for()``.  ``final_validation`` is exposed as an attribute
+    but never injected into the evidence dict so the engine cannot reach it.
+
+    Metric
+    ------
+    ``evaluation_metric`` governs how ``score_metric()`` evaluates predictions.
+    The internal ``score()`` method always uses R² to give the ``GatedJudge``
+    and threshold-based falsifiers a direction-consistent fitness signal
+    regardless of the external evaluation metric.  ``ImprovementFalsifier``
+    explicitly calls ``score_metric()`` for metric-direction-aware comparison.
+
+    Parameters
+    ----------
+    target_transform:
+        Monotone transform applied to numeric outcome columns before fitting and
+        scoring (``"log1p"`` supported).  Predictions are returned in transformed
+        space by ``score()``; callers are responsible for inverting with
+        ``_invert_transform``.
+    evaluation_metric:
+        Metric used by ``score_metric()`` and the final validation scorer.
+        Defaults to ``"r2"`` (backward-compatible).
+    confirmation_fraction:
+        Fraction of total rows reserved for the *selection* partition.
+    final_validation_fraction:
+        Fraction reserved for the *final validation* partition.  Must satisfy
+        ``scout_fraction + confirmation_fraction + final_validation_fraction <= 1``.
     """
 
     name = "uploaded_table"
@@ -213,17 +257,43 @@ class UploadedTableDomain:
         candidates: list[dict[str, Any]],
         *,
         scout_fraction: float = 0.6,
+        confirmation_fraction: float = 0.25,
+        final_validation_fraction: float = 0.15,
         seed: int = 20260623,
+        target_transform: str | None = None,
+        evaluation_metric: str = "r2",
     ):
         if not candidates:
             raise ValueError("The approved plan contains no testable candidates")
+        validate_metric(evaluation_metric)
+        total = scout_fraction + confirmation_fraction + final_validation_fraction
+        if total > 1.0 + 1e-9:
+            raise ValueError(
+                f"scout_fraction ({scout_fraction}) + confirmation_fraction "
+                f"({confirmation_fraction}) + final_validation_fraction "
+                f"({final_validation_fraction}) = {total:.3f} > 1.0"
+            )
         self.df = dataframe.reset_index(drop=True)
         self.specs = candidates
-        indices = list(range(len(self.df)))
+        self.target_transform = target_transform
+        self.evaluation_metric = evaluation_metric
+
+        n = len(self.df)
+        indices = list(range(n))
         random.Random(seed).shuffle(indices)
-        cut = max(3, min(len(indices) - 3, int(len(indices) * scout_fraction)))
-        self.scout = self.df.iloc[indices[:cut]].copy()
-        self.confirmation = self.df.iloc[indices[cut:]].copy()
+
+        scout_cut = max(3, min(n - 3, int(n * scout_fraction)))
+        sel_cut = scout_cut + max(1, int(n * confirmation_fraction))
+        # Final validation: whatever remains after scout + selection.
+        # Clamp so we always have at least 1 row in final_validation (if n allows).
+        sel_cut = min(sel_cut, n - 1) if n > scout_cut + 1 else scout_cut + 1
+
+        self.scout = self.df.iloc[indices[:scout_cut]].copy()
+        self.selection = self.df.iloc[indices[scout_cut:sel_cut]].copy()
+        self.final_validation = self.df.iloc[indices[sel_cut:]].copy()
+
+        # Legacy alias used by tests that directly access .confirmation
+        self.confirmation = self.selection
 
     def propose(self):
         for spec in self.specs:
@@ -235,7 +305,9 @@ class UploadedTableDomain:
             )
 
     def evidence_for(self, c: Candidate) -> Any:
-        return {"scout": self.scout, "confirmation": self.confirmation}
+        # Expose scout and selection to the engine and falsifiers.
+        # final_validation is intentionally NOT included here.
+        return {"scout": self.scout, "confirmation": self.selection}
 
     def splits(self, evidence: Any, seed: int):
         train = evidence["scout"]
@@ -246,18 +318,56 @@ class UploadedTableDomain:
         picks = rng.integers(0, len(confirmation), size=len(confirmation))
         return train, confirmation.iloc[picks].copy()
 
+    def _get_y(self, df: pd.DataFrame, col: str) -> np.ndarray:
+        y = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+        return _apply_transform(y, self.target_transform)
+
     def refit(self, c: Candidate, train: pd.DataFrame) -> dict[str, Any]:
         kind = c.payload["kind"]
         if kind == "linear_association":
             x_name, y_name = c.payload["predictor"], c.payload["outcome"]
-            pair = train[[x_name, y_name]].apply(pd.to_numeric, errors="coerce").dropna()
-            if len(pair) < 3:
+            x_s = pd.to_numeric(train[x_name], errors="coerce")
+            y_raw = pd.to_numeric(train[y_name], errors="coerce")
+            mask = x_s.notna() & y_raw.notna()
+            if mask.sum() < 3:
                 return {"kind": kind, "valid": False}
-            x = pair[x_name].to_numpy(float)
-            y = pair[y_name].to_numpy(float)
+            x = x_s[mask].to_numpy(float)
+            y = _apply_transform(y_raw[mask].to_numpy(float), self.target_transform)
             X = np.column_stack([np.ones(len(x)), x])
             beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-            return {"kind": kind, "valid": True, "intercept": float(beta[0]), "slope": float(beta[1])}
+            return {
+                "kind": kind, "valid": True,
+                "intercept": float(beta[0]), "slope": float(beta[1]),
+                "target_transform": self.target_transform,
+            }
+        if kind == "composite_linear":
+            predictors = c.payload["predictors"]
+            y_name = c.payload["outcome"]
+            cols = predictors + [y_name]
+            sub = train[cols].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(sub) < len(predictors) + 2:
+                return {"kind": kind, "valid": False}
+            X = np.column_stack([np.ones(len(sub))] + [sub[p].to_numpy(float) for p in predictors])
+            y = _apply_transform(sub[y_name].to_numpy(float), self.target_transform)
+            beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+            # Per-predictor marginal R² (ablation contributions)
+            ablation: dict[str, float] = {}
+            full_pred = X @ beta
+            full_r2 = _r2(y, full_pred)
+            for i, p in enumerate(predictors):
+                drop_cols = [j for j in range(len(predictors)) if j != i]
+                X_drop = np.column_stack([np.ones(len(sub))] + [sub[predictors[j]].to_numpy(float) for j in drop_cols])
+                b_drop, *_ = np.linalg.lstsq(X_drop, y, rcond=None)
+                drop_r2 = _r2(y, X_drop @ b_drop)
+                ablation[p] = round(full_r2 - drop_r2, 6)
+            return {
+                "kind": kind, "valid": True,
+                "intercept": float(beta[0]),
+                "coefficients": {p: float(beta[i + 1]) for i, p in enumerate(predictors)},
+                "predictors": predictors,
+                "ablation_contributions": ablation,
+                "target_transform": self.target_transform,
+            }
         if kind == "group_difference":
             group, outcome = c.payload["group"], c.payload["outcome"]
             temp = pd.DataFrame({"g": train[group].astype(str), "y": pd.to_numeric(train[outcome], errors="coerce")}).dropna()
@@ -265,32 +375,79 @@ class UploadedTableDomain:
             return {"kind": kind, "valid": bool(means), "means": means, "overall": float(temp["y"].mean()) if len(temp) else 0.0}
         return {"kind": kind, "valid": False}
 
-    def score(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> float:
-        if not model.get("valid") or len(test) < 3:
-            return 0.0
+    def _predict_raw(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> np.ndarray | None:
+        """Return predictions in *transformed* space (pre-invert), or None on failure."""
         kind = model["kind"]
         if kind == "linear_association":
             x_name, y_name = c.payload["predictor"], c.payload["outcome"]
-            pair = test[[x_name, y_name]].apply(pd.to_numeric, errors="coerce").dropna()
-            if len(pair) < 3:
-                return 0.0
-            x = pair[x_name].to_numpy(float)
-            y = pair[y_name].to_numpy(float)
+            x_s = pd.to_numeric(test[x_name], errors="coerce")
+            y_raw = pd.to_numeric(test[y_name], errors="coerce")
+            mask = x_s.notna() & y_raw.notna()
+            if mask.sum() < 3:
+                return None
+            x = x_s[mask].to_numpy(float)
             slope = float(model["slope"])
             expected = c.payload.get("expected_direction")
             if expected == "positive" and slope <= 0:
-                return -1.0
+                return None
             if expected == "negative" and slope >= 0:
-                return -1.0
-            return _r2(y, model["intercept"] + slope * x)
+                return None
+            pred = model["intercept"] + slope * x
+            y_t = _apply_transform(y_raw[mask].to_numpy(float), self.target_transform)
+            return np.stack([y_t, pred])  # [true, pred] for downstream
+
+        if kind == "composite_linear":
+            predictors = model["predictors"]
+            y_name = c.payload["outcome"]
+            cols = predictors + [y_name]
+            sub = test[cols].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(sub) < 3:
+                return None
+            X = np.column_stack([np.ones(len(sub))] + [sub[p].to_numpy(float) for p in predictors])
+            y = _apply_transform(sub[y_name].to_numpy(float), self.target_transform)
+            beta = np.array([model["intercept"]] + [model["coefficients"][p] for p in predictors])
+            pred = X @ beta
+            return np.stack([y, pred])
+
         if kind == "group_difference":
             group, outcome = c.payload["group"], c.payload["outcome"]
             temp = pd.DataFrame({"g": test[group].astype(str), "y": pd.to_numeric(test[outcome], errors="coerce")}).dropna()
             if len(temp) < 3:
-                return 0.0
+                return None
             pred = np.array([model["means"].get(label, model["overall"]) for label in temp["g"]], dtype=float)
-            return _r2(temp["y"].to_numpy(float), pred)
-        return 0.0
+            return np.stack([temp["y"].to_numpy(float), pred])
+        return None
+
+    def score(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> float:
+        """R² score on *test* data (always R², used by GatedJudge and threshold falsifiers)."""
+        if not model.get("valid") or len(test) < 3:
+            return 0.0
+        data = self._predict_raw(c, model, test)
+        if data is None:
+            return 0.0
+        return _r2(data[0], data[1])
+
+    def score_metric(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> float:
+        """Score under ``self.evaluation_metric``.
+
+        For ``"r2"`` this is identical to ``score()``.  For error metrics
+        (rmsle, rmse, mae) predictions are inverted out of transform space
+        before evaluation so the result is in the original target units.
+        """
+        if not model.get("valid") or len(test) < 3:
+            from .metrics import NULL_SCORE
+            return NULL_SCORE.get(self.evaluation_metric, float("nan"))
+        data = self._predict_raw(c, model, test)
+        if data is None:
+            from .metrics import NULL_SCORE
+            return NULL_SCORE.get(self.evaluation_metric, float("nan"))
+        y_t_tf, pred_tf = data[0], data[1]
+        if self.evaluation_metric == "r2":
+            return _r2(y_t_tf, pred_tf)
+        # For error metrics: invert transform so we compare original-scale values
+        y_orig = _invert_transform(y_t_tf, self.target_transform)
+        pred_orig = _invert_transform(pred_tf, self.target_transform)
+        return compute_metric(self.evaluation_metric, y_orig, pred_orig)
 
     def baseline_score(self, test: Any) -> float:
         return 0.0
