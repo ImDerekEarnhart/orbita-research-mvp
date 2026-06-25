@@ -12,6 +12,8 @@ from orbita_discovery.falsifiers import BaselineFalsifier, CrossSeedFalsifier, H
 from orbita_discovery.judges import GatedJudge
 
 from .compiler import ResearchCompiler
+from .composition import build_composite_candidates
+from .falsifiers import AblationFalsifier, ImprovementFalsifier
 from .ingestion import ArtifactIngestor
 from .memory import BeliefMemory
 from .reporting import ReportCompiler
@@ -53,9 +55,21 @@ class ResearchMVP:
         record = self.ingestor.ingest(file_path, case_dir)
         return self.store.add_file_record(case_id, record)
 
-    def compile_case(self, case_id: str, *, max_candidates: int = 60) -> dict[str, Any]:
+    def compile_case(
+        self,
+        case_id: str,
+        *,
+        max_candidates: int = 60,
+        target_transform: str | None = None,
+        outcome_domain: str | None = None,
+    ) -> dict[str, Any]:
         case = self.store.get_case(case_id)
-        plan = self.compiler.compile(case, max_candidates=max_candidates)
+        plan = self.compiler.compile(
+            case,
+            max_candidates=max_candidates,
+            target_transform=target_transform,
+            outcome_domain=outcome_domain,
+        )
         return self.store.save_plan(case_id, plan, compiler="orbita-heuristic-compiler/0.1")
 
     def submit_external_plan(self, case_id: str, plan: dict[str, Any], *, compiler: str = "external-ai") -> dict[str, Any]:
@@ -101,17 +115,19 @@ class ResearchMVP:
 
         try:
             thresholds = plan.get("thresholds", {})
+            target_transform = plan.get("target_transform") or None
             domain = UploadedTableDomain(
                 df,
                 plan["candidates"],
                 scout_fraction=float(plan.get("candidate_generation", {}).get("scout_fraction", 0.6)),
                 seed=int(plan.get("candidate_generation", {}).get("seed", 20260623)),
+                target_transform=target_transform,
             )
             judge = GatedJudge(
                 commit_at=float(thresholds.get("commit_at", 0.25)),
                 baseline_margin=float(thresholds.get("baseline_margin", 0.05)),
             )
-            falsifiers = [
+            pairwise_falsifiers = [
                 BaselineFalsifier(margin=float(thresholds.get("baseline_margin", 0.05))),
                 HeldOutFalsifier(min_score=float(thresholds.get("held_out_min", 0.15))),
                 CrossSeedFalsifier(
@@ -120,17 +136,65 @@ class ResearchMVP:
                     max_spread=thresholds.get("cross_seed_max_spread", 0.65),
                 ),
             ]
-            engine = Engine(judge, falsifiers, Ledger(ledger_path))
+            # Phase 1: pairwise candidate falsification
+            phase1_ledger = Ledger(ledger_path)
+            engine = Engine(judge, pairwise_falsifiers, phase1_ledger)
             engine.run(domain)
+            phase1_findings = [finding_to_dict(item) for item in phase1_ledger.entries]
+            phase1_survivors = survivors(phase1_ledger)
+
+            # Phase 2: composite candidate generation and falsification
+            composite_specs = build_composite_candidates(
+                [finding_to_dict(s) for s in phase1_survivors],
+                min_predictors=int(thresholds.get("composite_min_predictors", 2)),
+                max_predictors=int(thresholds.get("composite_max_predictors", 10)),
+            )
+            phase2_findings: list[dict[str, Any]] = []
+            if composite_specs:
+                composite_domain = UploadedTableDomain(
+                    df,
+                    composite_specs,
+                    scout_fraction=float(plan.get("candidate_generation", {}).get("scout_fraction", 0.6)),
+                    seed=int(plan.get("candidate_generation", {}).get("seed", 20260623)),
+                    target_transform=target_transform,
+                )
+                composite_falsifiers = [
+                    ImprovementFalsifier(
+                        min_improvement=float(thresholds.get("composite_min_improvement", 0.01))
+                    ),
+                    HeldOutFalsifier(min_score=float(thresholds.get("held_out_min", 0.15))),
+                    CrossSeedFalsifier(
+                        seeds=int(thresholds.get("cross_seed_count", 9)),
+                        min_median=float(thresholds.get("cross_seed_min", 0.15)),
+                        max_spread=thresholds.get("cross_seed_max_spread", 0.65),
+                    ),
+                    AblationFalsifier(
+                        min_contribution=float(thresholds.get("ablation_min_contribution", 0.01))
+                    ),
+                ]
+                # Composite ledger appended to same file for one tamper-evident chain
+                phase2_ledger = Ledger(ledger_path, truncate=False)
+                engine2 = Engine(judge, composite_falsifiers, phase2_ledger)
+                engine2.run(composite_domain)
+                phase2_findings = [finding_to_dict(item) for item in phase2_ledger.entries]
+
+            all_findings = phase1_findings + phase2_findings
+            all_survivor_ids = (
+                [item.candidate.id for item in phase1_survivors]
+                + [f["candidate"]["id"] for f in phase2_findings
+                   if f["final_status"] != "refuted"
+                   and not any(a["killed"] for a in f["falsifications"])]
+            )
             engine_result = {
                 "run_id": run_record["id"],
                 "engine": "orbita-discovery-kit/0.2-compatible",
                 "domain": "uploaded_table",
                 "ledger_path": str(ledger_path.resolve()),
-                "candidate_count": len(engine.ledger.entries),
-                "survivor_count": len(survivors(engine.ledger)),
-                "survivor_ids": [item.candidate.id for item in survivors(engine.ledger)],
-                "findings": [finding_to_dict(item) for item in engine.ledger.entries],
+                "candidate_count": len(all_findings),
+                "survivor_count": len(all_survivor_ids),
+                "survivor_ids": all_survivor_ids,
+                "findings": all_findings,
+                "composite_candidates_proposed": len(composite_specs),
             }
 
             import_summary = self._import_result(

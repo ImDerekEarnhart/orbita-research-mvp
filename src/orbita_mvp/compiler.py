@@ -11,7 +11,14 @@ from .table_domain import generate_table_candidates
 class ResearchCompiler:
     """Translate a case into an explicit, reviewable, frozen analysis plan."""
 
-    def compile(self, case: dict[str, Any], *, max_candidates: int = 60) -> dict[str, Any]:
+    def compile(
+        self,
+        case: dict[str, Any],
+        *,
+        max_candidates: int = 60,
+        target_transform: str | None = None,
+        outcome_domain: str | None = None,
+    ) -> dict[str, Any]:
         files = case.get("files", [])
         tables = [f for f in files if f.get("artifact_kind") == "table" and f.get("extracted_path")]
         texts = [f for f in files if f.get("artifact_kind") == "text" and f.get("extracted_path")]
@@ -82,6 +89,8 @@ class ResearchCompiler:
             "candidate_generation": generation,
             "structural_relations": generation.get("structural_relations", []),
             "routes": ["uploaded_table_association", "data_quality_audit", "belief_graph_import"],
+            "target_transform": target_transform,
+            "outcome_domain": outcome_domain,
             "thresholds": {
                 "commit_at": 0.25,
                 "baseline_margin": 0.05,
@@ -89,6 +98,10 @@ class ResearchCompiler:
                 "cross_seed_count": 9,
                 "cross_seed_min": 0.15,
                 "cross_seed_max_spread": 0.65,
+                "composite_min_predictors": 2,
+                "composite_max_predictors": 10,
+                "composite_min_improvement": 0.01,
+                "ablation_min_contribution": 0.01,
             },
             "candidates": candidates,
             "assumptions": assumptions,

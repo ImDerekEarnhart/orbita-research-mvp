@@ -76,6 +76,8 @@ class CaseCreate(BaseModel):
 
 class CompileRequest(BaseModel):
     max_candidates: int = Field(default=60, ge=1, le=500)
+    target_transform: str | None = Field(default=None, description="Monotone transform for numeric outcomes before fitting: 'log1p' or null")
+    outcome_domain: str | None = Field(default=None, description="Domain constraint for predictions: 'nonneg' clips output to [0, inf), or null")
 
 
 class ApproveRequest(BaseModel):
@@ -220,7 +222,13 @@ def upload_file(case_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.post("/cases/{case_id}/compile")
 def compile_case(case_id: str, request: CompileRequest) -> dict[str, Any]:
-    return _guard(service.compile_case, case_id, max_candidates=request.max_candidates)
+    return _guard(
+        service.compile_case,
+        case_id,
+        max_candidates=request.max_candidates,
+        target_transform=request.target_transform,
+        outcome_domain=request.outcome_domain,
+    )
 
 
 @app.post("/cases/{case_id}/plans")
@@ -349,27 +357,28 @@ async def predict(
     # Re-read training data and refit on full training set
     plan_record = service.store.get_plan(run["plan_id"]) if run.get("plan_id") else None
     if not plan_record:
-        # fall back: find plan via case
-        case_id = run.get("case_id")
-        if case_id:
-            case = service.store.get_case(case_id)
-            if case.get("plans"):
-                plan_record = case["plans"][0]
+        case_id_run = run.get("case_id")
+        if case_id_run:
+            case_obj = service.store.get_case(case_id_run)
+            if case_obj.get("plans"):
+                plan_record = case_obj["plans"][0]
     if not plan_record:
         raise HTTPException(status_code=422, detail="Cannot locate training plan for this run")
 
-    train_path = plan_record["plan"].get("selected_dataset", {}).get("normalized_path")
+    plan_body = plan_record["plan"]
+    train_path = plan_body.get("selected_dataset", {}).get("normalized_path")
     if not train_path or not Path(train_path).exists():
         raise HTTPException(status_code=422, detail="Training CSV is no longer available on this server")
 
     train_df = pd.read_csv(train_path)
+    target_transform = plan_body.get("target_transform") or None
+    outcome_domain = plan_body.get("outcome_domain") or None
 
-    # Refit on full training set (not just scout partition)
-    from .table_domain import UploadedTableDomain
+    from .table_domain import UploadedTableDomain, _invert_transform
     from orbita_discovery.core import Candidate
     c = Candidate(id=best["candidate"]["id"], statement=best["candidate"]["statement"], payload=payload)
 
-    domain = UploadedTableDomain(train_df, [best["candidate"]])
+    domain = UploadedTableDomain(train_df, [best["candidate"]], target_transform=target_transform)
     model = domain.refit(c, train_df)
     if not model.get("valid"):
         raise HTTPException(status_code=422, detail="Refitting the survivor on training data produced an invalid model")
@@ -389,26 +398,45 @@ async def predict(
 
     # Generate predictions row by row
     row_ids = test_df[identifier_column].tolist()
-    predictions: list[float | None] = []
+    raw_preds: np.ndarray | None = None
 
     if kind == "linear_association":
         predictor = payload["predictor"]
         if predictor not in test_df.columns:
             raise HTTPException(status_code=422, detail=f"Predictor column '{predictor}' not found in test file")
-        xs = pd.to_numeric(test_df[predictor], errors="coerce")
-        preds = model["intercept"] + model["slope"] * xs
-        predictions = [None if not np.isfinite(v) else round(float(v), 8) for v in preds]
+        xs = pd.to_numeric(test_df[predictor], errors="coerce").to_numpy(float)
+        raw_preds = model["intercept"] + model["slope"] * xs
+
+    elif kind == "composite_linear":
+        predictors = model["predictors"]
+        missing = [p for p in predictors if p not in test_df.columns]
+        if missing:
+            raise HTTPException(status_code=422, detail=f"Composite predictor columns missing from test file: {missing}")
+        X = np.column_stack([np.ones(len(test_df))] + [
+            pd.to_numeric(test_df[p], errors="coerce").to_numpy(float) for p in predictors
+        ])
+        beta = np.array([model["intercept"]] + [model["coefficients"][p] for p in predictors])
+        raw_preds = X @ beta
 
     elif kind == "group_difference":
         group_col = payload["group"]
         if group_col not in test_df.columns:
             raise HTTPException(status_code=422, detail=f"Group column '{group_col}' not found in test file")
-        predictions = [
+        raw_preds = np.array([
             model["means"].get(str(g), model["overall"])
             for g in test_df[group_col].astype(str)
-        ]
+        ], dtype=float)
     else:
         raise HTTPException(status_code=422, detail=f"Unsupported survivor kind for prediction: {kind}")
+
+    # Invert transform and apply domain constraint
+    final_preds = _invert_transform(raw_preds, target_transform)
+    if outcome_domain == "nonneg":
+        final_preds = np.clip(final_preds, 0, None)
+
+    predictions: list[float | None] = [
+        None if not np.isfinite(v) else round(float(v), 8) for v in final_preds
+    ]
 
     # Build CSV output
     output = io.StringIO()

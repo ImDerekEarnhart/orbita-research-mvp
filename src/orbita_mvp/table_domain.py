@@ -196,6 +196,18 @@ def generate_table_candidates(
     return candidates, generation
 
 
+def _apply_transform(y: np.ndarray, transform: str | None) -> np.ndarray:
+    if transform == "log1p":
+        return np.log1p(np.clip(y, 0, None))
+    return y
+
+
+def _invert_transform(y: np.ndarray, transform: str | None) -> np.ndarray:
+    if transform == "log1p":
+        return np.expm1(y)
+    return y
+
+
 class UploadedTableDomain:
     """Fittable domain for frozen candidates compiled from an uploaded table.
 
@@ -203,6 +215,13 @@ class UploadedTableDomain:
     and falsifiers score frozen candidates on the locked confirmation partition.
     Cross-seed checks bootstrap the confirmation partition rather than exposing
     it to candidate generation.
+
+    Parameters
+    ----------
+    target_transform:
+        Optional monotone transform applied to numeric outcome columns before
+        fitting and scoring (``"log1p"`` supported).  Predictions are returned
+        in transformed space; callers are responsible for inverting.
     """
 
     name = "uploaded_table"
@@ -214,11 +233,13 @@ class UploadedTableDomain:
         *,
         scout_fraction: float = 0.6,
         seed: int = 20260623,
+        target_transform: str | None = None,
     ):
         if not candidates:
             raise ValueError("The approved plan contains no testable candidates")
         self.df = dataframe.reset_index(drop=True)
         self.specs = candidates
+        self.target_transform = target_transform
         indices = list(range(len(self.df)))
         random.Random(seed).shuffle(indices)
         cut = max(3, min(len(indices) - 3, int(len(indices) * scout_fraction)))
@@ -246,18 +267,56 @@ class UploadedTableDomain:
         picks = rng.integers(0, len(confirmation), size=len(confirmation))
         return train, confirmation.iloc[picks].copy()
 
+    def _get_y(self, df: pd.DataFrame, col: str) -> np.ndarray:
+        y = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+        return _apply_transform(y, self.target_transform)
+
     def refit(self, c: Candidate, train: pd.DataFrame) -> dict[str, Any]:
         kind = c.payload["kind"]
         if kind == "linear_association":
             x_name, y_name = c.payload["predictor"], c.payload["outcome"]
-            pair = train[[x_name, y_name]].apply(pd.to_numeric, errors="coerce").dropna()
-            if len(pair) < 3:
+            x_s = pd.to_numeric(train[x_name], errors="coerce")
+            y_raw = pd.to_numeric(train[y_name], errors="coerce")
+            mask = x_s.notna() & y_raw.notna()
+            if mask.sum() < 3:
                 return {"kind": kind, "valid": False}
-            x = pair[x_name].to_numpy(float)
-            y = pair[y_name].to_numpy(float)
+            x = x_s[mask].to_numpy(float)
+            y = _apply_transform(y_raw[mask].to_numpy(float), self.target_transform)
             X = np.column_stack([np.ones(len(x)), x])
             beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-            return {"kind": kind, "valid": True, "intercept": float(beta[0]), "slope": float(beta[1])}
+            return {
+                "kind": kind, "valid": True,
+                "intercept": float(beta[0]), "slope": float(beta[1]),
+                "target_transform": self.target_transform,
+            }
+        if kind == "composite_linear":
+            predictors = c.payload["predictors"]
+            y_name = c.payload["outcome"]
+            cols = predictors + [y_name]
+            sub = train[cols].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(sub) < len(predictors) + 2:
+                return {"kind": kind, "valid": False}
+            X = np.column_stack([np.ones(len(sub))] + [sub[p].to_numpy(float) for p in predictors])
+            y = _apply_transform(sub[y_name].to_numpy(float), self.target_transform)
+            beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+            # Ablation: score each predictor's marginal contribution
+            ablation: dict[str, float] = {}
+            full_pred = X @ beta
+            full_r2 = _r2(y, full_pred)
+            for i, p in enumerate(predictors):
+                drop_cols = [j for j in range(len(predictors)) if j != i]
+                X_drop = np.column_stack([np.ones(len(sub))] + [sub[predictors[j]].to_numpy(float) for j in drop_cols])
+                b_drop, *_ = np.linalg.lstsq(X_drop, y, rcond=None)
+                drop_r2 = _r2(y, X_drop @ b_drop)
+                ablation[p] = round(full_r2 - drop_r2, 6)
+            return {
+                "kind": kind, "valid": True,
+                "intercept": float(beta[0]),
+                "coefficients": {p: float(beta[i + 1]) for i, p in enumerate(predictors)},
+                "predictors": predictors,
+                "ablation_contributions": ablation,
+                "target_transform": self.target_transform,
+            }
         if kind == "group_difference":
             group, outcome = c.payload["group"], c.payload["outcome"]
             temp = pd.DataFrame({"g": train[group].astype(str), "y": pd.to_numeric(train[outcome], errors="coerce")}).dropna()
@@ -271,11 +330,13 @@ class UploadedTableDomain:
         kind = model["kind"]
         if kind == "linear_association":
             x_name, y_name = c.payload["predictor"], c.payload["outcome"]
-            pair = test[[x_name, y_name]].apply(pd.to_numeric, errors="coerce").dropna()
-            if len(pair) < 3:
+            x_s = pd.to_numeric(test[x_name], errors="coerce")
+            y_raw = pd.to_numeric(test[y_name], errors="coerce")
+            mask = x_s.notna() & y_raw.notna()
+            if mask.sum() < 3:
                 return 0.0
-            x = pair[x_name].to_numpy(float)
-            y = pair[y_name].to_numpy(float)
+            x = x_s[mask].to_numpy(float)
+            y = _apply_transform(y_raw[mask].to_numpy(float), self.target_transform)
             slope = float(model["slope"])
             expected = c.payload.get("expected_direction")
             if expected == "positive" and slope <= 0:
@@ -283,6 +344,17 @@ class UploadedTableDomain:
             if expected == "negative" and slope >= 0:
                 return -1.0
             return _r2(y, model["intercept"] + slope * x)
+        if kind == "composite_linear":
+            predictors = model["predictors"]
+            y_name = c.payload["outcome"]
+            cols = predictors + [y_name]
+            sub = test[cols].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(sub) < 3:
+                return 0.0
+            X = np.column_stack([np.ones(len(sub))] + [sub[p].to_numpy(float) for p in predictors])
+            y = _apply_transform(sub[y_name].to_numpy(float), self.target_transform)
+            beta = np.array([model["intercept"]] + [model["coefficients"][p] for p in predictors])
+            return _r2(y, X @ beta)
         if kind == "group_difference":
             group, outcome = c.payload["group"], c.payload["outcome"]
             temp = pd.DataFrame({"g": test[group].astype(str), "y": pd.to_numeric(test[outcome], errors="coerce")}).dropna()
