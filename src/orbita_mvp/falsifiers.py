@@ -8,15 +8,29 @@ from .metrics import NULL_SCORE, higher_is_better, is_improvement
 
 
 class AblationFalsifier:
-    """Kill a composite_linear candidate if any predictor contributes < min_contribution R².
+    """Kill a composite_linear candidate if any predictor contributes < min_contribution.
 
     For non-composite candidates, this falsifier always passes (no ablation needed).
-    For composite candidates, the model's ``ablation_contributions`` dict (computed in
-    ``UploadedTableDomain.refit``) is used directly, avoiding a second OLS pass.
 
-    Ablation contributions are always in R² units (marginal R² each predictor adds),
-    regardless of ``evaluation_metric``.  A contribution of < 0.01 means the predictor
-    explains less than 1 % of residual variance — it is not earning its place.
+    Partition
+    ---------
+    Uses ``evidence["confirmation"]`` (the selection partition) — never the scout
+    partition.  This prevents data-partition violations and matches the partition
+    used by ImprovementFalsifier and HeldOutFalsifier.
+
+    Metric
+    ------
+    Contributions are computed in ``evaluation_metric`` units (metric-aware):
+
+    * Higher-is-better metrics (R²):
+        contribution = full_score − reduced_score  (positive when predictor is useful)
+    * Lower-is-better metrics (RMSLE, RMSE, MAE):
+        contribution = reduced_score − full_score  (positive when predictor is useful;
+        removing a useful predictor *increases* the error)
+
+    A predictor with contribution < min_contribution does not earn its place.
+    The R² ablation_contributions in the model dict (fitted during refit()) are
+    retained as a report-only diagnostic but are NOT used here.
     """
 
     name = "ablation"
@@ -31,24 +45,71 @@ class AblationFalsifier:
         if not isinstance(domain, FittableDomain):
             return Falsification(self.name, killed=False,
                                  detail={"skipped": "domain not fittable"})
-        train, _ = domain.splits(evidence, seed=1)
-        model = domain.refit(c, train)
-        if not model.get("valid"):
-            return Falsification(self.name, killed=True, metric=0.0,
-                                 detail={"error": "composite refit produced invalid model"})
 
-        contributions = model.get("ablation_contributions", {})
-        useless = {p: v for p, v in contributions.items() if v < self.min_contribution}
-        min_contrib = min(contributions.values()) if contributions else 0.0
+        # Use selection partition — not scout (fixes data-partition violation)
+        selection = evidence["confirmation"]
+
+        metric: str = getattr(domain, "evaluation_metric", "r2")
+        hib = higher_is_better(metric)
+        score_fn = getattr(domain, "score_metric", None) or domain.score
+
+        full_model = domain.refit(c, selection)
+        if not full_model.get("valid"):
+            return Falsification(self.name, killed=True, metric=0.0,
+                                 detail={"error": "composite refit produced invalid model",
+                                         "partition": "selection"})
+
+        full_score = score_fn(c, full_model, selection)
+        predictors = list(c.payload.get("predictors", []))
+
+        contributions: dict[str, float] = {}
+        per_predictor: list[dict] = []
+        for p in predictors:
+            reduced_preds = [x for x in predictors if x != p]
+            if not reduced_preds:
+                contributions[p] = float("inf")
+                per_predictor.append({"predictor": p, "contribution": float("inf"),
+                                      "full_score": full_score, "reduced_score": None})
+                continue
+            reduced_payload = {**c.payload, "predictors": reduced_preds,
+                               "id": c.id + f"_drop_{p}"}
+            reduced_c = Candidate(id=reduced_payload["id"], statement=c.statement,
+                                  payload=reduced_payload)
+            reduced_model = domain.refit(reduced_c, selection)
+            if not reduced_model.get("valid"):
+                contributions[p] = 0.0
+                per_predictor.append({"predictor": p, "contribution": 0.0,
+                                      "full_score": full_score, "reduced_score": None,
+                                      "error": "reduced refit invalid"})
+                continue
+            reduced_score = score_fn(reduced_c, reduced_model, selection)
+            if hib:
+                contrib = round(full_score - reduced_score, 6)
+            else:
+                contrib = round(reduced_score - full_score, 6)
+            contributions[p] = contrib
+            per_predictor.append({"predictor": p, "contribution": contrib,
+                                   "full_score": full_score, "reduced_score": reduced_score,
+                                   "pass": contrib >= self.min_contribution})
+
+        useless = {p: v for p, v in contributions.items()
+                   if v < self.min_contribution and v != float("inf")}
+        min_contrib = min((v for v in contributions.values() if v != float("inf")),
+                          default=0.0)
         killed = bool(useless)
         return Falsification(
             self.name,
             killed=killed,
             metric=min_contrib,
             detail={
+                "evaluation_metric": metric,
+                "higher_is_better": hib,
+                "full_score": full_score,
                 "contributions": contributions,
+                "per_predictor": per_predictor,
                 "min_contribution_threshold": self.min_contribution,
                 "useless_predictors": useless,
+                "partition": "selection",
             },
         )
 

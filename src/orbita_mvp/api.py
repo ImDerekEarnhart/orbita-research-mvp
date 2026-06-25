@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import logging
 import os
 import secrets
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,8 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 
 from orbita import EvidenceKind, Stance
@@ -28,16 +32,29 @@ DB_PATH = Path(os.getenv("ORBITA_MVP_DB", str(_data_dir / "orbita_mvp.db")))
 WORKSPACE = Path(os.getenv("ORBITA_MVP_WORKSPACE", str(_data_dir / "orbita_workspace")))
 # Prefer an explicit build-time SHA; fall back to Railway's injected variable.
 _GIT_COMMIT = os.getenv("GIT_COMMIT_SHA", os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"))
+# Test endpoints are disabled by default. Set ORBITA_ENABLE_TEST_ENDPOINTS=true on staging only.
+# Production must omit this variable or set it to any value other than "true".
+_TEST_ENDPOINTS_ENABLED = os.getenv("ORBITA_ENABLE_TEST_ENDPOINTS", "").lower() == "true"
 service = ResearchMVP(DB_PATH, WORKSPACE)
+
+@asynccontextmanager
+async def _lifespan(app):
+    if _TEST_ENDPOINTS_ENABLED:
+        logger.warning("Test endpoints ENABLED (ORBITA_ENABLE_TEST_ENDPOINTS=true) — staging only")
+    else:
+        logger.info("Test endpoints disabled (production-safe)")
+    yield
+
 
 app = FastAPI(
     title="Orbita Research MVP",
-    version="0.2.0",
+    version="0.2.1",
     description=(
         "Upload research material, compile an explicit governed plan, run frozen "
         "discovery candidates, persist findings in an epistemic graph, and produce "
         "an expert-readable dossier."
     ),
+    lifespan=_lifespan,
 )
 
 _DEMO_USER = os.getenv("ORBITA_DEMO_USER", "")
@@ -160,9 +177,9 @@ def home() -> str:
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "0.2.0",
+        "version": "0.2.1",
         "git_commit": _GIT_COMMIT,
-        "plan_schema": "orbita-research-plan/0.2",
+        "plan_schema": "orbita-research-plan/0.3",
         "db": str(DB_PATH.resolve()),
         "workspace": str(WORKSPACE.resolve()),
     }
@@ -421,22 +438,45 @@ async def predict(
     payload = best["candidate"]["payload"]
     kind = payload["kind"]
 
-    train_path = plan_body.get("selected_dataset", {}).get("normalized_path")
-    if not train_path or not Path(train_path).exists():
-        raise HTTPException(status_code=422, detail="Training CSV is no longer available on this server")
-
-    train_df = pd.read_csv(train_path)
     target_transform = plan_body.get("target_transform") or None
     outcome_domain = plan_body.get("outcome_domain") or None
 
-    from .table_domain import UploadedTableDomain, _invert_transform
-    from orbita_discovery.core import Candidate
-    c = Candidate(id=best["candidate"]["id"], statement=best["candidate"]["statement"], payload=payload)
+    from .table_domain import _invert_transform
 
-    domain = UploadedTableDomain(train_df, [best["candidate"]], target_transform=target_transform)
-    model = domain.refit(c, train_df)
-    if not model.get("valid"):
-        raise HTTPException(status_code=422, detail="Refitting the survivor on training data produced an invalid model")
+    # Load the frozen model artifact — never refit (lstsq) at inference time.
+    model_artifacts = result.get("model_artifacts", {})
+    artifact_info = model_artifacts.get(target_column, {})
+    artifact_path_str = artifact_info.get("model_artifact_path")
+    model: dict
+    if artifact_path_str and Path(artifact_path_str).exists():
+        from .model_artifact import load_model_artifact, model_from_artifact
+        try:
+            artifact = load_model_artifact(artifact_path_str)
+        except Exception as _art_err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model artifact integrity check failed: {_art_err}"
+            )
+        model = model_from_artifact(artifact, payload)
+        if not model.get("valid"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Frozen artifact for '{target_column}' could not be reconstructed (kind={kind!r})"
+            )
+    else:
+        # No artifact — this run predates artifact serialization or artifact was lost.
+        # Refuse to silently refit; require the artifact to be present.
+        if artifact_path_str:
+            artifact_missing_hint = (
+                f"Model artifact expected at {artifact_path_str!r} but file is missing. "
+                "The volume may have been remounted or the artifact was deleted."
+            )
+        else:
+            artifact_missing_hint = (
+                "This historical run predates serialized deployment artifacts and cannot "
+                "be used for new inference. Create a new case and run under plan schema 0.3."
+            )
+        raise HTTPException(status_code=422, detail=artifact_missing_hint)
 
     # Load test CSV
     suffix = Path(file.filename or "test.csv").suffix
@@ -619,6 +659,88 @@ def case_graph(case_id: str) -> dict[str, Any]:
 def case_events(case_id: str, since: str = "") -> dict[str, Any]:
     _guard(service.store.get_case, case_id)
     return build_events(case_id, service.ledger.db.conn, since)
+
+
+@app.post("/admin/test/tamper-artifact")
+def tamper_artifact_for_test(
+    run_id: str = Query(..., description="Run ID whose deployment artifact to corrupt"),
+    target_column: str = Query(..., description="Outcome column"),
+    x_test_token: str = Query(None, alias="test_token"),
+) -> dict[str, Any]:
+    """Test-only endpoint: corrupt a deployment artifact to verify integrity checks.
+    Only active when ORBITA_ENABLE_TEST_ENDPOINTS=true. Requires test_token matching
+    ORBITA_TEST_TOKEN env var. Returns 404 when test endpoints are disabled.
+    """
+    if not _TEST_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    _test_tok = os.getenv("ORBITA_TEST_TOKEN", "")
+    if not _test_tok or x_test_token != _test_tok:
+        raise HTTPException(status_code=403, detail="Forbidden: requires valid test_token")
+    run = _guard(service.store.get_run, run_id)
+    result = run.get("result", {})
+    art_info = result.get("model_artifacts", {}).get(target_column, {})
+    art_path_str = art_info.get("model_artifact_path")
+    if not art_path_str or not Path(art_path_str).exists():
+        raise HTTPException(status_code=404, detail=f"Deployment artifact not found at {art_path_str!r}")
+    art_path = Path(art_path_str)
+    import json as _json
+    original_bytes = art_path.read_bytes()
+    artifact = _json.loads(original_bytes)
+    backup_path = art_path.with_suffix(".json.backup")
+    backup_path.write_bytes(original_bytes)
+    coefs = artifact.get("coefficients", {})
+    if coefs:
+        first_key = next(iter(coefs))
+        original_val = coefs[first_key]
+        artifact["coefficients"][first_key] = original_val + 9999.0
+        corrupted_field = first_key
+    else:
+        original_val = artifact.get("intercept", 0.0)
+        artifact["intercept"] = original_val + 9999.0
+        corrupted_field = "intercept"
+    art_path.write_text(_json.dumps(artifact, indent=2), encoding="utf-8")
+    return {
+        "status": "corrupted",
+        "artifact_path": str(art_path),
+        "backup_path": str(backup_path),
+        "expected_sha256": art_info.get("model_artifact_sha256"),
+        "corrupted_field": corrupted_field,
+        "original_value": original_val,
+        "corrupted_value": original_val + 9999.0,
+    }
+
+
+@app.post("/admin/test/restore-artifact")
+def restore_artifact_for_test(
+    run_id: str = Query(...),
+    target_column: str = Query(...),
+    x_test_token: str = Query(None, alias="test_token"),
+) -> dict[str, Any]:
+    """Test-only endpoint: restore a previously tampered deployment artifact from backup.
+    Returns 404 when test endpoints are disabled.
+    """
+    if not _TEST_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    _test_tok = os.getenv("ORBITA_TEST_TOKEN", "")
+    if not _test_tok or x_test_token != _test_tok:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    run = _guard(service.store.get_run, run_id)
+    result = run.get("result", {})
+    art_info = result.get("model_artifacts", {}).get(target_column, {})
+    art_path_str = art_info.get("model_artifact_path")
+    if not art_path_str:
+        raise HTTPException(status_code=404, detail="Deployment artifact path not found")
+    art_path = Path(art_path_str)
+    backup_path = art_path.with_suffix(".json.backup")
+    if not backup_path.exists():
+        raise HTTPException(status_code=404, detail="Backup not found — artifact was not previously tampered via this endpoint")
+    art_path.write_bytes(backup_path.read_bytes())
+    backup_path.unlink()
+    return {
+        "status": "restored",
+        "artifact_path": str(art_path),
+        "restored_sha256": art_info.get("model_artifact_sha256"),
+    }
 
 
 def main() -> None:

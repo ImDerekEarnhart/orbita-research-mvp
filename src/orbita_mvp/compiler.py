@@ -10,9 +10,11 @@ import pandas as pd
 from .metrics import validate_metric
 from .table_domain import generate_table_candidates
 
-# Fields that are frozen at compile time and must not change before execution.
-# Any modification to these fields changes the plan hash and invalidates the plan.
-IMMUTABLE_PLAN_FIELDS = (
+PLAN_SCHEMA_V02 = "orbita-research-plan/0.2"
+PLAN_SCHEMA_V03 = "orbita-research-plan/0.3"
+
+# v0.2 field set — historical plans (Run 001, Run 002A). MUST NOT be extended.
+_IMMUTABLE_FIELDS_V02 = (
     "target_transform",
     "outcome_domain",
     "evaluation_metric",
@@ -20,12 +22,54 @@ IMMUTABLE_PLAN_FIELDS = (
     "candidate_generation",
 )
 
+# v0.3 field set — new plans. Adds ablation policy and composition strategy.
+_IMMUTABLE_FIELDS_V03 = (
+    "target_transform",
+    "outcome_domain",
+    "evaluation_metric",
+    "ablation_metric",
+    "composition_strategy",
+    "thresholds",
+    "candidate_generation",
+)
+
+# Legacy alias — keep for any code that references IMMUTABLE_PLAN_FIELDS directly.
+IMMUTABLE_PLAN_FIELDS = _IMMUTABLE_FIELDS_V03
+
 
 def compute_plan_hash(plan: dict[str, Any]) -> str:
-    """SHA-256 of the canonical JSON encoding of the immutable plan fields."""
-    subset = {k: plan.get(k) for k in IMMUTABLE_PLAN_FIELDS}
+    """SHA-256 of the canonical JSON encoding of immutable fields for this plan's schema.
+
+    Schema routing
+    --------------
+    orbita-research-plan/0.2  → original five-field set (Run 001, Run 002A compatible)
+    orbita-research-plan/0.3  → extended set (ablation_metric, composition_strategy added)
+
+    Historical plan hashes are preserved: a v0.2 plan always hashes with the v0.2
+    field set, so stored hashes remain verifiable even after the engine is upgraded.
+    """
+    schema = plan.get("schema_version", PLAN_SCHEMA_V02)
+    fields = _IMMUTABLE_FIELDS_V02 if schema == PLAN_SCHEMA_V02 else _IMMUTABLE_FIELDS_V03
+    subset = {k: plan.get(k) for k in fields}
     canonical = json.dumps(subset, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def verify_plan_schema_executable(plan: dict[str, Any]) -> None:
+    """Raise if the plan's schema cannot be executed by this engine version.
+
+    Historical v0.2 plans remain auditable and their hashes still verify, but
+    they cannot be executed under the v0.3 engine semantics (different ablation
+    policy, backward elimination, two-artifact pipeline).  Re-compile to proceed.
+    """
+    schema = plan.get("schema_version", PLAN_SCHEMA_V02)
+    if schema != PLAN_SCHEMA_V03:
+        raise ValueError(
+            f"Plan schema {schema!r} cannot be executed by this engine. "
+            "Historical plans remain auditable and their hashes still verify, "
+            "but new execution requires plan schema orbita-research-plan/0.3. "
+            "Re-compile the case to generate an executable plan."
+        )
 
 
 class ResearchCompiler:
@@ -39,10 +83,14 @@ class ResearchCompiler:
         target_transform: str | None = None,
         outcome_domain: str | None = None,
         evaluation_metric: str = "r2",
+        ablation_metric: str | None = None,
         confirmation_fraction: float = 0.25,
         final_validation_fraction: float = 0.15,
     ) -> dict[str, Any]:
         validate_metric(evaluation_metric)
+        if ablation_metric is not None:
+            validate_metric(ablation_metric)
+        resolved_ablation_metric = ablation_metric if ablation_metric is not None else evaluation_metric
         files = case.get("files", [])
         tables = [f for f in files if f.get("artifact_kind") == "table" and f.get("extracted_path")]
         texts = [f for f in files if f.get("artifact_kind") == "text" and f.get("extracted_path")]
@@ -109,7 +157,7 @@ class ResearchCompiler:
         quality_findings = self._quality_findings(profile)
 
         plan: dict[str, Any] = {
-            "schema_version": "orbita-research-plan/0.2",
+            "schema_version": PLAN_SCHEMA_V03,
             "mode": case.get("mode", "open_discovery"),
             "goal": case.get("goal", ""),
             "status": "ready_for_review" if candidates else "no_candidates",
@@ -131,7 +179,8 @@ class ResearchCompiler:
             "target_transform": target_transform,
             "outcome_domain": outcome_domain,
             "evaluation_metric": evaluation_metric,
-            "composition_strategy": "composition_v1",
+            "ablation_metric": resolved_ablation_metric,
+            "composition_strategy": "composition_v1_1_backward_elimination",
             "thresholds": {
                 "commit_at": 0.25,
                 "baseline_margin": 0.05,
@@ -143,6 +192,8 @@ class ResearchCompiler:
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,
                 "ablation_min_contribution": 0.01,
+                "ablation_min_absolute_improvement": 0.01,
+                "ablation_min_relative_improvement": None,
             },
             "candidates": candidates,
             "assumptions": assumptions,

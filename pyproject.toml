@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orbita-research-mvp"
-version = "0.1.0"
+version = "0.2.1"
 description = "Local research-intake, governed discovery, epistemic memory, dependency collapse, and reporting service."
 readme = "README.md"
 requires-python = ">=3.11"
