@@ -527,6 +527,85 @@ class ResearchMVP:
                 result=engine_result,
                 dataframe=df,
             )
+
+            # Attach artifact provenance as evidence nodes in the belief graph.
+            # Must happen BEFORE capture_graph so these nodes land in the snapshot.
+            candidate_to_claim = import_summary.get("candidate_to_claim", {})
+            for _oc, _si in selected_models.items():
+                _sel_cid = _si["selected_model_id"]
+                _claim_id = candidate_to_claim.get(_sel_cid)
+                if not _claim_id:
+                    continue
+                _yart = model_artifacts.get(_oc, {})
+                _sel_art_id = _yart.get("selection_artifact_id", "")
+                _sel_art_sha = _yart.get("selection_artifact_sha256", "")
+                _sel_art_path = _yart.get("selection_artifact_path", "")
+                _dep_art_id = _yart.get("model_artifact_id", "")
+                _dep_art_sha = _yart.get("model_artifact_sha256", "")
+                _dep_art_path = _yart.get("model_artifact_path", "")
+                _sel_finding = next((f for f in all_findings if f["candidate"]["id"] == _sel_cid), None)
+                _fv = _sel_finding.get("final_validation_metric_score") if _sel_finding else None
+
+                for _evi_uri, _evi_excerpt, _evi_key, _evi_content in [
+                    # Selection artifact
+                    (
+                        f"file://{_sel_art_path}",
+                        f"selection-artifact:{_sel_art_id}|sha256:{_sel_art_sha[:16]}",
+                        f"sel-artifact:{_sel_art_id}",
+                        json.dumps({"artifact_kind": "selection_artifact",
+                                    "selection_artifact_id": _sel_art_id,
+                                    "artifact_sha256": _sel_art_sha,
+                                    "training_partition": "scout",
+                                    "run_id": run_record["id"]}, sort_keys=True),
+                    ),
+                    # Final-validation evidence
+                    (
+                        f"file://{_sel_art_path}",
+                        f"final-validation-evidence|{evaluation_metric}={_fv}|sel_artifact:{_sel_art_id}|sha256:{_sel_art_sha[:16]}",
+                        f"fv-evidence:{run_record['id']}:{_sel_cid}",
+                        json.dumps({"artifact_kind": "final_validation_evidence",
+                                    "fv_score": _fv,
+                                    "metric": evaluation_metric,
+                                    "higher_is_better": hib,
+                                    "report_only": True,
+                                    "selection_artifact_id": _sel_art_id,
+                                    "selection_artifact_sha256": _sel_art_sha,
+                                    "run_id": run_record["id"]}, sort_keys=True),
+                    ),
+                    # Deployment artifact
+                    (
+                        f"file://{_dep_art_path}",
+                        f"deployment-artifact:{_dep_art_id}|sha256:{_dep_art_sha[:16]}",
+                        f"dep-artifact:{_dep_art_id}",
+                        json.dumps({"artifact_kind": "deployment_artifact",
+                                    "model_artifact_id": _dep_art_id,
+                                    "artifact_sha256": _dep_art_sha,
+                                    "selection_artifact_id": _sel_art_id,
+                                    "training_partition": "all_rows",
+                                    "run_id": run_record["id"]}, sort_keys=True),
+                    ),
+                ]:
+                    if not _sel_art_id and "selection" in _evi_key:
+                        continue
+                    if not _fv and "fv-evidence" in _evi_key:
+                        continue
+                    if not _dep_art_id and "dep-artifact" in _evi_key:
+                        continue
+                    try:
+                        _evi = self.ledger.add_evidence(
+                            _evi_uri,
+                            _evi_excerpt,
+                            source_kind=EvidenceKind.DATASET,
+                            independence_key=_evi_key,
+                            content=_evi_content,
+                            metadata={"run_id": run_record["id"]},
+                        )
+                        self.ledger.attest(_claim_id, _evi, Stance.SUPPORT,
+                                           actor="artifact-provenance-recorder",
+                                           actor_role=ActorRole.TOOL)
+                    except Exception:
+                        pass
+
             graph = self.ledger.capture_graph(
                 name=f"Case {case_id} after run {run_record['id']}",
                 root_claim_ids=import_summary["claim_ids"],

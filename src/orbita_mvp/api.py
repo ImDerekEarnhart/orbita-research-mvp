@@ -644,6 +644,82 @@ def case_events(case_id: str, since: str = "") -> dict[str, Any]:
     return build_events(case_id, service.ledger.db.conn, since)
 
 
+@app.post("/admin/test/tamper-artifact")
+def tamper_artifact_for_test(
+    run_id: str = Query(..., description="Run ID whose deployment artifact to corrupt"),
+    target_column: str = Query(..., description="Outcome column"),
+    x_test_token: str = Query(None, alias="test_token"),
+) -> dict[str, Any]:
+    """Test-only endpoint: corrupt a deployment artifact to verify integrity checks.
+    Requires test_token query param matching ORBITA_TEST_TOKEN env var.
+    Only active when ORBITA_TEST_TOKEN is set.
+    """
+    _test_tok = os.getenv("ORBITA_TEST_TOKEN", "")
+    if not _test_tok or x_test_token != _test_tok:
+        raise HTTPException(status_code=403, detail="Forbidden: requires valid test_token")
+    run = _guard(service.store.get_run, run_id)
+    result = run.get("result", {})
+    art_info = result.get("model_artifacts", {}).get(target_column, {})
+    art_path_str = art_info.get("model_artifact_path")
+    if not art_path_str or not Path(art_path_str).exists():
+        raise HTTPException(status_code=404, detail=f"Deployment artifact not found at {art_path_str!r}")
+    art_path = Path(art_path_str)
+    import json as _json
+    original_bytes = art_path.read_bytes()
+    artifact = _json.loads(original_bytes)
+    backup_path = art_path.with_suffix(".json.backup")
+    backup_path.write_bytes(original_bytes)
+    coefs = artifact.get("coefficients", {})
+    if coefs:
+        first_key = next(iter(coefs))
+        original_val = coefs[first_key]
+        artifact["coefficients"][first_key] = original_val + 9999.0
+        corrupted_field = first_key
+    else:
+        original_val = artifact.get("intercept", 0.0)
+        artifact["intercept"] = original_val + 9999.0
+        corrupted_field = "intercept"
+    art_path.write_text(_json.dumps(artifact, indent=2), encoding="utf-8")
+    return {
+        "status": "corrupted",
+        "artifact_path": str(art_path),
+        "backup_path": str(backup_path),
+        "expected_sha256": art_info.get("model_artifact_sha256"),
+        "corrupted_field": corrupted_field,
+        "original_value": original_val,
+        "corrupted_value": original_val + 9999.0,
+    }
+
+
+@app.post("/admin/test/restore-artifact")
+def restore_artifact_for_test(
+    run_id: str = Query(...),
+    target_column: str = Query(...),
+    x_test_token: str = Query(None, alias="test_token"),
+) -> dict[str, Any]:
+    """Test-only endpoint: restore a previously tampered deployment artifact from backup."""
+    _test_tok = os.getenv("ORBITA_TEST_TOKEN", "")
+    if not _test_tok or x_test_token != _test_tok:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    run = _guard(service.store.get_run, run_id)
+    result = run.get("result", {})
+    art_info = result.get("model_artifacts", {}).get(target_column, {})
+    art_path_str = art_info.get("model_artifact_path")
+    if not art_path_str:
+        raise HTTPException(status_code=404, detail="Deployment artifact path not found")
+    art_path = Path(art_path_str)
+    backup_path = art_path.with_suffix(".json.backup")
+    if not backup_path.exists():
+        raise HTTPException(status_code=404, detail="Backup not found — artifact was not previously tampered via this endpoint")
+    art_path.write_bytes(backup_path.read_bytes())
+    backup_path.unlink()
+    return {
+        "status": "restored",
+        "artifact_path": str(art_path),
+        "restored_sha256": art_info.get("model_artifact_sha256"),
+    }
+
+
 def main() -> None:
     import uvicorn
 
