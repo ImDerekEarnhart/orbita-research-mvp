@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import logging
 import os
 import secrets
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,8 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 
 from orbita import EvidenceKind, Stance
@@ -28,7 +32,19 @@ DB_PATH = Path(os.getenv("ORBITA_MVP_DB", str(_data_dir / "orbita_mvp.db")))
 WORKSPACE = Path(os.getenv("ORBITA_MVP_WORKSPACE", str(_data_dir / "orbita_workspace")))
 # Prefer an explicit build-time SHA; fall back to Railway's injected variable.
 _GIT_COMMIT = os.getenv("GIT_COMMIT_SHA", os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"))
+# Test endpoints are disabled by default. Set ORBITA_ENABLE_TEST_ENDPOINTS=true on staging only.
+# Production must omit this variable or set it to any value other than "true".
+_TEST_ENDPOINTS_ENABLED = os.getenv("ORBITA_ENABLE_TEST_ENDPOINTS", "").lower() == "true"
 service = ResearchMVP(DB_PATH, WORKSPACE)
+
+@asynccontextmanager
+async def _lifespan(app):
+    if _TEST_ENDPOINTS_ENABLED:
+        logger.warning("Test endpoints ENABLED (ORBITA_ENABLE_TEST_ENDPOINTS=true) — staging only")
+    else:
+        logger.info("Test endpoints disabled (production-safe)")
+    yield
+
 
 app = FastAPI(
     title="Orbita Research MVP",
@@ -38,6 +54,7 @@ app = FastAPI(
         "discovery candidates, persist findings in an epistemic graph, and produce "
         "an expert-readable dossier."
     ),
+    lifespan=_lifespan,
 )
 
 _DEMO_USER = os.getenv("ORBITA_DEMO_USER", "")
@@ -651,9 +668,11 @@ def tamper_artifact_for_test(
     x_test_token: str = Query(None, alias="test_token"),
 ) -> dict[str, Any]:
     """Test-only endpoint: corrupt a deployment artifact to verify integrity checks.
-    Requires test_token query param matching ORBITA_TEST_TOKEN env var.
-    Only active when ORBITA_TEST_TOKEN is set.
+    Only active when ORBITA_ENABLE_TEST_ENDPOINTS=true. Requires test_token matching
+    ORBITA_TEST_TOKEN env var. Returns 404 when test endpoints are disabled.
     """
+    if not _TEST_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
     _test_tok = os.getenv("ORBITA_TEST_TOKEN", "")
     if not _test_tok or x_test_token != _test_tok:
         raise HTTPException(status_code=403, detail="Forbidden: requires valid test_token")
@@ -697,7 +716,11 @@ def restore_artifact_for_test(
     target_column: str = Query(...),
     x_test_token: str = Query(None, alias="test_token"),
 ) -> dict[str, Any]:
-    """Test-only endpoint: restore a previously tampered deployment artifact from backup."""
+    """Test-only endpoint: restore a previously tampered deployment artifact from backup.
+    Returns 404 when test endpoints are disabled.
+    """
+    if not _TEST_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
     _test_tok = os.getenv("ORBITA_TEST_TOKEN", "")
     if not _test_tok or x_test_token != _test_tok:
         raise HTTPException(status_code=403, detail="Forbidden")
