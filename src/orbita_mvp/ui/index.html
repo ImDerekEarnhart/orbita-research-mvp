@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Orbita guided discovery frontend" />
+  <title>Orbita — Guided Discovery</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <header class="topbar">
+    <a class="brand" href="#/cases" aria-label="Orbita home">
+      <span class="brand-mark">O</span>
+      <span>
+        <strong>Orbita</strong>
+        <small>Guided discovery</small>
+      </span>
+    </a>
+
+    <nav class="topnav" aria-label="Primary">
+      <a href="#/cases" data-nav="cases">Cases</a>
+      <a href="#/new" data-nav="new">New discovery</a>
+      <button id="openSettings" class="button ghost small" type="button">Connection</button>
+    </nav>
+  </header>
+
+  <main id="app" tabindex="-1"></main>
+
+  <dialog id="settingsDialog" class="modal">
+    <form method="dialog" id="settingsForm">
+      <div class="modal-head">
+        <div>
+          <p class="eyebrow">Connection</p>
+          <h2>Connect to Orbita</h2>
+        </div>
+        <button class="icon-button" value="cancel" aria-label="Close">×</button>
+      </div>
+
+      <label>
+        API base URL
+        <input id="apiBase" type="url" placeholder="https://…" required />
+      </label>
+
+      <div class="two-col">
+        <label>
+          Username
+          <input id="apiUsername" autocomplete="username" />
+        </label>
+        <label>
+          Password
+          <input id="apiPassword" type="password" autocomplete="current-password" />
+        </label>
+      </div>
+
+      <label class="switch-row">
+        <span>
+          <strong>Use demo mode</strong>
+          <small>Explore the full workflow without calling the live API.</small>
+        </span>
+        <input id="mockMode" type="checkbox" />
+      </label>
+
+      <p class="security-note">Credentials are stored only in this browser session and are never written into project files.</p>
+
+      <div class="modal-actions">
+        <button class="button ghost" value="cancel">Cancel</button>
+        <button class="button primary" id="saveSettings" value="default">Save connection</button>
+      </div>
+    </form>
+  </dialog>
+
+  <template id="loadingTemplate">
+    <section class="center-state">
+      <div class="spinner"></div>
+      <h2>Loading Orbita…</h2>
+    </section>
+  </template>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

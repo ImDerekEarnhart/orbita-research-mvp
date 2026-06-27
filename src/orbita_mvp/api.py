@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
@@ -741,6 +742,11 @@ def restore_artifact_for_test(
         "artifact_path": str(art_path),
         "restored_sha256": art_info.get("model_artifact_sha256"),
     }
+
+
+_ui_dir = Path(__file__).parent / "ui"
+if _ui_dir.exists():
+    app.mount("/ui", StaticFiles(directory=str(_ui_dir), html=True), name="ui")
 
 
 def main() -> None:
