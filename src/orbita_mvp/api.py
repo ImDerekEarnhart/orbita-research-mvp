@@ -66,7 +66,7 @@ _DEMO_PASS = os.getenv("ORBITA_DEMO_PASS", "")
 async def basic_auth(request: Request, call_next):
     if not (_DEMO_USER and _DEMO_PASS):
         return await call_next(request)
-    if request.url.path in ("/health", "/healthz"):
+    if request.url.path in ("/health", "/healthz") or request.url.path.startswith("/ui"):
         return await call_next(request)
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Basic "):

@@ -810,5 +810,10 @@
     }
   }
 
+  // Auto-open Connection dialog on first visit when in live mode with no credentials saved.
+  if (!state.settings.mockMode && !state.settings.username) {
+    openSettings();
+  }
+
   router();
 })();
