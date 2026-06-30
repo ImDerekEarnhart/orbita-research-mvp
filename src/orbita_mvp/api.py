@@ -102,6 +102,7 @@ class CompileRequest(BaseModel):
     evaluation_metric: str = Field(default="r2", description="Metric used for model selection and final validation: r2, rmse, mae, rmsle")
     confirmation_fraction: float = Field(default=0.25, ge=0.05, le=0.5, description="Fraction of rows reserved for model-selection (selection partition)")
     final_validation_fraction: float = Field(default=0.15, ge=0.05, le=0.4, description="Fraction of rows reserved for final unbiased validation (never touched during model selection)")
+    target_column: str | None = Field(default=None, description="Explicit outcome column the user intends to predict. When provided, this column is excluded from predictor roles and is the only allowed outcome.")
 
 
 class ApproveRequest(BaseModel):
@@ -262,6 +263,7 @@ def compile_case(case_id: str, request: CompileRequest) -> dict[str, Any]:
         evaluation_metric=request.evaluation_metric,
         confirmation_fraction=request.confirmation_fraction,
         final_validation_fraction=request.final_validation_fraction,
+        target_column=request.target_column,
     )
 
 

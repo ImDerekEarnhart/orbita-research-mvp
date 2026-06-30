@@ -64,9 +64,12 @@ def generate_table_candidates(
     scout_fraction: float = 0.6,
     seed: int = 20260623,
     exclude_columns: list[str] | None = None,
+    target_column: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if len(df) < 6:
         raise ValueError("At least 6 rows are required for discovery and held-out checking")
+    if target_column is not None and target_column not in df.columns:
+        raise ValueError(f"target_column {target_column!r} not found in dataset columns")
     _exclude: set[str] = set(exclude_columns or [])
     rng = random.Random(seed)
     indices = list(range(len(df)))
@@ -74,10 +77,13 @@ def generate_table_candidates(
     cut = max(3, min(len(indices) - 3, int(len(indices) * scout_fraction)))
     scout = df.iloc[indices[:cut]].copy()
 
-    numeric_columns = []
-    categorical_columns = []
+    # Predictor-eligible columns: exclude identifiers AND the target column.
+    # The target column is allowed as an OUTCOME but never as a predictor.
+    _exclude_as_predictor: set[str] = _exclude | ({target_column} if target_column else set())
+    numeric_columns = []        # eligible as predictors
+    categorical_columns = []    # eligible as predictors
     for column in df.columns:
-        if str(column) in _exclude:
+        if str(column) in _exclude_as_predictor:
             continue
         name = str(column)
         numeric_fraction = float(pd.to_numeric(df[column], errors="coerce").notna().mean())
@@ -88,15 +94,50 @@ def generate_table_candidates(
             categorical_columns.append(name)
 
     goal_columns = _goal_columns(goal, [str(c) for c in df.columns]) if goal.strip() else []
+    # When an explicit target_column is provided it is always the outcome.
+    # goal_columns are still used to constrain which pairs are explored, but
+    # the direction is always predictor → target_column.
+    if target_column and target_column not in goal_columns:
+        goal_columns = goal_columns + [target_column]
     scored: list[tuple[float, dict[str, Any]]] = []
 
+    # Build numeric columns that CAN appear as outcomes.  When target_column is
+    # specified only that column is a valid outcome; otherwise any numeric column is.
+    _target_col_set: set[str] = {target_column} if target_column else set()
+    _any_outcome = not bool(target_column)
+
+    def _is_valid_outcome(col: str) -> bool:
+        return _any_outcome or col in _target_col_set
+
+    # The target column must also be included in correlation checks even though
+    # it is excluded from numeric_columns (the predictor list).  Add it for
+    # structural detection and pair scoring using the full df column list.
+    target_numeric: list[str] = []
+    if target_column:
+        tc_series = pd.to_numeric(df[target_column], errors="coerce")
+        if tc_series.notna().mean() >= 0.85 and tc_series.nunique() >= 3:
+            target_numeric = [target_column]
+
+    # structural relations check all numeric predictor columns pairwise.
     structural = detect_structural_relations(df, numeric_columns=numeric_columns)
     structural_relations: list[dict[str, Any]] = []
     seen_structural: set[str] = set()
 
-    for i, x in enumerate(numeric_columns):
-        for y in numeric_columns[i + 1 :]:
+    # Build the full set of numeric columns for outcome lookup.
+    all_numeric = numeric_columns + target_numeric
+
+    for i, x in enumerate(all_numeric):
+        for y in all_numeric[i + 1 :]:
+            # At least one of the pair must be an eligible outcome.
+            if not (_is_valid_outcome(x) or _is_valid_outcome(y)):
+                continue
+            # If a goal_columns filter is active, respect it.
             if goal_columns and not ({x, y} & set(goal_columns)):
+                continue
+            # Enforce: target_column is never a predictor.
+            # When x == target_column it would become the predictor in the else
+            # branch below; skip entirely so direction logic below never sees it.
+            if target_column and x == target_column:
                 continue
             artifact = structural_for(structural, x, y)
             if artifact is not None:
@@ -122,12 +163,20 @@ def generate_table_candidates(
             if not math.isfinite(r) or abs(r) < 0.2:
                 continue
             direction = "positive" if r >= 0 else "negative"
-            if y in goal_columns and x not in goal_columns:
+            # Explicit target takes precedence over goal_columns direction.
+            if target_column and y == target_column:
+                predictor, outcome = x, y
+            elif target_column and x == target_column:
+                predictor, outcome = y, x
+            elif y in goal_columns and x not in goal_columns:
                 predictor, outcome = x, y
             elif x in goal_columns and y not in goal_columns:
                 predictor, outcome = y, x
             else:
                 predictor, outcome = x, y
+            # Hard guard: target_column must not be a predictor.
+            if target_column and predictor == target_column:
+                continue
             spec = {
                 "id": _candidate_id("linear", predictor, outcome),
                 "statement": f"{predictor} and {outcome} show a stable {direction} linear association.",
@@ -144,7 +193,11 @@ def generate_table_candidates(
         groups = scout[group].dropna().astype(str)
         if groups.nunique() < 2:
             continue
-        for outcome in numeric_columns:
+        outcome_pool = all_numeric if target_numeric else numeric_columns
+        for outcome in outcome_pool:
+            # Categorical predictor: target_column can only be an outcome here.
+            if target_column and outcome != target_column and not _any_outcome:
+                continue
             if goal_columns and not ({group, outcome} & set(goal_columns)):
                 continue
             temp = pd.DataFrame({"group": groups, "y": pd.to_numeric(scout.loc[groups.index, outcome], errors="coerce")}).dropna()
@@ -177,6 +230,19 @@ def generate_table_candidates(
 
     scored.sort(key=lambda item: (-item[0], item[1]["id"]))
     candidates = [spec for _, spec in scored[:max_candidates]]
+
+    # Post-generation leakage assertion: target_column must never be a predictor.
+    if target_column:
+        for cand in candidates:
+            payload_predictor = cand.get("predictor")
+            payload_predictors = cand.get("predictors", [])
+            if payload_predictor == target_column or target_column in payload_predictors:
+                raise ValueError(
+                    f"Target leakage detected during candidate generation: "
+                    f"target column {target_column!r} appears as a predictor in "
+                    f"candidate {cand['id']!r}. This is a bug — please report it."
+                )
+
     generation = {
         "strategy": "locked_scout_then_confirmation",
         "seed": seed,
@@ -186,6 +252,7 @@ def generate_table_candidates(
         "numeric_columns": numeric_columns,
         "categorical_columns": categorical_columns,
         "goal_columns": goal_columns,
+        "target_column": target_column,
         "generated_candidates": len(candidates),
         "candidate_budget": max_candidates,
         "structural_relations": structural_relations,

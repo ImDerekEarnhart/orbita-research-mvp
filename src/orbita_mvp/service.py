@@ -119,6 +119,7 @@ class ResearchMVP:
         evaluation_metric: str = "r2",
         confirmation_fraction: float = 0.25,
         final_validation_fraction: float = 0.15,
+        target_column: str | None = None,
     ) -> dict[str, Any]:
         case = self.store.get_case(case_id)
         plan = self.compiler.compile(
@@ -129,6 +130,7 @@ class ResearchMVP:
             evaluation_metric=evaluation_metric,
             confirmation_fraction=confirmation_fraction,
             final_validation_fraction=final_validation_fraction,
+            target_column=target_column,
         )
         return self.store.save_plan(case_id, plan, compiler="orbita-heuristic-compiler/0.1")
 
@@ -328,6 +330,23 @@ class ResearchMVP:
                 phase2_findings = [finding_to_dict(item) for item in phase2_ledger.entries]
 
             all_findings = phase1_findings + phase2_findings
+
+            # Runtime leakage guard: if a target_column was frozen in the plan,
+            # reject any candidate whose predictor list includes it.
+            # This runs on ALL findings (including refuted) to catch any engine bug.
+            _target_col = plan.get("target_column") or plan.get("candidate_generation", {}).get("target_column")
+            if _target_col:
+                for _f in all_findings:
+                    _pay = _f["candidate"]["payload"]
+                    _pred = _pay.get("predictor")
+                    _preds = _pay.get("predictors", [])
+                    if _pred == _target_col or _target_col in _preds:
+                        raise ValueError(
+                            f"Target leakage detected at runtime: target column "
+                            f"{_target_col!r} appears as a predictor in candidate "
+                            f"{_f['candidate']['id']!r}. Aborting run to prevent "
+                            f"invalid results."
+                        )
 
             # Collect selection-partition metric scores for all survivors.
             # Phase-1 scores are in survivor_metric_scores (computed on the

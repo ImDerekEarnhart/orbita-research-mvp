@@ -86,6 +86,7 @@ class ResearchCompiler:
         ablation_metric: str | None = None,
         confirmation_fraction: float = 0.25,
         final_validation_fraction: float = 0.15,
+        target_column: str | None = None,
     ) -> dict[str, Any]:
         validate_metric(evaluation_metric)
         if ablation_metric is not None:
@@ -147,6 +148,7 @@ class ResearchCompiler:
             goal=case.get("goal", ""),
             max_candidates=max_candidates,
             exclude_columns=identifier_columns,
+            target_column=target_column,
         )
         # Augment generation dict with all partition fractions so the service
         # can reconstruct the exact same split as candidate generation used.
@@ -178,6 +180,7 @@ class ResearchCompiler:
             "routes": ["uploaded_table_association", "data_quality_audit", "belief_graph_import"],
             "target_transform": target_transform,
             "outcome_domain": outcome_domain,
+            "target_column": target_column,
             "evaluation_metric": evaluation_metric,
             "ablation_metric": resolved_ablation_metric,
             "composition_strategy": "composition_v1_1_backward_elimination",
