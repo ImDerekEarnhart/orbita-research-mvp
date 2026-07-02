@@ -30,7 +30,27 @@ class ReportCompiler:
         reexamination: list[dict[str, Any]],
     ) -> str:
         findings = result.get("findings", [])
-        survived = [f for f in findings if f.get("final_status") in {"supported", "challenged", "provisional"} and not any(a.get("killed") for a in f.get("falsifications", []))]
+        # final_status is the generic discovery engine's own status and always
+        # collapses every killed candidate into "refuted" — see
+        # orbita_discovery.core.resolve_status. The enriched, product-level
+        # verdict (not_supported / inconclusive / functional_form_rejected /
+        # refuted / committed / provisional) lives on the persisted claim
+        # instead, keyed by source_candidate_id. Look claims up by candidate
+        # id so this report matches the API, graph, and case UI exactly.
+        claims_by_candidate_id = {
+            row.get("source_candidate_id"): row for row in claim_rows if row.get("source_candidate_id")
+        }
+
+        def _candidate_id(f: dict[str, Any]) -> str | None:
+            return f.get("candidate", {}).get("id")
+
+        def _verdict_for(f: dict[str, Any]) -> str:
+            claim = claims_by_candidate_id.get(_candidate_id(f))
+            if claim:
+                return claim.get("verdict", f.get("final_status", "unknown"))
+            return f.get("final_status", "unknown")
+
+        survived = [f for f in findings if _verdict_for(f) in {"committed", "provisional"}]
         failed = [f for f in findings if f not in survived]
         selected = plan.get("selected_dataset", {})
         lines: list[str] = [
@@ -91,7 +111,7 @@ class ReportCompiler:
             lines += [
                 f"### {idx}. {candidate.get('statement', candidate.get('id'))}",
                 "",
-                f"- **Final status:** {finding.get('final_status')}",
+                f"- **Verdict:** {_verdict_for(finding)}",
                 f"- **Held-out score:** {_fmt(verdict.get('score'))}",
                 f"- **Baseline:** {_fmt(verdict.get('detail', {}).get('baseline'))}",
                 f"- **Checks survived:** {', '.join(finding.get('survived', [])) or 'none'}",
@@ -113,10 +133,13 @@ class ReportCompiler:
             lines.append("None.")
         for finding in failed:
             killed_by = [a.get("name") for a in finding.get("falsifications", []) if a.get("killed")]
+            claim = claims_by_candidate_id.get(_candidate_id(finding))
+            reason = (claim.get("finding_detail", {}) or {}).get("rejection_reason") if claim else None
             lines.append(
                 f"- **{finding.get('candidate', {}).get('statement', finding.get('candidate', {}).get('id'))}** — "
-                f"status `{finding.get('final_status')}`, score {_fmt(finding.get('verdict', {}).get('score'))}; "
+                f"verdict `{_verdict_for(finding)}`, score {_fmt(finding.get('verdict', {}).get('score'))}; "
                 f"failed: {', '.join(killed_by) or 'did not reach the governed threshold'}."
+                + (f" {reason}" if reason else "")
             )
 
         lines += [

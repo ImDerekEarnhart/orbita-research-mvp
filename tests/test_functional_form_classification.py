@@ -59,6 +59,25 @@ def _run_case(csv_path: Path, name: str):
             svc.close()
 
 
+def _run_case_with_report(csv_path: Path, name: str):
+    """Like _run_case, but also returns the generated markdown report text."""
+    with tempfile.TemporaryDirectory() as td:
+        svc = ResearchMVP(Path(td) / "o.db", Path(td) / "ws")
+        try:
+            case = svc.create_case(name=name, goal="")
+            svc.add_file(case["id"], csv_path)
+            plan = svc.compile_case(case["id"])
+            svc.approve_plan(plan["id"], reviewer="tester")
+            run = svc.run_case(case["id"], plan_id=plan["id"])
+            assert run["status"] == "completed"
+            claims = svc.store.case_claims(case["id"])
+            report_path = Path(run["result"]["reports"]["markdown"]["path"])
+            report_text = report_path.read_text(encoding="utf-8")
+            return claims, report_text
+        finally:
+            svc.close()
+
+
 # ---------------------------------------------------------------------------
 # 1. Unit tests for the classifier itself (no dataset dependency)
 # ---------------------------------------------------------------------------
@@ -318,3 +337,33 @@ def test_allometry_every_killed_claim_has_full_diagnostic_fields():
         # held_out_score may be None only if the candidate never reached that
         # check, but at least one score/n pair must be present.
         assert detail.get("held_out_score") is not None or detail.get("baseline_score") is not None
+
+
+# ---------------------------------------------------------------------------
+# 3. The HTML/markdown report must match the claims API, not the raw engine's
+#    collapsed final_status. ReportCompiler.build_markdown previously read
+#    finding.get("final_status") directly from the raw ledger findings,
+#    bypassing the enriched claim_rows entirely — so a not_supported claim
+#    (correct everywhere else) still printed "refuted" in the report.
+# ---------------------------------------------------------------------------
+
+def test_report_uses_enriched_verdict_not_raw_final_status():
+    claims, report_text = _run_case_with_report(TITANIC_CSV, "Titanic report consistency regression")
+
+    not_supported = [c for c in claims if c["finding_type"] == "not_supported_candidate"]
+    assert not_supported, "expected at least one not_supported claim in this run"
+
+    for c in not_supported:
+        text = c["canonical_text"]
+        # Find this candidate's line in the "failed" section of the report
+        # and confirm it prints the enriched verdict, not the raw engine
+        # status. Every not_supported claim must never appear tagged
+        # `refuted` in the report.
+        idx = report_text.find(text)
+        assert idx != -1, f"candidate statement not found in report: {text}"
+        line_end = report_text.find("\n", idx)
+        line = report_text[idx:line_end if line_end != -1 else None]
+        assert "verdict `not_supported`" in line, (
+            f"report line for a not_supported claim must say so, got: {line!r}"
+        )
+        assert "`refuted`" not in line, f"not_supported claim incorrectly shown as refuted: {line!r}"
