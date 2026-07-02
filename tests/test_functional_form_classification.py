@@ -28,7 +28,9 @@ pin the corrected, honest classification:
 
 from __future__ import annotations
 
+import html
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 from orbita_mvp import ResearchMVP
@@ -61,6 +63,14 @@ def _run_case(csv_path: Path, name: str):
 
 def _run_case_with_report(csv_path: Path, name: str):
     """Like _run_case, but also returns the generated markdown report text."""
+    claims, report_text, _html_text, _case_id = _run_case_with_html_report(csv_path, name)
+    return claims, report_text
+
+
+def _run_case_with_html_report(csv_path: Path, name: str):
+    """Like _run_case, but also returns the generated markdown AND rendered
+    HTML report text — the HTML is exactly what /cases/{id}/report serves
+    and users download, so that is what must be checked for consistency."""
     with tempfile.TemporaryDirectory() as td:
         svc = ResearchMVP(Path(td) / "o.db", Path(td) / "ws")
         try:
@@ -72,8 +82,10 @@ def _run_case_with_report(csv_path: Path, name: str):
             assert run["status"] == "completed"
             claims = svc.store.case_claims(case["id"])
             report_path = Path(run["result"]["reports"]["markdown"]["path"])
+            html_path = Path(run["result"]["reports"]["html"]["path"])
             report_text = report_path.read_text(encoding="utf-8")
-            return claims, report_text
+            html_text = html_path.read_text(encoding="utf-8")
+            return claims, report_text, html_text, case["id"]
         finally:
             svc.close()
 
@@ -404,3 +416,80 @@ def test_report_uses_enriched_verdict_not_raw_final_status():
             f"report line for a not_supported claim must say so, got: {line!r}"
         )
         assert "`refuted`" not in line, f"not_supported claim incorrectly shown as refuted: {line!r}"
+
+
+def test_full_rendered_html_never_shows_not_supported_claim_as_refuted():
+    """Parse the COMPLETE rendered HTML (exactly what /cases/{id}/report
+    serves and what a user downloads) and check every section, not just the
+    "failed candidates" markdown line. This is what actually shipped to a
+    downloaded dossier: the "Candidates that failed or remained unresolved"
+    narrative section AND the "Belief graph and provenance receipt" table
+    both render the same claim, and both must show the same verdict.
+    """
+    claims, _md, html_text, case_id = _run_case_with_html_report(
+        TITANIC_CSV, "Titanic full-HTML report consistency regression"
+    )
+    not_supported = [c for c in claims if c["finding_type"] == "not_supported_candidate"]
+    assert not_supported, "expected at least one not_supported claim in this run"
+    assert not any(c["finding_type"] == "falsified_candidate" for c in claims), (
+        "this regression run is expected to have zero genuinely-refuted claims; "
+        "if that changes, this test's premise (checking for absence of the word "
+        "'refuted' near these claims) needs the more general per-claim proximity "
+        "check below instead of the whole-document check"
+    )
+
+    # 1. Whole-document check: with zero genuinely refuted claims in this run,
+    #    the ONLY legitimate appearance of the word "refuted" is the explicit
+    #    "0 refuted" count in the executive summary. It must not appear
+    #    anywhere else — not attached to any specific claim's row or bullet,
+    #    not in the narrative "failed candidates" section, nowhere else in
+    #    the document. This is what a user Ctrl-F'ing the downloaded HTML
+    #    for "refuted" should see: exactly one hit, and it says zero.
+    refuted_occurrences = html_text.lower().count("refuted")
+    assert refuted_occurrences == 1, (
+        f"expected exactly one appearance of 'refuted' (the executive summary's "
+        f"explicit '0 refuted' count) in dossier for case {case_id}, found "
+        f"{refuted_occurrences}"
+    )
+    assert "0 refuted" in html_text, (
+        f"the single 'refuted' occurrence must be the executive summary's explicit "
+        f"zero count, case {case_id}"
+    )
+
+    # 2. Per-claim proximity check, for robustness independent of (1): every
+    #    occurrence of a not_supported claim's statement text in the HTML
+    #    must not have "refuted" within a reasonable surrounding window
+    #    (catches the case where some OTHER claim in the same run is
+    #    genuinely refuted, so check (1) alone would be too strict).
+    for c in not_supported:
+        text = c["canonical_text"]
+        start = 0
+        found_once = False
+        while True:
+            idx = html_text.find(html.escape(text), start)
+            if idx == -1:
+                idx = html_text.find(text, start)
+                if idx == -1:
+                    break
+            found_once = True
+            window = html_text[max(0, idx - 400) : idx + len(text) + 400]
+            assert "refuted" not in window.lower(), (
+                f"not_supported claim shown near the word 'refuted' in rendered HTML: {text!r}"
+            )
+            start = idx + 1
+        assert found_once, f"claim statement not found anywhere in rendered HTML: {text!r}"
+
+
+def test_executive_summary_shows_explicit_verdict_counts():
+    """The executive summary must give an explicit count breakdown
+    (e.g. "1 supported, 5 not supported, 0 refuted, and 2 data-quality
+    artifacts") instead of the old vague "were refuted, unstable, or
+    unresolved", which hid that 0 of them were actually refuted.
+    """
+    claims, report_text = _run_case_with_report(TITANIC_CSV, "Titanic executive summary regression")
+    counts = Counter(c["verdict"] for c in claims)
+
+    assert f"{counts.get('committed', 0)} supported" in report_text
+    assert f"{counts.get('not_supported', 0)} not supported" in report_text
+    assert f"{counts.get('rejected', 0)} refuted" in report_text
+    assert f"{counts.get('artifact', 0)} data-quality artifacts" in report_text

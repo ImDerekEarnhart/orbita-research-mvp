@@ -3,8 +3,27 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
+
+# Human-readable label for each public verdict state, used in the executive
+# summary so counts are explicit ("1 supported, 5 not supported, 0 refuted,
+# and 2 data-quality artifacts") instead of a vague "were refuted, unstable,
+# or unresolved" that hides which of five very different outcomes occurred.
+_VERDICT_LABELS = {
+    "committed": "supported",
+    "provisional": "provisional",
+    "not_supported": "not supported",
+    "inconclusive": "inconclusive",
+    "functional_form_rejected": "functional-form-rejected",
+    "rejected": "refuted",
+    "artifact": "data-quality artifacts",
+    "unresolved": "unresolved",
+}
+# Always shown, in this order, even at zero — these are the four outcomes a
+# reader needs to see explicitly to trust the summary.
+_ALWAYS_SHOWN_VERDICTS = ("committed", "not_supported", "rejected", "artifact")
 
 
 def _fmt(value: Any, digits: int = 3) -> str:
@@ -17,6 +36,27 @@ def _fmt(value: Any, digits: int = 3) -> str:
 
 def _escape(text: Any) -> str:
     return html.escape(str(text))
+
+
+def _verdict_count_summary(claim_rows: list[dict[str, Any]]) -> str:
+    """Build an explicit per-verdict count sentence from the persisted claims.
+
+    Uses claim_rows directly (not the raw findings list) so artifact/
+    data-quality claims — which never appear in result["findings"] — are
+    included, and so this always matches whatever the claims API and case UI
+    show for the same case.
+    """
+    counts = Counter(row.get("verdict", "unknown") for row in claim_rows)
+    parts = [f"{counts.get(v, 0)} {_VERDICT_LABELS.get(v, v)}" for v in _ALWAYS_SHOWN_VERDICTS]
+    # Append any other verdict present with a nonzero count (inconclusive,
+    # functional_form_rejected, provisional, unresolved) so nothing is
+    # silently dropped from the total.
+    for v, n in counts.items():
+        if v not in _ALWAYS_SHOWN_VERDICTS and n:
+            parts.append(f"{n} {_VERDICT_LABELS.get(v, v)}")
+    if len(parts) > 1:
+        return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+    return parts[0] if parts else "no claims recorded"
 
 
 class ReportCompiler:
@@ -65,16 +105,15 @@ class ReportCompiler:
             "## Executive summary",
             "",
         ]
+        verdict_summary = _verdict_count_summary(claim_rows)
         if survived:
             lines.append(
-                f"Orbita froze and tested {len(findings)} candidate relationships. "
-                f"{len(survived)} survived the configured held-out and cross-seed attacks; "
-                f"{len(failed)} were refuted, unstable, or unresolved."
+                f"Orbita froze and tested {len(findings)} candidate relationships: {verdict_summary}."
             )
         else:
             lines.append(
-                f"Orbita tested {len(findings)} candidate relationships, but none survived every configured attack. "
-                "This is a valid null result and should not be rewritten as a discovery."
+                f"Orbita tested {len(findings)} candidate relationships, but none survived every configured attack "
+                f"({verdict_summary}). This is a valid null result and should not be rewritten as a discovery."
             )
         lines += [
             "",
