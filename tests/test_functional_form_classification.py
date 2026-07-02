@@ -134,6 +134,43 @@ def test_persistent_negative_cross_seed_on_generic_claim_is_functional_form_reje
     assert diag["cross_seed_median"] == -0.25
 
 
+def test_composite_killed_by_non_pairwise_check_on_tiny_sample_is_inconclusive():
+    # Composite candidates are killed by ImprovementFalsifier/AblationFalsifier
+    # — names outside baseline/held_out/cross_seed — but those checks score on
+    # the exact same tiny confirmation partition. A composite killed only by
+    # "improvement" with n below the reliability floor must still be
+    # inconclusive, not blindly refuted just because its own falsifier name
+    # isn't one of the three core pairwise checks.
+    finding = {
+        "candidate": {"id": "composite:y:abc", "payload": {"kind": "composite_linear", "predictors": ["a", "b"], "outcome": "y"}},
+        "falsifications": [
+            {"name": "improvement", "killed": True, "detail": {"composite_score": -0.2, "n": 5}},
+        ],
+    }
+    ftype, diag = classify_pairwise_finding(
+        finding, min_reliable_partition_n=8, is_explicit_predictive_claim=True
+    )
+    assert ftype == "inconclusive_candidate"
+    assert diag["smallest_test_partition_n"] == 5
+
+
+def test_composite_killed_by_non_pairwise_check_on_large_sample_is_refuted():
+    # Same shape, but the sample is large enough to trust: an explicit
+    # predictive claim (composite) killed by improvement/ablation on a
+    # reliable sample IS refuted — those falsifiers directly test "did this
+    # predict better than baseline," which is exactly what the claim asserts.
+    finding = {
+        "candidate": {"id": "composite:y:abc", "payload": {"kind": "composite_linear", "predictors": ["a", "b"], "outcome": "y"}},
+        "falsifications": [
+            {"name": "improvement", "killed": True, "detail": {"composite_score": -0.2, "n": 200}},
+        ],
+    }
+    ftype, diag = classify_pairwise_finding(
+        finding, min_reliable_partition_n=8, is_explicit_predictive_claim=True
+    )
+    assert ftype == "falsified_candidate"
+
+
 def test_stable_opposite_direction_against_directional_claim_is_refuted():
     # The candidate asserts a specific direction (e.g. "a stable positive
     # linear association"). If the fitted relationship is stably in the

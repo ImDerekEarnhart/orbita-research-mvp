@@ -152,40 +152,42 @@ def classify_pairwise_finding(
     should keep their existing robust_relation / promising_candidate logic
     for anything that survived falsification untouched.
 
-    Priority, evaluated across all killed pairwise checks (baseline,
-    held_out, cross_seed):
-      1. Any check ran on a test partition smaller than
-         ``min_reliable_partition_n`` -> "inconclusive_candidate". Sample
-         size is checked first because it invalidates the other checks'
-         scores entirely, regardless of what they show.
-      2. A persistent negative *cross_seed* median (aggregated across 9
-         reseeds/resamples, so it reflects a pattern rather than one
-         unlucky split) means the tested MODEL FORM performed below
-         baseline. What that implies depends on what the candidate's literal
-         claim actually asserts:
-           - If ``is_explicit_predictive_claim`` (the candidate's own
-             statement asserts predictive performance above baseline, e.g.
-             a composite "can be predicted by" claim) -> "refuted". Failing
-             to predict better than baseline directly contradicts that
-             literal claim.
-           - Elif ``direction_conflict`` (the candidate asserted a specific
-             direction — e.g. "a stable positive association" — and the
-             fitted relationship is in the opposite direction) -> "refuted".
-             A stable opposite-signed effect, or a failed preregistered
-             directional prediction, is direct contradiction.
-           - Otherwise (a generic association/relationship claim with no
-             directional or predictive-performance assertion) ->
-             "functional_form_rejected_candidate". The tested functional
-             form (e.g. raw linear) failed, but that does not by itself
-             refute the underlying variable relationship — only that this
-             particular model shape did not capture it.
-      3. A negative score from baseline or held_out ALONE (each computed on
+    Priority:
+      1. Sample size gate, evaluated across EVERY falsification that reports
+         an "n" — killed or not, and regardless of check name. Composite
+         candidates are killed by ImprovementFalsifier/AblationFalsifier
+         (names outside baseline/held_out/cross_seed), but those still score
+         on the same tiny confirmation partition, so they are exactly as
+         unreliable at small n. Any check run on a partition smaller than
+         ``min_reliable_partition_n`` -> "inconclusive_candidate", before
+         anything else is considered.
+      2. If ``is_explicit_predictive_claim`` (the candidate's own statement
+         asserts predictive performance above baseline, e.g. a composite
+         "can be predicted by" claim) and it was killed by ANY predictive
+         check (improvement, ablation, or a persistent negative cross_seed
+         median) -> "refuted". Failing to predict better than baseline on a
+         large-enough sample directly contradicts that literal claim.
+      3. Elif ``direction_conflict`` (the candidate asserted a specific
+         direction — e.g. "a stable positive association" — and the fitted
+         relationship is in the opposite direction) and cross_seed shows a
+         persistent negative median -> "refuted". A stable opposite-signed
+         effect, or a failed preregistered directional prediction, is direct
+         contradiction.
+      4. Elif cross_seed shows a persistent negative median (aggregated
+         across 9 reseeds/resamples, so it reflects a pattern rather than one
+         unlucky split) on a generic association/relationship claim with no
+         directional or predictive-performance assertion ->
+         "functional_form_rejected_candidate". The tested functional form
+         (e.g. raw linear) failed, but that does not by itself refute the
+         underlying variable relationship — only that this particular model
+         shape did not capture it.
+      5. A negative score from baseline or held_out ALONE (each computed on
          a single fixed split) never triggers refutation or functional-form
          rejection on its own — one influential point landing in one
          particular split is noise. Falls through to "not_supported".
     """
     falsifications = finding.get("falsifications", []) or []
-    killed_checks = [a for a in falsifications if a.get("killed") and a.get("name") in _PAIRWISE_CHECK_NAMES]
+    killed = [a for a in falsifications if a.get("killed")]
 
     diagnostics: dict[str, Any] = {
         "killed_checks": [],
@@ -193,24 +195,32 @@ def classify_pairwise_finding(
         "hard_refutation_score_ceiling": hard_refutation_score_ceiling,
         "is_predictive_claim": is_explicit_predictive_claim,
     }
-    if not killed_checks:
-        return "falsified_candidate", diagnostics  # nothing pairwise killed it; caller's problem
+    if not killed:
+        return "falsified_candidate", diagnostics  # nothing killed it; caller's problem
 
+    # Sample size is a property of the test partition itself, not of which
+    # specific falsifier happened to trip. Composite candidates are killed by
+    # ImprovementFalsifier/AblationFalsifier — names outside baseline/held_out/
+    # cross_seed — but those still score on the same tiny confirmation
+    # partition, so they are just as unreliable at small n. Check every
+    # falsification that reports an "n" (killed or not), not only the
+    # baseline/held_out/cross_seed trio.
     smallest_n: int | None = None
     cross_seed_median: float | None = None
     cross_seed_killed = False
-    for attack in killed_checks:
+    for attack in falsifications:
         name = attack.get("name")
         detail = attack.get("detail", {}) or {}
         n = detail.get("n")
-        score = detail.get("score") if name in ("baseline", "held_out") else detail.get("median")
-        diagnostics["killed_checks"].append({"name": name, "score": score, "n": n})
         if isinstance(n, int):
             smallest_n = n if smallest_n is None else min(smallest_n, n)
-        if name == "cross_seed":
-            cross_seed_killed = True
-            if isinstance(score, (int, float)):
-                cross_seed_median = score
+        if attack.get("killed"):
+            score = detail.get("score") if name in ("baseline", "held_out") else detail.get("median")
+            diagnostics["killed_checks"].append({"name": name, "score": score, "n": n})
+            if name == "cross_seed":
+                cross_seed_killed = True
+                if isinstance(score, (int, float)):
+                    cross_seed_median = score
 
     diagnostics["smallest_test_partition_n"] = smallest_n
     diagnostics["cross_seed_median"] = cross_seed_median
@@ -222,16 +232,20 @@ def classify_pairwise_finding(
         )
         return "inconclusive_candidate", diagnostics
 
-    persistent_negative = (
+    persistent_negative_cross_seed = (
         cross_seed_killed and cross_seed_median is not None and cross_seed_median < hard_refutation_score_ceiling
     )
-    if persistent_negative:
-        if is_explicit_predictive_claim:
-            diagnostics["reason"] = (
-                "This candidate's own statement asserts predictive performance above baseline; the "
-                "cross-seed median was persistently below baseline, directly contradicting that claim."
-            )
-            return "falsified_candidate", diagnostics
+    killed_by_predictive_check = any(a.get("name") not in _PAIRWISE_CHECK_NAMES for a in killed)
+
+    if is_explicit_predictive_claim and (persistent_negative_cross_seed or killed_by_predictive_check):
+        diagnostics["reason"] = (
+            "This candidate's own statement asserts predictive performance above baseline; a predictive "
+            "check (improvement/ablation/held-out/cross-seed) failed on a large-enough sample, directly "
+            "contradicting that claim."
+        )
+        return "falsified_candidate", diagnostics
+
+    if persistent_negative_cross_seed:
         if direction_conflict:
             diagnostics["reason"] = (
                 "The fitted relationship is in the opposite direction from what this candidate asserts — "
