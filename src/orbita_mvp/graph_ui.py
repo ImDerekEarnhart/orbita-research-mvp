@@ -64,8 +64,14 @@ def build_graph_data(case_id: str, conn: Any) -> dict[str, Any]:
             "candidate_score": detail.get("candidate_score"),
             "baseline_score": detail.get("baseline_score"),
             "held_out_score": detail.get("held_out_score"),
+            "held_out_n": detail.get("held_out_n"),
+            "baseline_n": detail.get("baseline_n"),
+            "full_data_score_diagnostic": detail.get("full_data_score_diagnostic"),
+            "metric_name": detail.get("metric_name"),
             "cross_seed_summary": detail.get("cross_seed_summary"),
             "verdict_reason": detail.get("verdict_reason"),
+            "rejection_reason": detail.get("rejection_reason"),
+            "alternative_candidate_id": detail.get("alternative_candidate_id"),
             "influence_warning": detail.get("influence_warning"),
         })
 
@@ -530,6 +536,9 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <div class="lg-item"><div class="ld" style="background:#f97316"></div>Artifact</div>
         <div class="lg-item"><div class="ld" style="background:#eab308"></div>Provisional</div>
         <div class="lg-item"><div class="ld" style="background:#6b7280"></div>Unresolved</div>
+        <div class="lg-item"><div class="ld" style="background:#94a3b8"></div>Not supported</div>
+        <div class="lg-item"><div class="ld" style="background:#475569"></div>Inconclusive</div>
+        <div class="lg-item"><div class="ld" style="background:#d97706"></div>Wrong functional form</div>
         <div class="lg-item"><div class="ld" style="background:#8b5cf6"></div>Evidence</div>
         <div class="lg-item"><div class="ld" style="background:#0ea5e9"></div>Analysis Run</div>
         <div class="lg-item"><div class="ld" style="background:#14b8a6"></div>Source File</div>
@@ -581,6 +590,9 @@ var NODE_CLR = {
   state_artifact:    {background:'#f97316',border:'#ea580c'},  // orange
   state_provisional: {background:'#eab308',border:'#ca8a04'},  // yellow
   state_unresolved:  {background:'#6b7280',border:'#4b5563'},  // gray
+  state_not_supported:          {background:'#94a3b8',border:'#64748b'},  // slate
+  state_inconclusive:           {background:'#475569',border:'#334155'},  // dark slate
+  state_functional_form_rejected: {background:'#d97706',border:'#b45309'},  // amber
   state_:            {background:'#6b7280',border:'#4b5563'},
   evidence:         {background:'#8b5cf6',border:'#7c3aed'},
   evidence_rev:     {background:'#3b2b6b',border:'#2b1b5b'},
@@ -601,6 +613,9 @@ var STATUS_CLR = {
   artifact:    {bg:'#431407',fg:'#fb923c',brd:'#ea580c'},
   provisional: {bg:'#422006',fg:'#facc15',brd:'#ca8a04'},
   unresolved:  {bg:'#1f2937',fg:'#9ca3af',brd:'#4b5563'},
+  not_supported: {bg:'#1e293b',fg:'#94a3b8',brd:'#64748b'},
+  inconclusive:  {bg:'#0f172a',fg:'#64748b',brd:'#334155'},
+  functional_form_rejected: {bg:'#451a03',fg:'#fbbf24',brd:'#b45309'},
   pending:     {bg:'#1f2937',fg:'#9ca3af',brd:'#4b5563'},
 };
 
@@ -648,7 +663,7 @@ function visNode(n, hidden) {
 function computeVisible(d) {
   if(showAllCandidates) return null;  // null => everything visible
   var visible = new Set();
-  var shown = {rejected:0, artifact:0, provisional:0, unresolved:0};
+  var shown = {rejected:0, artifact:0, provisional:0, unresolved:0, not_supported:0, inconclusive:0, functional_form_rejected:0};
   d.nodes.forEach(function(n){
     if(n.type!=='claim') return;
     var st = n.public_state||'unresolved';
@@ -823,16 +838,20 @@ function renderOverview(n) {
     h+=row(stmtLabel,'<span style="line-height:1.55">'+esc(n.full_text||'')+'</span>');
     h+=row('Finding type',esc(n.finding_type||'—'));
     if(n.verdict_reason) h+=row('Why','<span style="line-height:1.5;color:var(--dim)">'+esc(n.verdict_reason)+'</span>');
+    if(n.rejection_reason) h+=row('Rejection reason','<span style="line-height:1.5;color:#fbbf24">'+esc(n.rejection_reason)+'</span>');
+    if(n.alternative_candidate_id) h+=row('Supported alternative','<span style="color:#4ade80;font-family:monospace;font-size:11px">'+esc(n.alternative_candidate_id)+'</span>');
     if(n.influence_warning){
       var iw=n.influence_warning;
       h+='<div class="dr"><div class="dl" style="color:#fb923c">⚠ Influence warning</div><div class="dv" style="line-height:1.5">'+esc(iw.message||'High-leverage dominance')+
          '<div style="color:var(--dim);font-size:10px;margin-top:4px">R² full '+esc(iw.r2_full)+' → '+esc(iw.r2_without_dominant)+' without dominant point · Cook&#39;s D '+esc(iw.max_cooks_distance)+'</div></div></div>';
     }
+    if(n.metric_name) h+=row('Metric',esc(n.metric_name));
     var scores=[];
     if(n.candidate_score!=null) scores.push('candidate '+(+n.candidate_score).toFixed(3));
     if(n.baseline_score!=null) scores.push('baseline '+(+n.baseline_score).toFixed(3));
-    if(n.held_out_score!=null) scores.push('held-out '+(+n.held_out_score).toFixed(3));
+    if(n.held_out_score!=null) scores.push('held-out '+(+n.held_out_score).toFixed(3)+(n.held_out_n!=null?' (n='+n.held_out_n+')':''));
     if(n.cross_seed_summary&&n.cross_seed_summary.median!=null) scores.push('cross-seed median '+(+n.cross_seed_summary.median).toFixed(3));
+    if(n.full_data_score_diagnostic!=null) scores.push('full-data fit '+(+n.full_data_score_diagnostic).toFixed(3)+' (diagnostic only)');
     if(scores.length) h+=row('Check scores','<span style="color:var(--dim)">'+esc(scores.join(' · '))+'</span>');
     h+=row('Claim type',esc(n.claim_type||'—'));
     h+=row('Created',fmt(n.created_at));

@@ -33,7 +33,7 @@ class BaselineFalsifier:
             self.name,
             killed=delta < self.margin,
             metric=delta,
-            detail={"score": round(score, 6), "baseline": round(baseline, 6), "margin": self.margin},
+            detail={"score": round(score, 6), "baseline": round(baseline, 6), "margin": self.margin, "n": len(test)},
         )
 
 
@@ -53,7 +53,7 @@ class HeldOutFalsifier:
             self.name,
             killed=score < self.min_score,
             metric=score,
-            detail={"score": round(score, 6), "minimum": self.min_score},
+            detail={"score": round(score, 6), "minimum": self.min_score, "n": len(test)},
         )
 
 
@@ -69,10 +69,12 @@ class CrossSeedFalsifier:
         if not isinstance(domain, FittableDomain):
             return Falsification(self.name, False, detail={"skipped": "domain not fittable"})
         scores: list[float] = []
+        test_n = 0
         for seed in range(2, 2 + self.seeds):
             train, test = domain.splits(evidence, seed=seed)
             model = domain.refit(c, train)
             scores.append(domain.score(c, model, test))
+            test_n = len(test)
         med = median(scores)
         spread = max(scores) - min(scores)
         killed = med < self.min_median
@@ -88,6 +90,7 @@ class CrossSeedFalsifier:
                 "seeds": self.seeds,
                 "min_median": self.min_median,
                 "max_spread": self.max_spread,
+                "n": test_n,
             },
         )
 

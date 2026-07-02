@@ -176,9 +176,13 @@ def test_end_to_end_no_falsified_provisional_leak(tmp_path: Path):
         assert counts["generated_candidates"] > 0
         assert counts["artifact_count"] >= 1
         assert counts["committed_count"] >= 1
-        # Provisional must not absorb rejected findings.
-        assert counts["rejected_count"] >= 1
-        # Public verdict set is exactly the five spec states.
+        # The raw mass->rate relation is real but nonlinear; the log-log form
+        # survives, so the raw form must now be reclassified as
+        # functional_form_rejected rather than a bare "rejected" — see
+        # test_functional_form_classification.py for the dedicated coverage.
+        assert counts["rejected_count"] + counts["functional_form_rejected_count"] >= 1
+        # Public verdict set is exactly the eight spec states.
         assert set(c["verdict"] for c in claims) <= {
-            "committed", "rejected", "artifact", "provisional", "unresolved"
+            "committed", "rejected", "artifact", "provisional", "unresolved",
+            "not_supported", "inconclusive", "functional_form_rejected",
         }

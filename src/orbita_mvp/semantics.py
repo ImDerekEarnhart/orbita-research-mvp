@@ -27,16 +27,43 @@ REJECTED = "rejected"
 ARTIFACT = "artifact"
 PROVISIONAL = "provisional"
 UNRESOLVED = "unresolved"
+# A falsifier score fell below the support threshold, but did not show
+# evidence actively worse than a trivial baseline. Distinct from REJECTED:
+# "insufficient support" is not the same claim as "contradicted".
+NOT_SUPPORTED = "not_supported"
+# The held-out or cross-seed test partition was too small for its score to
+# be trustworthy (a handful of rows can flip R² by more than a full point).
+# Distinct from UNRESOLVED: the candidate *could* be tested, the result is
+# just too noisy to act on with this much data.
+INCONCLUSIVE = "inconclusive"
+# The tested functional form (e.g. a raw linear fit) failed, but a
+# transformed version of the same predictor/outcome pair (e.g. log-log)
+# survived. The underlying relationship is not refuted — the specific model
+# shape tried here was the wrong one.
+FUNCTIONAL_FORM_REJECTED = "functional_form_rejected"
 
-PUBLIC_STATES = {COMMITTED, REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED}
+PUBLIC_STATES = {
+    COMMITTED, REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED,
+    NOT_SUPPORTED, INCONCLUSIVE, FUNCTIONAL_FORM_REJECTED,
+}
 
 # Canonical mapping required by the spec. Legacy finding-type spellings are
 # retained so older rows in the persistent ledger still resolve correctly.
 FINDING_TYPE_TO_STATE: dict[str, str] = {
     # Survived all falsifiers and committed.
     "robust_relation": COMMITTED,
-    # Killed by at least one falsifier.
+    # Killed by at least one falsifier with evidence actively against it
+    # (e.g. held-out R² < 0 — worse than predicting the mean).
     "falsified_candidate": REJECTED,
+    # Killed by at least one falsifier, but the score simply didn't clear
+    # the bar rather than showing evidence against the hypothesis.
+    "not_supported_candidate": NOT_SUPPORTED,
+    # Killed, but on a test partition too small to trust the verdict.
+    "inconclusive_candidate": INCONCLUSIVE,
+    # Killed, but a transformed sibling candidate (same columns, different
+    # functional form) survived — the relationship exists, this shape of it
+    # doesn't.
+    "functional_form_rejected_candidate": FUNCTIONAL_FORM_REJECTED,
     # Structural / transform tautology, not a scientific hypothesis.
     "artifact": ARTIFACT,
     "structural_relation": ARTIFACT,
@@ -59,6 +86,9 @@ STATE_COLOR = {
     ARTIFACT: "orange",
     PROVISIONAL: "yellow",
     UNRESOLVED: "gray",
+    NOT_SUPPORTED: "slate",
+    INCONCLUSIVE: "blue-gray",
+    FUNCTIONAL_FORM_REJECTED: "amber",
 }
 
 
@@ -78,15 +108,212 @@ def is_rejected(finding_type: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Killed-candidate classification: refuted vs. not_supported vs. inconclusive
+# ---------------------------------------------------------------------------
+#
+# The generic discovery engine (orbita_discovery.core.resolve_status) collapses
+# every killed falsifier into one bucket: "refuted". That conflates three very
+# different outcomes:
+#   1. The evidence actively contradicts the hypothesis (score worse than a
+#      trivial baseline — e.g. held-out R² < 0).
+#   2. The evidence just didn't clear the support bar (score is non-negative
+#      but below the threshold).
+#   3. The test partition was too small for the score to mean anything (a
+#      handful of held-out rows can swing R² by more than a full point,
+#      especially with heavy-tailed data).
+#
+# This module re-derives a finer verdict from the same falsification detail
+# dicts (which now report "n", the test-partition size used) without
+# changing the generic engine's contract.
+
+_PAIRWISE_CHECK_NAMES = ("baseline", "held_out", "cross_seed")
+
+
+def _check_detail(falsifications: list[dict[str, Any]], name: str) -> dict[str, Any]:
+    for attack in falsifications:
+        if attack.get("name") == name:
+            return attack.get("detail", {}) or {}
+    return {}
+
+
+def classify_pairwise_finding(
+    finding: dict[str, Any],
+    *,
+    min_reliable_partition_n: int = 8,
+    hard_refutation_score_ceiling: float = 0.0,
+) -> tuple[str, dict[str, Any]]:
+    """Reclassify a killed finding into refuted / not_supported / inconclusive.
+
+    Returns ``(internal_finding_type, diagnostics)``. Only meaningful for
+    findings where at least one falsifier reported ``killed=True`` — callers
+    should keep their existing robust_relation / promising_candidate logic
+    for anything that survived falsification untouched.
+
+    Priority, evaluated across all killed pairwise checks (baseline,
+    held_out, cross_seed):
+      1. Any check ran on a test partition smaller than
+         ``min_reliable_partition_n`` -> "inconclusive_candidate". Sample
+         size is checked first because it invalidates the other checks'
+         scores entirely, regardless of what they show.
+      2. "Refuted" (hard evidence against the hypothesis) requires the
+         *cross_seed* median specifically to be worse than
+         ``hard_refutation_score_ceiling``. cross_seed aggregates 9
+         reseeds/resamples, so a negative median reflects a persistent
+         pattern rather than one unlucky split. A negative score from
+         baseline or held_out ALONE — each computed on a single fixed
+         split — is explicitly NOT sufficient on its own: one influential
+         point landing in one particular split is noise, not evidence the
+         relationship is wrong. It falls through to not_supported instead.
+      3. Otherwise -> "not_supported_candidate".
+    """
+    falsifications = finding.get("falsifications", []) or []
+    killed_checks = [a for a in falsifications if a.get("killed") and a.get("name") in _PAIRWISE_CHECK_NAMES]
+
+    diagnostics: dict[str, Any] = {
+        "killed_checks": [],
+        "min_reliable_partition_n": min_reliable_partition_n,
+        "hard_refutation_score_ceiling": hard_refutation_score_ceiling,
+    }
+    if not killed_checks:
+        return "falsified_candidate", diagnostics  # nothing pairwise killed it; caller's problem
+
+    smallest_n: int | None = None
+    cross_seed_median: float | None = None
+    cross_seed_killed = False
+    for attack in killed_checks:
+        name = attack.get("name")
+        detail = attack.get("detail", {}) or {}
+        n = detail.get("n")
+        score = detail.get("score") if name in ("baseline", "held_out") else detail.get("median")
+        diagnostics["killed_checks"].append({"name": name, "score": score, "n": n})
+        if isinstance(n, int):
+            smallest_n = n if smallest_n is None else min(smallest_n, n)
+        if name == "cross_seed":
+            cross_seed_killed = True
+            if isinstance(score, (int, float)):
+                cross_seed_median = score
+
+    diagnostics["smallest_test_partition_n"] = smallest_n
+    diagnostics["cross_seed_median"] = cross_seed_median
+
+    if smallest_n is not None and smallest_n < min_reliable_partition_n:
+        diagnostics["reason"] = (
+            f"Test partition had only {smallest_n} row(s), below the minimum of "
+            f"{min_reliable_partition_n} needed for a reliable score."
+        )
+        return "inconclusive_candidate", diagnostics
+
+    # Hard refutation requires the aggregated cross-seed signal specifically —
+    # a lone negative baseline/held_out score (one fixed split) is not, by
+    # itself, evidence the hypothesis is wrong.
+    if cross_seed_killed and cross_seed_median is not None and cross_seed_median < hard_refutation_score_ceiling:
+        diagnostics["reason"] = (
+            "The cross-seed median score (aggregated across repeated resamples) was worse than a "
+            "trivial baseline — a persistent pattern, not one unlucky split. Evidence against the hypothesis."
+        )
+        return "falsified_candidate", diagnostics
+
+    diagnostics["reason"] = "Score(s) below the support threshold, but not a persistent negative signal across resamples."
+    return "not_supported_candidate", diagnostics
+
+
+def _strip_transform_prefix(column: str) -> str:
+    """Return the base column name with a leading log-transform prefix removed.
+
+    Used to detect that ``body_mass`` and ``log_body_mass`` (or ``log10_``,
+    case-insensitive) refer to the same underlying variable in a different
+    functional form, so alternative-form survivors can be linked back to
+    their rejected raw-scale counterparts.
+    """
+    lowered = column.lower()
+    for prefix in ("log10_", "log1p_", "log_", "ln_"):
+        if lowered.startswith(prefix):
+            return column[len(prefix):]
+    return column
+
+
+def _candidate_family_key(payload: dict[str, Any]) -> tuple[str, ...] | None:
+    """Group candidates that test the same underlying variables in different forms."""
+    kind = payload.get("kind")
+    outcome = payload.get("outcome")
+    if not outcome:
+        return None
+    outcome_base = _strip_transform_prefix(str(outcome))
+    if kind == "linear_association":
+        predictor = payload.get("predictor")
+        if not predictor:
+            return None
+        return (kind, _strip_transform_prefix(str(predictor)), outcome_base)
+    if kind == "composite_linear":
+        predictors = payload.get("predictors") or []
+        bases = tuple(sorted(_strip_transform_prefix(str(p)) for p in predictors))
+        return (kind, bases, outcome_base)
+    return None
+
+
+def apply_functional_form_overrides(
+    findings: list[tuple[dict[str, Any], str]],
+) -> dict[str, tuple[str, dict[str, Any]]]:
+    """Reclassify killed numeric findings whose transformed sibling survived.
+
+    ``findings`` is a list of ``(finding_dict, internal_finding_type)`` pairs
+    already classified by the caller (survivors use robust_relation /
+    promising_candidate; killed pairwise candidates use falsified_candidate /
+    not_supported_candidate / inconclusive_candidate).
+
+    Returns a dict of ``candidate_id -> (new_finding_type, extra_fields)``
+    for every candidate that should be overridden to
+    functional_form_rejected_candidate. Candidates not present in the
+    returned dict keep their original classification.
+    """
+    survivor_families: dict[tuple[str, ...], str] = {}
+    for finding, ftype in findings:
+        if ftype not in {"robust_relation", "promising_candidate"}:
+            continue
+        payload = (finding.get("candidate", {}) or {}).get("payload", {}) or {}
+        key = _candidate_family_key(payload)
+        if key is not None:
+            survivor_families.setdefault(key, finding["candidate"]["id"])
+
+    overrides: dict[str, tuple[str, dict[str, Any]]] = {}
+    rejected_types = {"falsified_candidate", "not_supported_candidate", "inconclusive_candidate"}
+    for finding, ftype in findings:
+        if ftype not in rejected_types:
+            continue
+        payload = (finding.get("candidate", {}) or {}).get("payload", {}) or {}
+        key = _candidate_family_key(payload)
+        if key is None:
+            continue
+        alt_id = survivor_families.get(key)
+        if not alt_id:
+            continue
+        cid = finding["candidate"]["id"]
+        if alt_id == cid:
+            continue
+        overrides[cid] = (
+            "functional_form_rejected_candidate",
+            {"alternative_candidate_id": alt_id, "previous_finding_type": ftype},
+        )
+    return overrides
+
+
+# ---------------------------------------------------------------------------
 # Hypothesis / verdict separation
 # ---------------------------------------------------------------------------
 
 _VERDICT_REASON = {
     COMMITTED: "Survived baseline, held-out, and cross-seed falsification and met the commit threshold.",
-    REJECTED: "Rejected by at least one falsification check.",
+    REJECTED: "At least one falsification check found evidence actively against the hypothesis "
+               "(a score worse than a trivial baseline), not merely below the support threshold.",
     ARTIFACT: "Structural or transform relationship between columns; not an independent scientific finding.",
     PROVISIONAL: "Survived falsification but did not reach the commit threshold.",
     UNRESOLVED: "Could not be conclusively tested with the available data.",
+    NOT_SUPPORTED: "The tested evidence did not clear the support threshold, but did not show evidence "
+                   "actively contradicting the hypothesis either.",
+    INCONCLUSIVE: "The held-out or cross-seed test partition was too small for its score to be a "
+                  "reliable verdict; treat this result as untested rather than refuted.",
+    FUNCTIONAL_FORM_REJECTED: "This specific functional form was rejected, but a transformed version of "
+                              "the same predictor/outcome pair survived — see alternative_candidate_id.",
 }
 
 
@@ -125,6 +352,9 @@ def derive_finding_record(
     finding_type: str,
     *,
     influence_warning: dict[str, Any] | None = None,
+    classification_diagnostics: dict[str, Any] | None = None,
+    functional_form_override: dict[str, Any] | None = None,
+    full_data_score: float | None = None,
 ) -> dict[str, Any]:
     """Split an affirmative candidate into hypothesis + verdict + check scores.
 
@@ -133,6 +363,16 @@ def derive_finding_record(
     candidate statement; ``verdict`` is the public state; for rejected findings
     the affirmative text must be presented as a *candidate hypothesis*, never as
     an established conclusion.
+
+    ``classification_diagnostics`` (from ``classify_pairwise_finding``) and
+    ``functional_form_override`` (from ``apply_functional_form_overrides``)
+    are surfaced as ``rejection_reason``/``sample_sizes`` and
+    ``alternative_candidate_id`` respectively, so a not_supported/inconclusive/
+    functional_form_rejected verdict is always self-explanatory without
+    cross-referencing the raw ledger. ``full_data_score`` is a report-only fit
+    on the entire dataset (never used for any decision) shown alongside the
+    held-out score so users can see both "how well does this fit overall" and
+    "did it generalize."
     """
     candidate = finding.get("candidate", {}) or {}
     verdict = finding.get("verdict", {}) or {}
@@ -147,15 +387,27 @@ def derive_finding_record(
         "finding_type": finding_type,
         "verdict": state,
         "verdict_reason": _VERDICT_REASON.get(state, ""),
-        "is_candidate_hypothesis": state in {REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED},
+        "is_candidate_hypothesis": state in {
+            REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED,
+            NOT_SUPPORTED, INCONCLUSIVE, FUNCTIONAL_FORM_REJECTED,
+        },
         "passed_checks": passed,
         "failed_checks": failed,
         "candidate_score": verdict.get("score"),
+        "metric_name": finding.get("selection_metric"),
         "baseline_score": _check_score(falsifications, "baseline"),
         "held_out_score": _check_score(falsifications, "held_out"),
+        "held_out_n": _check_detail(falsifications, "held_out").get("n"),
+        "baseline_n": _check_detail(falsifications, "baseline").get("n"),
+        "full_data_score_diagnostic": full_data_score,
         "cross_seed_summary": _cross_seed_summary(falsifications),
         "final_status": finding.get("final_status"),
     }
     if influence_warning:
         record["influence_warning"] = influence_warning
+    if classification_diagnostics:
+        record["rejection_reason"] = classification_diagnostics.get("reason")
+        record["rejection_diagnostics"] = classification_diagnostics
+    if functional_form_override:
+        record["alternative_candidate_id"] = functional_form_override.get("alternative_candidate_id")
     return record

@@ -392,7 +392,10 @@ class CaseStore:
         from .semantics import public_state
 
         claims = self.case_claims(case_id)
-        counts = {"committed": 0, "rejected": 0, "artifact": 0, "provisional": 0, "unresolved": 0}
+        counts = {
+            "committed": 0, "rejected": 0, "artifact": 0, "provisional": 0, "unresolved": 0,
+            "not_supported": 0, "inconclusive": 0, "functional_form_rejected": 0,
+        }
         for claim in claims:
             state = public_state(claim.get("finding_type"))
             counts[state] = counts.get(state, 0) + 1
@@ -416,6 +419,9 @@ class CaseStore:
             "artifact_count": counts["artifact"],
             "provisional_count": counts["provisional"],
             "unresolved_count": counts["unresolved"],
+            "not_supported_count": counts["not_supported"],
+            "inconclusive_count": counts["inconclusive"],
+            "functional_form_rejected_count": counts["functional_form_rejected"],
             "filtered_count": max(0, max(generated, persisted) - persisted),
             "structural_relations_detected": structural,
         }

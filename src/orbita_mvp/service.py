@@ -545,6 +545,8 @@ class ResearchMVP:
                 plan=plan,
                 result=engine_result,
                 dataframe=df,
+                domain=domain,
+                composite_domain=composite_domain if composite_specs else None,
             )
 
             # Attach artifact provenance as evidence nodes in the belief graph.
@@ -678,12 +680,71 @@ class ResearchMVP:
         plan: dict[str, Any],
         result: dict[str, Any],
         dataframe: "pd.DataFrame | None" = None,
+        domain: Any = None,
+        composite_domain: Any = None,
     ) -> dict[str, Any]:
         from .influence import linear_influence_warning
-        from .semantics import derive_finding_record
+        from .semantics import (
+            apply_functional_form_overrides,
+            classify_pairwise_finding,
+            derive_finding_record,
+        )
 
         evaluation_metric = result.get("evaluation_metric", plan.get("evaluation_metric", "r2"))
         target_transform = plan.get("target_transform")
+        thresholds = plan.get("thresholds", {}) or {}
+        min_reliable_partition_n = int(thresholds.get("min_reliable_partition_n", 8))
+        hard_refutation_score_ceiling = float(thresholds.get("hard_refutation_score_ceiling", 0.0))
+
+        findings_list = result.get("findings", [])
+
+        # --- Classification pre-pass ------------------------------------
+        # Decide each finding's refined internal type (robust_relation /
+        # promising_candidate / falsified_candidate / not_supported_candidate /
+        # inconclusive_candidate / untestable_candidate) before doing any
+        # claim/evidence writes, so the functional-form pass below can see
+        # which candidates in the same run actually survived.
+        prelim: dict[str, tuple[str, dict[str, Any] | None]] = {}
+        for finding in findings_list:
+            cid = finding["candidate"]["id"]
+            final_status = finding.get("final_status")
+            support = final_status in {"supported", "challenged", "provisional"} and not any(
+                attack.get("killed") for attack in finding.get("falsifications", [])
+            )
+            if support and final_status == "supported":
+                prelim[cid] = ("robust_relation", None)
+            elif support:
+                prelim[cid] = ("promising_candidate", None)
+            elif final_status == "refuted":
+                ftype, diag = classify_pairwise_finding(
+                    finding,
+                    min_reliable_partition_n=min_reliable_partition_n,
+                    hard_refutation_score_ceiling=hard_refutation_score_ceiling,
+                )
+                prelim[cid] = (ftype, diag)
+            else:
+                prelim[cid] = ("untestable_candidate", None)
+
+        overrides = apply_functional_form_overrides(
+            [(finding, prelim[finding["candidate"]["id"]][0]) for finding in findings_list]
+        )
+
+        # --- Full-data diagnostic score (report-only, never gates anything) ---
+        full_data_scores: dict[str, float | None] = {}
+        for finding in findings_list:
+            cid = finding["candidate"]["id"]
+            payload = finding["candidate"].get("payload", {}) or {}
+            kind = payload.get("kind")
+            dom = composite_domain if kind == "composite_linear" and composite_domain is not None else domain
+            if dom is None:
+                full_data_scores[cid] = None
+                continue
+            try:
+                cand_obj = Candidate(id=cid, statement=finding["candidate"].get("statement", ""), payload=payload)
+                model = dom.refit(cand_obj, dom.df)
+                full_data_scores[cid] = dom.score_metric(cand_obj, model, dom.df) if model.get("valid") else None
+            except Exception:
+                full_data_scores[cid] = None
 
         candidate_to_claim: dict[str, str] = {}
         claim_ids: list[str] = []
@@ -751,12 +812,10 @@ class ResearchMVP:
                 claim_id,
                 rationale=f"Imported governed discovery result from run {case_run_id}; evidence {evidence_id}",
             )
-            finding_type = (
-                "robust_relation" if support and final_status == "supported"
-                else "promising_candidate" if support
-                else "falsified_candidate" if final_status == "refuted"
-                else "untestable_candidate"
-            )
+            finding_type, classification_diagnostics = prelim[candidate["id"]]
+            functional_form_override = None
+            if candidate["id"] in overrides:
+                finding_type, functional_form_override = overrides[candidate["id"]]
             influence_warning = None
             if (
                 dataframe is not None
@@ -769,7 +828,12 @@ class ResearchMVP:
                     str(payload.get("outcome")),
                 )
             detail = derive_finding_record(
-                finding, finding_type, influence_warning=influence_warning
+                finding,
+                finding_type,
+                influence_warning=influence_warning,
+                classification_diagnostics=classification_diagnostics,
+                functional_form_override=functional_form_override,
+                full_data_score=full_data_scores.get(candidate["id"]),
             )
             self.store.link_claim(
                 case_id=case_id,

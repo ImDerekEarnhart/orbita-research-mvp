@@ -197,6 +197,17 @@ class ResearchCompiler:
                 "ablation_min_contribution": 0.01,
                 "ablation_min_absolute_improvement": 0.01,
                 "ablation_min_relative_improvement": None,
+                # Below this held-out/cross-seed test-partition size, a killed
+                # falsifier is reclassified as "inconclusive" rather than
+                # "refuted" — R² computed on a handful of rows is dominated by
+                # whichever single row landed in the split and cannot be
+                # trusted to reject a real relationship.
+                "min_reliable_partition_n": 8,
+                # Below this magnitude, a killed falsifier's score is treated
+                # as "did not clear the bar" rather than "actively
+                # contradicted" (hard evidence against requires a score
+                # meaningfully worse than a trivial baseline, i.e. negative).
+                "hard_refutation_score_ceiling": 0.0,
             },
             "candidates": candidates,
             "assumptions": assumptions,
