@@ -102,15 +102,80 @@ def test_lone_negative_baseline_score_is_not_supported_not_refuted():
     assert ftype == "not_supported_candidate"
 
 
-def test_persistent_negative_cross_seed_median_is_hard_refutation():
+def test_persistent_negative_cross_seed_on_generic_claim_is_functional_form_rejected():
     # cross_seed aggregates across 9 reseeds/resamples — a negative MEDIAN
-    # here reflects a pattern that survives repeated resampling, which is
-    # the actual bar for "evidence directly contradicts the claim."
+    # here reflects a pattern that survives repeated resampling: the tested
+    # MODEL FORM performed below baseline. For a generic, non-directional,
+    # non-predictive-performance claim (the default), that must NOT
+    # automatically refute the underlying relationship — it means this
+    # functional form was the wrong shape, which is functional_form_rejected.
     finding = _finding([{"name": "cross_seed", "detail": {"median": -0.25, "spread": 0.1, "n": 200}}])
     ftype, diag = classify_pairwise_finding(finding, min_reliable_partition_n=8)
-    assert ftype == "falsified_candidate"
-    assert "persistent pattern" in diag["reason"]
+    assert ftype == "functional_form_rejected_candidate"
     assert diag["cross_seed_median"] == -0.25
+
+
+def test_stable_opposite_direction_against_directional_claim_is_refuted():
+    # The candidate asserts a specific direction (e.g. "a stable positive
+    # linear association"). If the fitted relationship is stably in the
+    # OPPOSITE direction, that is a failed directional prediction — direct
+    # contradiction of the literal claim, not just an unhelpful model shape.
+    finding = _finding([{"name": "cross_seed", "detail": {"median": -0.3, "spread": 0.1, "n": 200}}])
+    ftype, diag = classify_pairwise_finding(
+        finding, min_reliable_partition_n=8, direction_conflict=True
+    )
+    assert ftype == "falsified_candidate"
+    assert "opposite direction" in diag["reason"]
+
+
+def test_explicit_predictive_claim_below_baseline_is_refuted():
+    # A composite candidate's own statement asserts "Y can be predicted by
+    # a composite of [...]" — an explicit claim of predictive performance
+    # above baseline. Persistently scoring below baseline directly
+    # contradicts that literal claim, so this is refuted, not merely a
+    # rejected functional form.
+    finding = _finding([{"name": "cross_seed", "detail": {"median": -0.15, "spread": 0.05, "n": 200}}])
+    ftype, diag = classify_pairwise_finding(
+        finding, min_reliable_partition_n=8, is_explicit_predictive_claim=True
+    )
+    assert ftype == "falsified_candidate"
+    assert "asserts predictive performance" in diag["reason"]
+    assert diag["is_predictive_claim"] is True
+
+
+def test_functional_form_rejection_links_to_surviving_log_log_sibling():
+    # End-to-end of the exact scenario the fix targets: a raw-linear
+    # candidate with persistent negative cross-seed performance (generic,
+    # non-directional, non-predictive claim) becomes functional_form_rejected
+    # on its own; when a transformed sibling of the same variables also
+    # survived in the same run, the override pass links the two together.
+    raw_finding_dict = {
+        "candidate": {
+            "id": "linear:body_mass:brain_mass",
+            "statement": "body_mass and brain_mass show a stable positive linear association.",
+            "payload": {"kind": "linear_association", "predictor": "body_mass", "outcome": "brain_mass"},
+        },
+        "falsifications": [
+            {"name": "cross_seed", "killed": True, "detail": {"median": -0.4, "spread": 0.2, "n": 50}},
+        ],
+    }
+    raw_ftype, _diag = classify_pairwise_finding(raw_finding_dict, min_reliable_partition_n=8)
+    assert raw_ftype == "functional_form_rejected_candidate"
+
+    log_finding_dict = {
+        "candidate": {
+            "id": "linear:log_body_mass:log_brain_mass",
+            "payload": {"kind": "linear_association", "predictor": "log_body_mass", "outcome": "log_brain_mass"},
+        },
+    }
+    overrides = apply_functional_form_overrides([
+        (raw_finding_dict, raw_ftype),
+        (log_finding_dict, "robust_relation"),
+    ])
+    assert "linear:body_mass:brain_mass" in overrides
+    new_type, extra = overrides["linear:body_mass:brain_mass"]
+    assert new_type == "functional_form_rejected_candidate"
+    assert extra["alternative_candidate_id"] == "linear:log_body_mass:log_brain_mass"
 
 
 def test_negative_held_out_plus_positive_cross_seed_stays_not_supported():

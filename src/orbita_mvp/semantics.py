@@ -141,8 +141,11 @@ def classify_pairwise_finding(
     *,
     min_reliable_partition_n: int = 8,
     hard_refutation_score_ceiling: float = 0.0,
+    is_explicit_predictive_claim: bool = False,
+    direction_conflict: bool = False,
 ) -> tuple[str, dict[str, Any]]:
-    """Reclassify a killed finding into refuted / not_supported / inconclusive.
+    """Reclassify a killed finding into refuted / functional_form_rejected /
+    not_supported / inconclusive.
 
     Returns ``(internal_finding_type, diagnostics)``. Only meaningful for
     findings where at least one falsifier reported ``killed=True`` — callers
@@ -155,16 +158,31 @@ def classify_pairwise_finding(
          ``min_reliable_partition_n`` -> "inconclusive_candidate". Sample
          size is checked first because it invalidates the other checks'
          scores entirely, regardless of what they show.
-      2. "Refuted" (hard evidence against the hypothesis) requires the
-         *cross_seed* median specifically to be worse than
-         ``hard_refutation_score_ceiling``. cross_seed aggregates 9
-         reseeds/resamples, so a negative median reflects a persistent
-         pattern rather than one unlucky split. A negative score from
-         baseline or held_out ALONE — each computed on a single fixed
-         split — is explicitly NOT sufficient on its own: one influential
-         point landing in one particular split is noise, not evidence the
-         relationship is wrong. It falls through to not_supported instead.
-      3. Otherwise -> "not_supported_candidate".
+      2. A persistent negative *cross_seed* median (aggregated across 9
+         reseeds/resamples, so it reflects a pattern rather than one
+         unlucky split) means the tested MODEL FORM performed below
+         baseline. What that implies depends on what the candidate's literal
+         claim actually asserts:
+           - If ``is_explicit_predictive_claim`` (the candidate's own
+             statement asserts predictive performance above baseline, e.g.
+             a composite "can be predicted by" claim) -> "refuted". Failing
+             to predict better than baseline directly contradicts that
+             literal claim.
+           - Elif ``direction_conflict`` (the candidate asserted a specific
+             direction — e.g. "a stable positive association" — and the
+             fitted relationship is in the opposite direction) -> "refuted".
+             A stable opposite-signed effect, or a failed preregistered
+             directional prediction, is direct contradiction.
+           - Otherwise (a generic association/relationship claim with no
+             directional or predictive-performance assertion) ->
+             "functional_form_rejected_candidate". The tested functional
+             form (e.g. raw linear) failed, but that does not by itself
+             refute the underlying variable relationship — only that this
+             particular model shape did not capture it.
+      3. A negative score from baseline or held_out ALONE (each computed on
+         a single fixed split) never triggers refutation or functional-form
+         rejection on its own — one influential point landing in one
+         particular split is noise. Falls through to "not_supported".
     """
     falsifications = finding.get("falsifications", []) or []
     killed_checks = [a for a in falsifications if a.get("killed") and a.get("name") in _PAIRWISE_CHECK_NAMES]
@@ -173,6 +191,7 @@ def classify_pairwise_finding(
         "killed_checks": [],
         "min_reliable_partition_n": min_reliable_partition_n,
         "hard_refutation_score_ceiling": hard_refutation_score_ceiling,
+        "is_predictive_claim": is_explicit_predictive_claim,
     }
     if not killed_checks:
         return "falsified_candidate", diagnostics  # nothing pairwise killed it; caller's problem
@@ -203,15 +222,28 @@ def classify_pairwise_finding(
         )
         return "inconclusive_candidate", diagnostics
 
-    # Hard refutation requires the aggregated cross-seed signal specifically —
-    # a lone negative baseline/held_out score (one fixed split) is not, by
-    # itself, evidence the hypothesis is wrong.
-    if cross_seed_killed and cross_seed_median is not None and cross_seed_median < hard_refutation_score_ceiling:
+    persistent_negative = (
+        cross_seed_killed and cross_seed_median is not None and cross_seed_median < hard_refutation_score_ceiling
+    )
+    if persistent_negative:
+        if is_explicit_predictive_claim:
+            diagnostics["reason"] = (
+                "This candidate's own statement asserts predictive performance above baseline; the "
+                "cross-seed median was persistently below baseline, directly contradicting that claim."
+            )
+            return "falsified_candidate", diagnostics
+        if direction_conflict:
+            diagnostics["reason"] = (
+                "The fitted relationship is in the opposite direction from what this candidate asserts — "
+                "a stable opposite-signed effect / failed directional prediction."
+            )
+            return "falsified_candidate", diagnostics
         diagnostics["reason"] = (
-            "The cross-seed median score (aggregated across repeated resamples) was worse than a "
-            "trivial baseline — a persistent pattern, not one unlucky split. Evidence against the hypothesis."
+            "The tested model form performed persistently below baseline across resamples, but this does "
+            "not by itself refute the underlying variable relationship — the functional form tried here "
+            "(e.g. a raw linear fit) was likely the wrong shape, not evidence the variables are unrelated."
         )
-        return "falsified_candidate", diagnostics
+        return "functional_form_rejected_candidate", diagnostics
 
     diagnostics["reason"] = "Score(s) below the support threshold, but not a persistent negative signal across resamples."
     return "not_supported_candidate", diagnostics
@@ -261,10 +293,16 @@ def apply_functional_form_overrides(
     promising_candidate; killed pairwise candidates use falsified_candidate /
     not_supported_candidate / inconclusive_candidate).
 
-    Returns a dict of ``candidate_id -> (new_finding_type, extra_fields)``
-    for every candidate that should be overridden to
-    functional_form_rejected_candidate. Candidates not present in the
-    returned dict keep their original classification.
+    Returns a dict of ``candidate_id -> (new_finding_type, extra_fields)``.
+    Candidates classified ``falsified_candidate`` / ``not_supported_candidate``
+    / ``inconclusive_candidate`` whose family sibling survived are upgraded to
+    ``functional_form_rejected_candidate``. Candidates already classified
+    ``functional_form_rejected_candidate`` by ``classify_pairwise_finding``
+    itself (a persistent negative cross-seed on a generic, non-directional,
+    non-predictive claim — see that function) keep their type but still get
+    ``alternative_candidate_id`` attached here if a surviving sibling exists,
+    so the diagnostic is as complete as possible either way. Candidates not
+    present in the returned dict keep their original classification.
     """
     survivor_families: dict[tuple[str, ...], str] = {}
     for finding, ftype in findings:
@@ -276,9 +314,12 @@ def apply_functional_form_overrides(
             survivor_families.setdefault(key, finding["candidate"]["id"])
 
     overrides: dict[str, tuple[str, dict[str, Any]]] = {}
-    rejected_types = {"falsified_candidate", "not_supported_candidate", "inconclusive_candidate"}
+    eligible_types = {
+        "falsified_candidate", "not_supported_candidate",
+        "inconclusive_candidate", "functional_form_rejected_candidate",
+    }
     for finding, ftype in findings:
-        if ftype not in rejected_types:
+        if ftype not in eligible_types:
             continue
         payload = (finding.get("candidate", {}) or {}).get("payload", {}) or {}
         key = _candidate_family_key(payload)
@@ -312,8 +353,10 @@ _VERDICT_REASON = {
                    "actively contradicting the hypothesis either.",
     INCONCLUSIVE: "The held-out or cross-seed test partition was too small for its score to be a "
                   "reliable verdict; treat this result as untested rather than refuted.",
-    FUNCTIONAL_FORM_REJECTED: "This specific functional form was rejected, but a transformed version of "
-                              "the same predictor/outcome pair survived — see alternative_candidate_id.",
+    FUNCTIONAL_FORM_REJECTED: "The tested functional form performed persistently below baseline, but this "
+                              "does not by itself refute the underlying variable relationship. If a "
+                              "transformed version of the same pair survived, it is named in "
+                              "alternative_candidate_id.",
 }
 
 
@@ -355,6 +398,7 @@ def derive_finding_record(
     classification_diagnostics: dict[str, Any] | None = None,
     functional_form_override: dict[str, Any] | None = None,
     full_data_score: float | None = None,
+    is_predictive_claim: bool = False,
 ) -> dict[str, Any]:
     """Split an affirmative candidate into hypothesis + verdict + check scores.
 
@@ -372,7 +416,10 @@ def derive_finding_record(
     cross-referencing the raw ledger. ``full_data_score`` is a report-only fit
     on the entire dataset (never used for any decision) shown alongside the
     held-out score so users can see both "how well does this fit overall" and
-    "did it generalize."
+    "did it generalize." ``is_predictive_claim`` is always recorded — even for
+    committed/provisional findings — so it is visible on screen whenever the
+    candidate's own statement asserts predictive performance (e.g. a composite
+    "can be predicted by" claim), not only when that claim gets refuted.
     """
     candidate = finding.get("candidate", {}) or {}
     verdict = finding.get("verdict", {}) or {}
@@ -391,6 +438,7 @@ def derive_finding_record(
             REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED,
             NOT_SUPPORTED, INCONCLUSIVE, FUNCTIONAL_FORM_REJECTED,
         },
+        "is_predictive_claim": is_predictive_claim,
         "passed_checks": passed,
         "failed_checks": failed,
         "candidate_score": verdict.get("score"),

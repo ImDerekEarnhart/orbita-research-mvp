@@ -698,15 +698,52 @@ class ResearchMVP:
 
         findings_list = result.get("findings", [])
 
+        # A candidate's own statement asserts predictive performance above
+        # baseline only for composite claims ("Y can be predicted by a
+        # composite of [...]"). linear_association/group_difference claims
+        # assert an association or a group difference, not predictive power —
+        # failing to predict well is not, by itself, a claim they contradict.
+        def _is_predictive_claim(payload: dict[str, Any]) -> bool:
+            return payload.get("kind") == "composite_linear"
+
+        # A directional claim ("a stable positive/negative linear
+        # association") is contradicted specifically when the fitted
+        # relationship runs the other way. The fitted model is identical
+        # across all cross-seed reseeds (train is always the scout partition,
+        # unaffected by seed — see UploadedTableDomain.splits), so this only
+        # needs one refit on scout, not a per-seed loop.
+        def _direction_conflict(cid: str, payload: dict[str, Any]) -> bool:
+            if payload.get("kind") != "linear_association":
+                return False
+            expected = payload.get("expected_direction")
+            if expected not in ("positive", "negative"):
+                return False
+            if domain is None:
+                return False
+            try:
+                cand_obj = Candidate(id=cid, statement="", payload=payload)
+                model = domain.refit(cand_obj, domain.scout)
+                if not model.get("valid"):
+                    return False
+                slope = model.get("slope")
+                if slope is None:
+                    return False
+                actual = "positive" if slope > 0 else "negative" if slope < 0 else None
+                return actual is not None and actual != expected
+            except Exception:
+                return False
+
         # --- Classification pre-pass ------------------------------------
         # Decide each finding's refined internal type (robust_relation /
         # promising_candidate / falsified_candidate / not_supported_candidate /
-        # inconclusive_candidate / untestable_candidate) before doing any
-        # claim/evidence writes, so the functional-form pass below can see
-        # which candidates in the same run actually survived.
+        # inconclusive_candidate / functional_form_rejected_candidate /
+        # untestable_candidate) before doing any claim/evidence writes, so the
+        # functional-form pass below can see which candidates in the same run
+        # actually survived.
         prelim: dict[str, tuple[str, dict[str, Any] | None]] = {}
         for finding in findings_list:
             cid = finding["candidate"]["id"]
+            payload = finding["candidate"].get("payload", {}) or {}
             final_status = finding.get("final_status")
             support = final_status in {"supported", "challenged", "provisional"} and not any(
                 attack.get("killed") for attack in finding.get("falsifications", [])
@@ -720,6 +757,8 @@ class ResearchMVP:
                     finding,
                     min_reliable_partition_n=min_reliable_partition_n,
                     hard_refutation_score_ceiling=hard_refutation_score_ceiling,
+                    is_explicit_predictive_claim=_is_predictive_claim(payload),
+                    direction_conflict=_direction_conflict(cid, payload),
                 )
                 prelim[cid] = (ftype, diag)
             else:
@@ -834,6 +873,7 @@ class ResearchMVP:
                 classification_diagnostics=classification_diagnostics,
                 functional_form_override=functional_form_override,
                 full_data_score=full_data_scores.get(candidate["id"]),
+                is_predictive_claim=_is_predictive_claim(payload),
             )
             self.store.link_claim(
                 case_id=case_id,
