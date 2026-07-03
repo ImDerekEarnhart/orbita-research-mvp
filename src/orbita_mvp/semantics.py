@@ -69,6 +69,11 @@ FINDING_TYPE_TO_STATE: dict[str, str] = {
     # Killed by at least one falsifier, but the score simply didn't clear
     # the bar rather than showing evidence against the hypothesis.
     "not_supported_candidate": NOT_SUPPORTED,
+    # A composite whose extra predictor(s) added no incremental value / whose
+    # ablation removed no performance — the simpler model dominates. This is
+    # redundancy, NOT a refutation of the relationship, so it maps to
+    # not_supported with a distinguishing reason.
+    "no_incremental_value_candidate": NOT_SUPPORTED,
     # Killed, but on a test partition too small to trust the verdict.
     "inconclusive_candidate": INCONCLUSIVE,
     # Killed, but a transformed sibling candidate (same columns, different

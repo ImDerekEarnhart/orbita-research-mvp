@@ -357,6 +357,89 @@ def test_stress_simpson_scoped_within_group_claims_recorded():
         assert "negative association" in c["canonical_text"]
 
 
+# ---------------------------------------------------------------------------
+# Generic unit tests — near-copy leakage detection and composite failure modes.
+# ---------------------------------------------------------------------------
+
+def test_near_copy_flags_noisy_duplicate_but_not_scaled_real_law():
+    from orbita_mvp.artifacts import detect_structural_relations
+
+    rng = np.random.default_rng(9)
+    base = rng.uniform(50, 200, size=400)
+    df = pd.DataFrame({
+        "source": base,
+        "leaky_copy": base + rng.normal(scale=0.2, size=400),   # near-identity noisy copy
+        "real_scaled": 2.6 * base + 15 + rng.normal(scale=8, size=400),  # real, slope != 1
+    })
+    rel = detect_structural_relations(df)
+    kinds = {tuple(sorted(v["columns"])): v["kind"] for v in rel.values()}
+    assert kinds.get(("leaky_copy", "source")) == "near_duplicate_copy"
+    # A strong but genuinely different-quantity relationship (slope 2.6) is NOT
+    # flagged as a leak, however tight.
+    assert ("real_scaled", "source") not in kinds
+
+
+def test_composite_no_incremental_value_is_not_refutation(tmp_path):
+    rng = np.random.default_rng(11)
+    n = 400
+    x1 = rng.normal(size=n)
+    x2 = x1 + rng.normal(scale=0.3, size=n)  # collinear with x1 (corr < near-copy)
+    y = 2.0 * x1 + rng.normal(scale=1.0, size=n)
+    df = pd.DataFrame({"row_id": range(n), "x1": x1, "x2": x2, "y": y})
+    p = tmp_path / "redundant.csv"
+    df.to_csv(p, index=False)
+
+    svc = ResearchMVP(tmp_path / "t.db", tmp_path / "ws")
+    try:
+        c = svc.create_case(name="redundant", goal="")
+        svc.add_file(c["id"], p)
+        svc.compile_case(c["id"])
+        svc.run_case(c["id"], auto_approve=True)
+        claims = svc.store.case_claims(c["id"])
+    finally:
+        svc.close()
+
+    composites = [cl for cl in claims if "composite" in cl["canonical_text"].lower()]
+    assert composites, "a composite should be proposed from two collinear predictors"
+    killed = [cl for cl in composites if cl["finding_type"] == "no_incremental_value_candidate"]
+    assert killed, "a redundant composite must be classified no_incremental_value, not refuted"
+    for cl in killed:
+        assert cl["verdict"] == "not_supported"
+        assert cl["verdict"] != "rejected"
+        diag = cl["finding_detail"].get("rejection_diagnostics", {})
+        modes = set(diag.get("composite_failure_mode", []))
+        assert modes and modes <= {"improvement", "ablation"}, modes
+        assert "incremental value" in (cl["finding_detail"].get("rejection_reason") or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end stress-CSV assertions available after Commit 4 (leakage detection)
+# ---------------------------------------------------------------------------
+
+@_needs_stress
+def test_stress_leakage_proxy_flagged_as_near_copy_artifact_not_committed():
+    claims, _counts, plan = _run_stress()
+
+    near_copies = [c for c in claims
+                   if (c.get("finding_detail", {}) or {}).get("artifact_kind") == "near_duplicate_copy"]
+    assert near_copies, "output_linear/leakage_proxy near-copy must be detected"
+    leak = near_copies[0]
+    assert leak["verdict"] == "artifact"
+    cols = set(leak["finding_detail"].get("artifact_warning", {}).get("columns", []))
+    assert cols == {"output_linear", "leakage_proxy"}
+    warn = leak["finding_detail"]["artifact_warning"]
+    assert warn["type"] == "target_leakage_near_copy"
+    assert warn["leakage_risk"] == "high"
+    assert warn["correlation"] > 0.999 and warn["residual_variance_ratio"] < 0.01
+
+    # It must NOT also be mined and committed as an ordinary linear discovery.
+    mined = [c for c in claims
+             if c["finding_type"] == "robust_relation"
+             and "output_linear" in c["canonical_text"] and "leakage_proxy" in c["canonical_text"]
+             and "linear association" in c["canonical_text"]]
+    assert not mined, "the near-copy pair must not be committed as a linear discovery"
+
+
 @_needs_stress
 def test_stress_every_finding_has_both_validator_summaries():
     claims, _counts, _plan = _run_stress()

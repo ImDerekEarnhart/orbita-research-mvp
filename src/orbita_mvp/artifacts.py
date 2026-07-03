@@ -33,11 +33,28 @@ _PERFECT_R2 = 0.99995
 # R²≈0.999999) has real residual scatter and stays *below* this ceiling, so it is
 # never mistaken for an artifact.
 _EXACT_R2 = 1.0 - 1e-9
+# Near-copy / target-leakage band: a relationship this tight (but not machine
+# exact) means one column carries essentially ALL the information in the other —
+# a noisy duplicate, an affine copy, or a near-deterministic transform. A
+# genuine strong scientific relationship keeps a real residual (R² well under
+# this, e.g. ~0.92 with slope ≠ 1); a leaked/derived column does not. Both a very
+# high affine R² AND a very high |correlation| are required so a coincidentally
+# tight but structurally different relationship is not mislabelled.
+_NEAR_COPY_R2 = 0.999
+_NEAR_COPY_CORR = 0.9995
 _MIN_POINTS = 5
 
 
 def _numeric(df: pd.DataFrame, col: str) -> np.ndarray:
     return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+
+
+def _pearson(x: np.ndarray, y: np.ndarray) -> float:
+    mask = np.isfinite(x) & np.isfinite(y)
+    xs, ys = x[mask], y[mask]
+    if len(xs) < _MIN_POINTS or np.ptp(xs) <= 1e-15 or np.ptp(ys) <= 1e-15:
+        return float("nan")
+    return float(np.corrcoef(xs, ys)[0, 1])
 
 
 def _r2(y: np.ndarray, pred: np.ndarray) -> float:
@@ -79,7 +96,15 @@ def _is_log_of(values: np.ndarray, base_values: np.ndarray) -> str | None:
     return None
 
 
-def _classify_pair(x: np.ndarray, y: np.ndarray, xname: str, yname: str) -> dict[str, Any] | None:
+def _classify_pair(
+    x: np.ndarray,
+    y: np.ndarray,
+    xname: str,
+    yname: str,
+    *,
+    near_copy_r2: float = _NEAR_COPY_R2,
+    near_copy_corr: float = _NEAR_COPY_CORR,
+) -> dict[str, Any] | None:
     """Classify a numeric column pair as a structural relation, or None."""
     # 1. Log transform in either direction.
     log_base = _is_log_of(y, x)
@@ -98,6 +123,42 @@ def _classify_pair(x: np.ndarray, y: np.ndarray, xname: str, yname: str) -> dict
         if abs(intercept) <= 1e-6 * (1.0 + abs(np.nanmean(y))):
             return {"kind": "unit_conversion", "detail": f"{yname} ≈ {slope:.6g}·{xname}"}
         return {"kind": "affine_dependence", "detail": f"{yname} ≈ {slope:.6g}·{xname} + {intercept:.6g}"}
+
+    # 3. Near-copy / target-leakage band: extremely tight AND near-identity.
+    # One column is a noisy DUPLICATE of the other — same quantity (slope ≈ 1,
+    # intercept ≈ 0) with residual variance near zero. A genuine tight law
+    # relates DIFFERENT quantities (slope ≠ 1, meaningful intercept) and is
+    # deliberately NOT flagged, however high its R² — near-identity, not merely
+    # high correlation, is what separates a leaked copy from real science.
+    corr = _pearson(x, y)
+    if math.isfinite(r2) and r2 >= near_copy_r2 and math.isfinite(corr) and abs(corr) >= near_copy_corr:
+        finite_y = y[np.isfinite(y)]
+        std_y = float(np.std(finite_y)) if len(finite_y) else 0.0
+        near_identity = (
+            abs(abs(slope) - 1.0) <= 0.05
+            and (std_y == 0.0 or abs(intercept) <= 0.05 * std_y)
+        )
+        if near_identity:
+            residual_ratio = max(0.0, 1.0 - float(r2))
+            return {
+                "kind": "near_duplicate_copy",
+                "detail": (
+                    f"{yname} ≈ {slope:.6g}·{xname} + {intercept:.6g} "
+                    f"(R²={r2:.6f}, |r|={abs(corr):.6f}, residual variance ratio={residual_ratio:.2e})"
+                ),
+                "leakage_risk": "high",
+                "similarity_metric": "affine_r2",
+                "similarity": round(float(r2), 6),
+                "correlation": round(float(corr), 6),
+                "residual_variance_ratio": round(residual_ratio, 8),
+                "slope": round(float(slope), 6),
+                "intercept": round(float(intercept), 6),
+                # Direction of derivation is not identifiable from values alone;
+                # both columns are reported and the pair is downgraded, never mined.
+                "suspected_source_column": sorted([xname, yname])[0],
+                "derived_column_candidate": sorted([xname, yname])[1],
+                "disposition": "downgraded_to_artifact",
+            }
     return None
 
 
@@ -129,6 +190,9 @@ def detect_structural_relations(
     df: pd.DataFrame,
     numeric_columns: list[str] | None = None,
     identifier_columns: list[str] | None = None,
+    *,
+    near_copy_r2: float = _NEAR_COPY_R2,
+    near_copy_corr: float = _NEAR_COPY_CORR,
 ) -> dict[str, dict[str, Any]]:
     """Return a map from "colA||colB" (sorted) to a structural classification.
 
@@ -146,7 +210,10 @@ def detect_structural_relations(
 
     cols = {c: _numeric(df, c) for c in numeric_columns}
     for xname, yname in combinations(numeric_columns, 2):
-        classification = _classify_pair(cols[xname], cols[yname], xname, yname)
+        classification = _classify_pair(
+            cols[xname], cols[yname], xname, yname,
+            near_copy_r2=near_copy_r2, near_copy_corr=near_copy_corr,
+        )
         if classification:
             relations[_pair_key(xname, yname)] = {**classification, "columns": [xname, yname]}
 

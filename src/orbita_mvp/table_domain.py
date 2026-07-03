@@ -86,7 +86,7 @@ def _fit_form(x: np.ndarray, y: np.ndarray, form: str) -> dict[str, Any] | None:
         ly = np.log(y)
         X = np.column_stack([np.ones(len(x)), x])
         beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
-        pred = np.exp(np.clip(X @ beta, -700.0, 700.0))
+        pred = np.exp(np.clip(X @ beta, -300.0, 300.0))
         return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])}, "r2": _r2(y, pred)}
     if form == "log_log":
         if np.any(x <= 0) or np.any(y <= 0):
@@ -94,7 +94,7 @@ def _fit_form(x: np.ndarray, y: np.ndarray, form: str) -> dict[str, Any] | None:
         lx, ly = np.log(x), np.log(y)
         X = np.column_stack([np.ones(len(lx)), lx])
         beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
-        pred = np.exp(np.clip(X @ beta, -700.0, 700.0))
+        pred = np.exp(np.clip(X @ beta, -300.0, 300.0))
         # slope in log-log space is the power-law exponent.
         return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])},
                 "r2": _r2(y, pred), "exponent": float(beta[1])}
@@ -112,11 +112,11 @@ def _predict_form(x: np.ndarray, form: str, params: dict[str, float]) -> np.ndar
             out[ok] = params["intercept"] + params["slope"] * np.log(x[ok])
             return out
         if form == "log_y":
-            return np.exp(np.clip(params["intercept"] + params["slope"] * x, -700.0, 700.0))
+            return np.exp(np.clip(params["intercept"] + params["slope"] * x, -300.0, 300.0))
         if form == "log_log":
             out = np.full_like(x, np.nan, dtype=float)
             ok = x > 0
-            out[ok] = np.exp(np.clip(params["intercept"] + params["slope"] * np.log(x[ok]), -700.0, 700.0))
+            out[ok] = np.exp(np.clip(params["intercept"] + params["slope"] * np.log(x[ok]), -300.0, 300.0))
             return out
     return None
 
@@ -197,6 +197,8 @@ def generate_table_candidates(
     seed: int = 20260623,
     exclude_columns: list[str] | None = None,
     target_column: str | None = None,
+    near_copy_r2: float = 0.999,
+    near_copy_corr: float = 0.9995,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if len(df) < 6:
         raise ValueError("At least 6 rows are required for discovery and held-out checking")
@@ -251,7 +253,10 @@ def generate_table_candidates(
             target_numeric = [target_column]
 
     # structural relations check all numeric predictor columns pairwise.
-    structural = detect_structural_relations(df, numeric_columns=numeric_columns)
+    structural = detect_structural_relations(
+        df, numeric_columns=numeric_columns,
+        near_copy_r2=near_copy_r2, near_copy_corr=near_copy_corr,
+    )
     structural_relations: list[dict[str, Any]] = []
     seen_structural: set[str] = set()
 
@@ -276,17 +281,34 @@ def generate_table_candidates(
                 key = _candidate_id("structural", x, y)
                 if key not in seen_structural:
                     seen_structural.add(key)
-                    structural_relations.append({
-                        "id": key,
-                        "statement": (
+                    akind = artifact["kind"]
+                    if akind in ("near_duplicate_copy", "near_copy_affine"):
+                        statement = (
+                            f"{y} is a likely derived variable / near-copy of {x} "
+                            f"(target-leakage risk): {artifact.get('detail', '')}"
+                        )
+                    else:
+                        statement = (
                             f"{x} and {y} are structurally related "
-                            f"({artifact['kind']}): {artifact.get('detail', '')}."
-                        ),
+                            f"({akind}): {artifact.get('detail', '')}."
+                        )
+                    rel = {
+                        "id": key,
+                        "statement": statement,
                         "kind": "structural_relation",
-                        "artifact_kind": artifact["kind"],
+                        "artifact_kind": akind,
                         "detail": artifact.get("detail", ""),
                         "columns": [x, y],
-                    })
+                    }
+                    # Carry near-copy / leakage evidence fields for persistence.
+                    for extra in (
+                        "leakage_risk", "similarity_metric", "similarity", "correlation",
+                        "residual_variance_ratio", "slope", "intercept",
+                        "suspected_source_column", "derived_column_candidate", "disposition",
+                    ):
+                        if extra in artifact:
+                            rel[extra] = artifact[extra]
+                    structural_relations.append(rel)
                 continue
             pair = scout[[x, y]].apply(pd.to_numeric, errors="coerce").dropna()
             if len(pair) < 5 or pair[x].nunique() < 3 or pair[y].nunique() < 3:

@@ -143,12 +143,16 @@ class ResearchCompiler:
         identifier_columns = [
             c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "identifier"
         ]
+        near_copy_r2 = 0.999
+        near_copy_corr = 0.9995
         candidates, generation = generate_table_candidates(
             df,
             goal=case.get("goal", ""),
             max_candidates=max_candidates,
             exclude_columns=identifier_columns,
             target_column=target_column,
+            near_copy_r2=near_copy_r2,
+            near_copy_corr=near_copy_corr,
         )
         # Augment generation dict with all partition fractions so the service
         # can reconstruct the exact same split as candidate generation used.
@@ -201,6 +205,11 @@ class ResearchCompiler:
                 # Minimum per-subgroup sample size for a conditioning variable to
                 # be analysed by the subgroup-reversal / regime-dependence guard.
                 "subgroup_min_group_n": 25,
+                # Near-copy / target-leakage band: a column pair with affine R²
+                # AND |correlation| above these (but not machine-exact) is
+                # downgraded to an artifact instead of mined as a discovery.
+                "near_copy_r2": near_copy_r2,
+                "near_copy_corr": near_copy_corr,
                 "composite_min_predictors": 2,
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,

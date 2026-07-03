@@ -970,6 +970,31 @@ class ResearchMVP:
                     is_explicit_predictive_claim=_is_predictive_claim(payload),
                     direction_conflict=_direction_conflict(cid, payload),
                 )
+                # A composite whose ONLY killers are improvement/ablation did
+                # predict adequately — it just added no incremental value over
+                # the simpler model. That is redundancy, not a refutation, and
+                # must be reported distinctly from a model that failed
+                # validation (held_out / validation_resample).
+                killer_names = {a.get("name") for a in finding.get("falsifications", []) if a.get("killed")}
+                if payload.get("kind") == "composite_linear" and killer_names and killer_names <= {"improvement", "ablation"}:
+                    reasons = []
+                    if "improvement" in killer_names:
+                        reasons.append(
+                            "adding the extra predictor(s) did not beat the best single predictor by the "
+                            "required margin (no incremental value)"
+                        )
+                    if "ablation" in killer_names:
+                        reasons.append(
+                            "at least one predictor can be removed with no meaningful performance loss "
+                            "(redundant predictor)"
+                        )
+                    diag = dict(diag or {})
+                    diag["reason"] = (
+                        "The composite was not refuted; the simpler model dominates: " + "; ".join(reasons) + "."
+                    )
+                    diag["composite_failure_mode"] = sorted(killer_names)
+                    prelim[cid] = ("no_incremental_value_candidate", diag)
+                    continue
                 # A generated group effect that fails only the standalone
                 # predictive bar, but carries a real bootstrap-stable effect
                 # size, is a *supported association* (not merely "not
@@ -1317,20 +1342,34 @@ class ResearchMVP:
             )
             self.ledger.attest(claim_id, evidence, Stance.SUPPORT, actor="artifact-detector", actor_role=ActorRole.TOOL)
             claim_ids.append(claim_id)
+            artifact_detail: dict[str, Any] = {
+                "hypothesis_text": artifact["statement"],
+                "finding_type": "artifact",
+                "verdict": "artifact",
+                "artifact_kind": artifact.get("artifact_kind"),
+                "detail": artifact.get("detail", ""),
+                "is_candidate_hypothesis": True,
+            }
+            if artifact.get("artifact_kind") in ("near_duplicate_copy", "near_copy_affine"):
+                artifact_detail["artifact_warning"] = {
+                    "type": "target_leakage_near_copy",
+                    "leakage_risk": artifact.get("leakage_risk", "high"),
+                    "similarity_metric": artifact.get("similarity_metric"),
+                    "similarity": artifact.get("similarity"),
+                    "correlation": artifact.get("correlation"),
+                    "residual_variance_ratio": artifact.get("residual_variance_ratio"),
+                    "suspected_source_column": artifact.get("suspected_source_column"),
+                    "derived_column_candidate": artifact.get("derived_column_candidate"),
+                    "disposition": artifact.get("disposition", "downgraded_to_artifact"),
+                    "columns": artifact.get("columns"),
+                }
             self.store.link_claim(
                 case_id=case_id,
                 run_id=case_run_id,
                 claim_id=claim_id,
                 finding_type="artifact",
                 source_candidate_id=artifact["id"],
-                finding_detail={
-                    "hypothesis_text": artifact["statement"],
-                    "finding_type": "artifact",
-                    "verdict": "artifact",
-                    "artifact_kind": artifact.get("artifact_kind"),
-                    "detail": artifact.get("detail", ""),
-                    "is_candidate_hypothesis": True,
-                },
+                finding_detail=artifact_detail,
             )
             artifact_count += 1
 
