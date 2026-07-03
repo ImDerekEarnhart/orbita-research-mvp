@@ -17,6 +17,7 @@ gracefully (skip) if the stress CSV is not present on this machine.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -438,6 +439,63 @@ def test_stress_leakage_proxy_flagged_as_near_copy_artifact_not_committed():
              and "output_linear" in c["canonical_text"] and "leakage_proxy" in c["canonical_text"]
              and "linear association" in c["canonical_text"]]
     assert not mined, "the near-copy pair must not be committed as a linear discovery"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end cross-surface consistency (Commit 5): claims API, belief graph,
+# report HTML, report JSON, and claim counts must agree on every verdict.
+# ---------------------------------------------------------------------------
+
+@_needs_stress
+def test_stress_all_surfaces_agree_on_verdict():
+    from collections import Counter
+
+    from orbita_mvp.graph_ui import build_graph_data
+
+    with tempfile.TemporaryDirectory() as td:
+        svc = ResearchMVP(Path(td) / "o.db", Path(td) / "ws")
+        try:
+            case = svc.create_case(name="surface-consistency", goal="")
+            svc.add_file(case["id"], STRESS_CSV)
+            plan = svc.compile_case(case["id"])
+            svc.approve_plan(plan["id"], reviewer="tester")
+            run = svc.run_case(case["id"], plan_id=plan["id"])
+
+            claims = svc.store.case_claims(case["id"])
+            counts = svc.store.case_claim_counts(case["id"])
+            graph = build_graph_data(case["id"], svc.ledger.db.conn)
+            reports = run["result"]["reports"]
+            report_json = json.loads(Path(reports["json"]["path"]).read_text(encoding="utf-8"))
+            html_text = Path(reports["html"]["path"]).read_text(encoding="utf-8")
+        finally:
+            svc.close()
+
+    graph_state = {n["id"]: n.get("public_state") for n in graph["nodes"] if n.get("type") == "claim"}
+    json_verdict = {c["claim_id"]: c.get("verdict") for c in report_json["claims"]}
+
+    for c in claims:
+        cid, verdict = c["claim_id"], c["verdict"]
+        # 1. belief graph node public_state == claims-API verdict
+        assert graph_state.get(cid) == verdict, (cid, verdict, graph_state.get(cid))
+        # 2. report JSON claim verdict == claims-API verdict
+        assert json_verdict.get(cid) == verdict, (cid, verdict, json_verdict.get(cid))
+        # 3. report HTML provenance table shows this claim with its verdict
+        assert cid in html_text
+
+    # 4. claim counts agree with the persisted claim tally
+    tally = Counter(c["verdict"] for c in claims)
+    assert counts["committed_count"] == tally.get("committed", 0)
+    assert counts["supported_association_count"] == tally.get("supported_association", 0)
+    assert counts["regime_dependent_count"] == tally.get("regime_dependent", 0)
+    assert counts["artifact_count"] == tally.get("artifact", 0)
+
+    # 5. the honest sections exist and there are no genuinely refuted claims here
+    assert "Supported associations" in html_text
+    assert "Regime-dependent" in html_text
+    assert tally.get("rejected", 0) == 0
+    # exactly one appearance of "refuted": the executive summary's "0 refuted".
+    assert html_text.lower().count("refuted") == 1
+    assert "0 refuted" in html_text
 
 
 @_needs_stress

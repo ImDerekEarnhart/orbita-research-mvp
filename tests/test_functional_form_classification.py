@@ -420,10 +420,11 @@ _NON_REFUTED_CANDIDATE_VERDICTS = {
 }
 
 
-# Verdicts rendered as a single bullet line in the report's "failed / unresolved"
-# section (committed and provisional render in the "survived" section with a
-# different multi-line layout, so they are excluded from the line-format check).
-_FAILED_SECTION_NON_REFUTED_VERDICTS = {
+# Non-committed, non-refuted verdicts that render with their enriched public
+# verdict somewhere at/near the claim (either a "failed"-section bullet line or a
+# dedicated section heading + verdict line). Provenance table + section must
+# agree on the verdict, and never show these as refuted.
+_NON_REFUTED_REPORTED_VERDICTS = {
     "not_supported", "inconclusive", "functional_form_rejected",
     "supported_association", "regime_dependent",
 }
@@ -433,8 +434,9 @@ def test_report_uses_enriched_verdict_not_raw_final_status():
     claims, report_text = _run_case_with_report(TITANIC_CSV, "Titanic report consistency regression")
 
     # Any candidate that did not commit but was NOT hard-refuted: the report
-    # must print its enriched public verdict, never the raw engine "refuted".
-    candidates = [c for c in claims if c["verdict"] in _FAILED_SECTION_NON_REFUTED_VERDICTS]
+    # must print its enriched public verdict near the claim, never the raw
+    # engine "refuted".
+    candidates = [c for c in claims if c["verdict"] in _NON_REFUTED_REPORTED_VERDICTS]
     assert candidates, "expected at least one non-refuted killed/candidate claim in this run"
 
     for c in candidates:
@@ -442,11 +444,14 @@ def test_report_uses_enriched_verdict_not_raw_final_status():
         verdict = c["verdict"]
         idx = report_text.find(text)
         assert idx != -1, f"candidate statement not found in report: {text}"
+        # The enriched verdict must appear within the block introduced by this
+        # claim (its bullet line or its section), and never as `refuted`.
+        window = report_text[idx: idx + 400]
+        assert verdict in window, (
+            f"report must show the {verdict} verdict near its claim, got: {window!r}"
+        )
         line_end = report_text.find("\n", idx)
         line = report_text[idx:line_end if line_end != -1 else None]
-        assert f"verdict `{verdict}`" in line, (
-            f"report line for a {verdict} claim must show that verdict, got: {line!r}"
-        )
         assert "`refuted`" not in line, f"{verdict} claim incorrectly shown as refuted: {line!r}"
 
 
