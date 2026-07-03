@@ -914,13 +914,42 @@ class ResearchMVP:
                 except Exception:
                     missing_by_cid[cid] = None
 
+        # --- Subgroup-reversal / regime-dependence detection ----------------
+        # For directional (linear_association) candidates, check whether the
+        # pooled direction reverses inside stable major subgroups of an eligible
+        # categorical conditioning variable (Simpson's paradox). If so, the
+        # universal directional claim must NOT be committed.
+        from .subgroup import detect_subgroup_reversal
+
+        eligible_conditioning = list(
+            (plan.get("candidate_generation", {}) or {}).get("categorical_columns", []) or []
+        )
+        min_group_n = int(thresholds.get("subgroup_min_group_n", 25))
+        subgroup_by_cid: dict[str, dict[str, Any] | None] = {}
+        if dataframe is not None and eligible_conditioning:
+            for finding in findings_list:
+                payload = finding["candidate"].get("payload", {}) or {}
+                if payload.get("kind") != "linear_association":
+                    continue
+                try:
+                    subgroup_by_cid[finding["candidate"]["id"]] = detect_subgroup_reversal(
+                        dataframe,
+                        str(payload.get("predictor")),
+                        str(payload.get("outcome")),
+                        eligible_conditioning,
+                        min_group_n=min_group_n,
+                    )
+                except Exception:
+                    subgroup_by_cid[finding["candidate"]["id"]] = None
+
         # --- Classification pre-pass ------------------------------------
         # Decide each finding's refined internal type (robust_relation /
         # promising_candidate / falsified_candidate / not_supported_candidate /
         # inconclusive_candidate / functional_form_rejected_candidate /
-        # supported_association_candidate / untestable_candidate) before doing
-        # any claim/evidence writes, so the functional-form pass below can see
-        # which candidates in the same run actually survived.
+        # supported_association_candidate / regime_dependent_candidate /
+        # untestable_candidate) before doing any claim/evidence writes, so the
+        # functional-form pass below can see which candidates in the same run
+        # actually survived.
         prelim: dict[str, tuple[str, dict[str, Any] | None]] = {}
         for finding in findings_list:
             cid = finding["candidate"]["id"]
@@ -964,6 +993,13 @@ class ResearchMVP:
                     prelim[cid] = (ftype, diag)
             else:
                 prelim[cid] = ("untestable_candidate", None)
+
+            # Subgroup reversal blocks any pooled directional verdict: whether
+            # or not the pooled fit would have committed, a universal directional
+            # claim cannot stand when it reverses inside the major subgroups.
+            reversal = subgroup_by_cid.get(cid)
+            if reversal:
+                prelim[cid] = ("regime_dependent_candidate", {"reason": reversal["reason"], "subgroup": reversal})
 
         overrides = apply_functional_form_overrides(
             [(finding, prelim[finding["candidate"]["id"]][0]) for finding in findings_list]
@@ -1146,6 +1182,7 @@ class ResearchMVP:
                 association_evidence=assoc_by_cid.get(candidate["id"]),
                 missingness=missing_by_cid.get(candidate["id"]),
                 model_family=model_family_by_cid.get(candidate["id"]),
+                subgroup_warning=subgroup_by_cid.get(candidate["id"]),
             )
             self.store.link_claim(
                 case_id=case_id,
@@ -1168,6 +1205,67 @@ class ResearchMVP:
                     metadata={"case_id": case_id, "run_id": case_run_id},
                     actor="research-compiler",
                     actor_role=ActorRole.TOOL,
+                )
+
+        # Scoped per-subgroup claims for every detected reversal: the pooled
+        # directional claim is blocked (regime_dependent) and the real
+        # within-subgroup associations are recorded as supported scoped claims.
+        for cid, reversal in subgroup_by_cid.items():
+            if not reversal:
+                continue
+            for si, scoped in enumerate(reversal.get("scoped_claims", []), start=1):
+                scoped_claim_id, _ = self.memory.resolve_or_create_claim(
+                    scoped["statement"],
+                    scope={
+                        "dataset_sha256": dataset_file["sha256"],
+                        "conditioning_variable": scoped["group_col"],
+                        "group_value": scoped["group_value"],
+                        "direction": scoped["direction"],
+                        "type": "scoped_association",
+                    },
+                    claim_type="research_finding",
+                    metadata={
+                        "case_id": case_id,
+                        "generated_from_case": case_id,
+                        "parent_candidate_id": cid,
+                        "conditioning_variable": scoped["group_col"],
+                    },
+                )
+                evidence = self.ledger.add_evidence(
+                    f"file://{dataset_file['stored_path']}",
+                    scoped["statement"],
+                    source_kind=EvidenceKind.DATASET,
+                    independence_key=f"dataset:{dataset_file['sha256']}:scoped:{cid}:{scoped['group_value']}",
+                    content=json.dumps(scoped, sort_keys=True),
+                    metadata={"case_id": case_id, "conditioning_variable": scoped["group_col"]},
+                )
+                self.ledger.attest(scoped_claim_id, evidence, Stance.SUPPORT,
+                                   actor="subgroup-reversal-detector", actor_role=ActorRole.TOOL)
+                self.memory.synchronize_status(scoped_claim_id, rationale="Scoped within-subgroup association")
+                claim_ids.append(scoped_claim_id)
+                self.store.link_claim(
+                    case_id=case_id,
+                    run_id=case_run_id,
+                    claim_id=scoped_claim_id,
+                    finding_type="scoped_association",
+                    source_candidate_id=f"scoped:{cid}:{si}",
+                    finding_detail={
+                        "hypothesis_text": scoped["statement"],
+                        "finding_type": "scoped_association",
+                        "verdict": "supported_association",
+                        "is_candidate_hypothesis": False,
+                        "association_evidence": {
+                            "effect_size_metric": "within_group_slope_sign",
+                            "direction": scoped["direction"],
+                            "sign_stability": scoped["sign_stability"],
+                            "n": scoped["n"],
+                        },
+                        "scope": {
+                            "conditioning_variable": scoped["group_col"],
+                            "group_value": scoped["group_value"],
+                        },
+                        "parent_candidate_id": cid,
+                    },
                 )
 
         artifact_count = 0

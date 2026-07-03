@@ -77,6 +77,9 @@ FINDING_TYPE_TO_STATE: dict[str, str] = {
     "functional_form_rejected_candidate": FUNCTIONAL_FORM_REJECTED,
     # A real association with limited standalone predictive utility.
     "supported_association_candidate": SUPPORTED_ASSOCIATION,
+    # A within-subgroup scoped association recorded when the pooled claim is
+    # blocked by a subgroup reversal.
+    "scoped_association": SUPPORTED_ASSOCIATION,
     # Pooled relationship reverses inside subgroups.
     "regime_dependent_candidate": REGIME_DEPENDENT,
     "subgroup_reversal_candidate": REGIME_DEPENDENT,

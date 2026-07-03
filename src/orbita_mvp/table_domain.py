@@ -86,7 +86,7 @@ def _fit_form(x: np.ndarray, y: np.ndarray, form: str) -> dict[str, Any] | None:
         ly = np.log(y)
         X = np.column_stack([np.ones(len(x)), x])
         beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
-        pred = np.exp(X @ beta)
+        pred = np.exp(np.clip(X @ beta, -700.0, 700.0))
         return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])}, "r2": _r2(y, pred)}
     if form == "log_log":
         if np.any(x <= 0) or np.any(y <= 0):
@@ -94,7 +94,7 @@ def _fit_form(x: np.ndarray, y: np.ndarray, form: str) -> dict[str, Any] | None:
         lx, ly = np.log(x), np.log(y)
         X = np.column_stack([np.ones(len(lx)), lx])
         beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
-        pred = np.exp(X @ beta)
+        pred = np.exp(np.clip(X @ beta, -700.0, 700.0))
         # slope in log-log space is the power-law exponent.
         return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])},
                 "r2": _r2(y, pred), "exponent": float(beta[1])}
@@ -112,11 +112,11 @@ def _predict_form(x: np.ndarray, form: str, params: dict[str, float]) -> np.ndar
             out[ok] = params["intercept"] + params["slope"] * np.log(x[ok])
             return out
         if form == "log_y":
-            return np.exp(params["intercept"] + params["slope"] * x)
+            return np.exp(np.clip(params["intercept"] + params["slope"] * x, -700.0, 700.0))
         if form == "log_log":
             out = np.full_like(x, np.nan, dtype=float)
             ok = x > 0
-            out[ok] = np.exp(params["intercept"] + params["slope"] * np.log(x[ok]))
+            out[ok] = np.exp(np.clip(params["intercept"] + params["slope"] * np.log(x[ok]), -700.0, 700.0))
             return out
     return None
 

@@ -280,6 +280,83 @@ def test_stress_temperature_quadratic_preferred_linear_is_functional_form_reject
     assert lc["finding_detail"].get("alternative_candidate_id"), "must point at the surviving curved sibling"
 
 
+# ---------------------------------------------------------------------------
+# Generic unit test — subgroup reversal detector (Simpson vs. non-reversing).
+# ---------------------------------------------------------------------------
+
+def test_detect_subgroup_reversal_flags_simpson_but_not_consistent_relationship():
+    from orbita_mvp.subgroup import detect_subgroup_reversal
+
+    rng = np.random.default_rng(5)
+    rows = []
+    # Two cohorts, each with a strong NEGATIVE within-group slope, offset so the
+    # pooled slope is POSITIVE (classic Simpson).
+    for cohort, x0, y0 in [("A", 0.0, 0.0), ("B", 10.0, 10.0)]:
+        for _ in range(150):
+            x = x0 + rng.uniform(0, 5)
+            y = y0 - 1.5 * (x - x0) + rng.normal(scale=0.5)
+            rows.append({"x": x, "y": y, "cohort": cohort, "flat": rng.choice(["p", "q"])})
+    df = pd.DataFrame(rows)
+
+    report = detect_subgroup_reversal(df, "x", "y", ["cohort", "flat"], min_group_n=25)
+    assert report is not None
+    assert report["conditioning_variable"] == "cohort"
+    assert report["pooled_direction"] == "positive"
+    assert all(g["direction"] == "negative" for g in report["groups"])
+    assert {s["group_value"] for s in report["scoped_claims"]} == {"A", "B"}
+
+    # A relationship that is consistently positive in every subgroup must NOT be
+    # flagged as a reversal.
+    rows2 = []
+    for cohort in ["A", "B"]:
+        for _ in range(150):
+            x = rng.uniform(0, 10)
+            rows2.append({"x": x, "y": 2.0 * x + rng.normal(scale=0.5), "cohort": cohort})
+    df2 = pd.DataFrame(rows2)
+    assert detect_subgroup_reversal(df2, "x", "y", ["cohort"], min_group_n=25) is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end stress-CSV assertions available after Commit 3 (subgroup reversal)
+# ---------------------------------------------------------------------------
+
+@_needs_stress
+def test_stress_simpson_pooled_is_regime_dependent_not_committed():
+    claims, counts, _plan = _run_stress()
+    linear = [c for c in claims
+              if "simpson_x and simpson_y" in c["canonical_text"] and "linear" in c["canonical_text"]]
+    assert linear, "the pooled linear simpson_x->simpson_y claim must be generated"
+    c = linear[0]
+    # Item 5/6: not committed as a universal positive relationship; classified
+    # as a subgroup reversal.
+    assert c["verdict"] == "regime_dependent", c["verdict"]
+    assert c["verdict"] != "committed"
+    sw = c["finding_detail"]["subgroup_warning"]
+    assert sw["conditioning_variable"] == "cohort"
+    assert sw["pooled_direction"] == "positive"
+    # Item 7: both cohorts negative within-group.
+    dirs = {g["group"]: g["direction"] for g in sw["groups"]}
+    assert dirs.get("Alpha") == "negative" and dirs.get("Beta") == "negative"
+    assert counts["regime_dependent_count"] >= 1
+
+
+@_needs_stress
+def test_stress_simpson_scoped_within_group_claims_recorded():
+    claims, _counts, _plan = _run_stress()
+    scoped = [c for c in claims if c["finding_type"] == "scoped_association"
+              and "simpson" in c["canonical_text"].lower()]
+    by_group = {}
+    for c in scoped:
+        scope = c["finding_detail"].get("scope", {})
+        by_group[scope.get("group_value")] = c
+    assert "Alpha" in by_group and "Beta" in by_group
+    for g in ("Alpha", "Beta"):
+        c = by_group[g]
+        assert c["verdict"] == "supported_association"
+        assert c["finding_detail"]["association_evidence"]["direction"] == "negative"
+        assert "negative association" in c["canonical_text"]
+
+
 @_needs_stress
 def test_stress_every_finding_has_both_validator_summaries():
     claims, _counts, _plan = _run_stress()

@@ -198,6 +198,9 @@ class ResearchCompiler:
                 # the preferred member of a relationship family when it beats the
                 # simplest within-margin form's held-out score by at least this.
                 "preferred_form_min_improvement": 0.01,
+                # Minimum per-subgroup sample size for a conditioning variable to
+                # be analysed by the subgroup-reversal / regime-dependence guard.
+                "subgroup_min_group_n": 25,
                 "composite_min_predictors": 2,
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,
