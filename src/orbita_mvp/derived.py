@@ -160,8 +160,9 @@ def detect_multivariable_derived(
             continue
         # Repeated-refit stability: refit on resamples of scout, held-out R² spread.
         rng = np.random.default_rng(9173)
+        refit_attempts = 8
         refit_r2 = []
-        for _ in range(8):
+        for _ in range(refit_attempts):
             idx = rng.integers(0, len(scout), len(scout))
             res = _fit_eval(scout.iloc[idx], heldout, target, feats, multiplicative=(construction != "affine"))
             if res is not None and np.isfinite(res[0]):
@@ -182,6 +183,10 @@ def detect_multivariable_derived(
             "margin_over_best_single": round(float(margin), 6),
             "refit_median_r2": round(refit_median, 6),
             "refit_r2_spread": round(float(max(refit_r2) - min(refit_r2)), 6) if len(refit_r2) > 1 else 0.0,
+            # Diagnostic count of valid repeated-refits (already computed above);
+            # surfaced for display only — does not affect detection/classification.
+            "valid_refit_count": len(refit_r2),
+            "refit_attempts": refit_attempts,
             "n_predictors": len(feats),
         }
     return out

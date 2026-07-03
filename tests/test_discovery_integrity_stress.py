@@ -517,6 +517,58 @@ def test_crucible_d_derived_index_is_artifact_qualified():
     assert not [c for c in claims if "null_chemistry" in c["canonical_text"].lower() and c["verdict"] == "committed"]
 
 
+# --- D1/D2 display-only: cluster public label + drawer fields --------------
+
+def test_derived_cluster_public_label_and_drawer_fields_display_only():
+    from orbita_mvp.graph_ui import build_graph_data, DERIVED_CLUSTER_LABEL
+
+    rng = np.random.default_rng(4)
+    n = 400
+    x1, x2, x3 = rng.normal(size=n), rng.normal(size=n), rng.normal(size=n)
+    idx = x1 + 2.0 * x2 - 0.5 * x3 + rng.normal(scale=0.01, size=n)  # constructed index
+    y = 1.5 * x1 + rng.normal(scale=2.0, size=n)                     # genuine, noisy
+    df = pd.DataFrame({"row_id": range(n), "x1": x1, "x2": x2, "x3": x3, "idx": idx, "y": y})
+
+    with tempfile.TemporaryDirectory() as td:
+        svc = ResearchMVP(Path(td) / "o.db", Path(td) / "ws")
+        try:
+            p = Path(td) / "d.csv"; df.to_csv(p, index=False)
+            case = svc.create_case(name="cluster", goal="")
+            svc.add_file(case["id"], p); svc.compile_case(case["id"]); svc.run_case(case["id"], auto_approve=True)
+            claims = svc.store.case_claims(case["id"])
+            clusters = [c for c in claims if (c.get("finding_detail", {}) or {}).get("artifact_kind") == "likely_derived_variable"]
+            assert clusters, "expected a near-deterministic dependency cluster"
+            cl = clusters[0]; fd = cl["finding_detail"]; aw = fd["artifact_warning"]
+
+            # Display-only: stored verdict + finding_type are UNCHANGED.
+            assert cl["verdict"] == "artifact"
+            assert cl["finding_type"] == "artifact"
+
+            # Drawer fields (D2) all persisted.
+            assert aw["type"] == "likely_derived_variable"
+            assert aw["derivation_direction"] == "undetermined"
+            assert "idx" in aw["member_columns"]
+            br = aw["best_reconstruction"]
+            assert br["reconstruction_metric"] == "held_out_r2"
+            assert br["held_out_r2"] is not None
+            assert br["residual_variance_ratio"] is not None
+            assert br["valid_refit_count"] is not None and br["refit_attempts"] is not None
+
+            # Public label (D1) applied to the graph node; stored statement (full_text) unchanged.
+            g = build_graph_data(case["id"], svc.ledger.db.conn)
+            node = next(nd for nd in g["nodes"] if nd.get("id") == cl["claim_id"])
+            assert node["label"] == DERIVED_CLUSTER_LABEL
+            assert node["display_label"] == DERIVED_CLUSTER_LABEL
+            assert "near-deterministic" in node["full_text"].lower()  # underlying statement intact
+            assert node["artifact_warning"]["derivation_direction"] == "undetermined"
+
+            # Non-cluster claim labels are NOT relabelled.
+            others = [nd for nd in g["nodes"] if nd.get("type") == "claim" and nd.get("id") != cl["claim_id"]]
+            assert all(nd["label"] != DERIVED_CLUSTER_LABEL for nd in others)
+        finally:
+            svc.close()
+
+
 # --- B: candidate-family budgeting -----------------------------------------
 
 def test_nonlinear_budget_does_not_crowd_out_linear_pairs():

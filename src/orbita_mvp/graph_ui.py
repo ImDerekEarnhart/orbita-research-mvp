@@ -8,6 +8,9 @@ from typing import Any
 
 from .semantics import public_state
 
+# Public display label for a multivariable near-deterministic dependency cluster.
+DERIVED_CLUSTER_LABEL = "Near-deterministic dependency cluster"
+
 
 # ---------------------------------------------------------------------------
 # Data builders
@@ -50,6 +53,12 @@ def build_graph_data(case_id: str, conn: Any) -> dict[str, Any]:
             detail = json.loads(r["finding_detail_json"] or "{}")
         except (TypeError, ValueError):
             detail = {}
+        # Display-only: a multivariable derived cluster gets a clear public label
+        # so it reads as one dependency cluster, not as if every member is an
+        # artifact. The stored statement (full_text) and verdict are unchanged.
+        if (detail.get("artifact_warning") or {}).get("type") == "likely_derived_variable":
+            label = DERIVED_CLUSTER_LABEL
+            display_label = DERIVED_CLUSTER_LABEL
         add_node({
             "id": r["claim_id"],
             "label": label,
@@ -817,7 +826,8 @@ function openDrawer(nodeId) {
   if(!n) return;
   selNodeId=nodeId; selNodeData=n;
   document.getElementById('drawer').classList.add('open');
-  document.getElementById('drw-title-text').textContent=n.full_text||n.label||nodeId;
+  var isCluster = n.artifact_warning && n.artifact_warning.type==='likely_derived_variable';
+  document.getElementById('drw-title-text').textContent = isCluster ? 'Near-deterministic dependency cluster' : (n.full_text||n.label||nodeId);
   var verdict = n.type==='claim' ? (n.public_state||'unresolved') : n.status;
   var sc = STATUS_CLR[verdict]||STATUS_CLR.pending;
   var badge=document.getElementById('drw-badge');
@@ -895,9 +905,20 @@ function renderOverview(n) {
       var sw=n.subgroup_warning, gd=(sw.groups||[]).map(function(g){return esc(g.group)+': '+esc(g.direction);}).join(', ');
       h+='<div class="dr"><div class="dl" style="color:#c4b5fd">⚠ Subgroup reversal</div><div class="dv" style="line-height:1.5">pooled '+esc(sw.pooled_direction)+' vs within-'+esc(sw.conditioning_variable)+' ('+gd+')</div></div>';
     }
-    if(n.artifact_warning&&n.artifact_warning.type){
+    if(n.artifact_warning&&n.artifact_warning.type==='likely_derived_variable'){
+      var aw=n.artifact_warning, br=aw.best_reconstruction||{};
+      h+=row('Cluster','<span style="color:#fb923c">Near-deterministic dependency cluster</span>');
+      h+=row('Cluster members','<span style="line-height:1.5">'+esc((aw.member_columns||[]).join(', '))+'</span>');
+      h+=row('Derivation direction','<span style="color:#fbbf24">'+esc(aw.derivation_direction||'undetermined')+'</span>');
+      h+=row('Reconstruction metric',esc(br.reconstruction_metric||'held_out_r2')+(br.construction?' ('+esc(br.construction)+')':''));
+      if(br.held_out_r2!=null) h+=row('Held-out reconstruction',(+br.held_out_r2).toFixed(6));
+      if(br.residual_variance_ratio!=null) h+=row('Residual variance ratio',(+br.residual_variance_ratio).toExponential(2));
+      if(br.valid_refit_count!=null) h+=row('Valid repeated-refits',esc(br.valid_refit_count)+(br.refit_attempts?' of '+esc(br.refit_attempts):''));
+      h+='<div class="dr"><div class="dl" style="color:#fb923c">⚠ Why artifact-qualified</div><div class="dv" style="line-height:1.5">These columns are mutually near-deterministic (one is a likely constructed/derived index). The data cannot determine which member was constructed, so the whole set is flagged; no single member is singled out or auto-contaminated.</div></div>';
+    } else if(n.artifact_warning&&n.artifact_warning.type){
       var aw=n.artifact_warning, awl='type '+esc(aw.type)+' · risk '+esc(aw.leakage_risk||'—');
       if(aw.correlation!=null) awl+=' · corr '+(+aw.correlation).toFixed(4);
+      if(aw.derivation_direction) awl+=' · direction '+esc(aw.derivation_direction);
       h+='<div class="dr"><div class="dl" style="color:#fb923c">⚠ Artifact / leakage</div><div class="dv" style="line-height:1.5">'+esc(awl)+'</div></div>';
     }
     h+=row('Claim type',esc(n.claim_type||'—'));
