@@ -3,16 +3,138 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import re
 import shutil
 import zipfile
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
 class IngestionError(RuntimeError):
     pass
+
+
+_ID_NAME_TOKENS = ("id", "uuid", "guid", "subject", "patient", "sample", "record", "index", "key")
+# Temporal-axis name hints. A monotonic-unique column matching one of these is a
+# temporal index (an ordered axis), NOT a row identifier.
+_TEMPORAL_NAME_TOKENS = (
+    "year", "date", "time", "timestamp", "datetime", "epoch", "month", "week",
+    "day", "hour", "minute", "second", "age", "duration", "elapsed", "tick",
+    "step", "period", "gps",
+)
+# Axis kinds for which chronological (time-ordered) validation is auto-enabled.
+# Restricted to clear calendar/sequence axes; feature-like temporal quantities
+# (age, duration, gps event time, arbitrary step) are left on random validation
+# unless a caller opts in.
+CHRONO_AXIS_KINDS = frozenset({"year", "date", "datetime", "timestamp"})
+# String identifier shapes: UUIDs, and prefixed sequences like OBS-0001 / SUBJ_12.
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_PREFIXED_SEQ_RE = re.compile(r"^[A-Za-z]{1,12}[-_ ]?\d{1,}$")
+
+
+def detect_identifier(series: pd.Series, name: str) -> dict[str, Any] | None:
+    """Detect a likely row-identifier column from structural signals, not just its name.
+
+    Returns a dict of the triggering signals (for an auditable receipt), or None.
+
+    Continuous measurements are near-unique too, so cardinality alone is never
+    enough. A column qualifies only when it is near-unique AND presents an
+    identifier *shape*: a string ID/UUID pattern, or an integer-valued
+    monotonic / constant-step sequence. Fractional numeric columns are treated
+    as measurements and never flagged.
+    """
+    n = int(len(series))
+    if n <= 20:
+        return None
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return None
+    unique = int(non_null.nunique())
+    uniqueness = unique / len(non_null)
+    if uniqueness < 0.98:
+        return None
+
+    normalized = name.lower().replace(" ", "_")
+    name_hit = any(tok in normalized for tok in _ID_NAME_TOKENS)
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric_fraction = float(numeric.notna().mean())
+
+    signals: dict[str, Any] = {"uniqueness": round(uniqueness, 4), "name_token_match": name_hit}
+
+    # String identifier shapes (UUID / prefixed sequence).
+    if numeric_fraction < 0.5:
+        as_str = non_null.astype(str)
+        sample = as_str.head(200)
+        uuid_frac = float(sample.map(lambda v: bool(_UUID_RE.match(v))).mean())
+        seq_frac = float(sample.map(lambda v: bool(_PREFIXED_SEQ_RE.match(v))).mean())
+        if uuid_frac >= 0.9:
+            signals["shape"] = "uuid"
+            return signals
+        if seq_frac >= 0.9:
+            signals["shape"] = "prefixed_sequence"
+            return signals
+        if name_hit:
+            signals["shape"] = "named_string_key"
+            return signals
+        return None
+
+    # Integer-valued monotonic / constant-step numeric sequence.
+    vals = numeric.dropna().to_numpy(dtype=float)
+    is_integer_valued = bool(np.all(np.isfinite(vals)) and np.allclose(vals, np.round(vals)))
+    if is_integer_valued and len(vals) > 1:
+        ordered = np.sort(vals)
+        diffs = np.diff(ordered)
+        monotonic_seq = bool(np.all(diffs >= 1) and np.all(diffs <= 2))  # dense/near-dense sequence
+        constant_step = bool(len(np.unique(np.round(diffs, 6))) == 1)
+        if monotonic_seq or constant_step:
+            signals["shape"] = "integer_sequence"
+            signals["monotonic"] = monotonic_seq
+            signals["constant_step"] = constant_step
+            return signals
+        if name_hit:
+            signals["shape"] = "named_integer_key"
+            return signals
+    return None
+
+
+def detect_temporal(series: pd.Series, name: str, identifier_signals: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Detect a temporal-index column (an ordered axis), distinct from an identifier.
+
+    A monotonic-unique numeric column with a temporal name (year/date/…), or any
+    datetime-parseable column, is a temporal index — it should stay AVAILABLE for
+    mining as an axis rather than being excluded as a row id. Returns the axis
+    signals (or None). ``is_ordered_axis`` marks a genuinely time-ordered column
+    that can drive chronological validation.
+    """
+    normalized = name.lower().replace(" ", "_")
+    name_temporal = any(tok in normalized for tok in _TEMPORAL_NAME_TOKENS)
+
+    # Datetime-parseable columns are temporal regardless of cardinality.
+    if any(tok in normalized for tok in ("date", "time", "timestamp", "datetime")):
+        parsed = pd.to_datetime(series, errors="coerce")
+        if len(series) and float(parsed.notna().mean()) >= 0.9:
+            return {
+                "axis_kind": "datetime",
+                "is_ordered_axis": bool(parsed.dropna().is_monotonic_increasing),
+                "name_token_match": True,
+            }
+
+    # Otherwise a temporal index must look like an ordered index (i.e. it would
+    # have been an identifier by shape) AND carry a temporal name — so a plain
+    # non-unique ``age_years`` feature stays a measurement.
+    if identifier_signals is not None and name_temporal:
+        numeric = pd.to_numeric(series, errors="coerce").dropna()
+        axis_kind = next((tok for tok in _TEMPORAL_NAME_TOKENS if tok in normalized), "temporal")
+        return {
+            "axis_kind": axis_kind,
+            "is_ordered_axis": bool(len(numeric) and numeric.is_monotonic_increasing),
+            "name_token_match": True,
+        }
+    return None
 
 
 def sha256_file(path: Path) -> str:
@@ -65,25 +187,38 @@ def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
                 counts = s.astype(str).value_counts(dropna=False).head(12)
                 stats = {"top_values": {str(k): int(v) for k, v in counts.items()}}
         normalized = name.lower().replace(" ", "_")
-        if unique == len(s) and len(s) > 3:
-            if any(token in normalized for token in ("id", "uuid", "subject", "patient", "sample")):
-                role = "identifier"
-        if any(token in normalized for token in ("date", "time", "timestamp")):
+        identifier_signals = detect_identifier(s, name)
+        # Temporal-axis detection takes precedence over identifier: an ordered
+        # time axis (year/date/…) must not be excluded as a row id.
+        temporal_signals = detect_temporal(s, name, identifier_signals)
+        if temporal_signals is not None:
+            role = "temporal_index"
+            identifier_signals = None
+        elif identifier_signals is not None:
+            role = "identifier"
+        if role not in ("identifier", "temporal_index") and any(
+            token in normalized for token in ("date", "time", "timestamp")
+        ):
             role = "time"
-        if any(token in normalized for token in ("label", "class", "group", "condition", "diagnosis", "treatment")):
+        if role not in ("identifier", "temporal_index") and any(
+            token in normalized for token in ("label", "class", "group", "condition", "diagnosis", "treatment")
+        ):
             role = "group_or_category"
-        profile["column_profiles"].append(
-            {
-                "name": name,
-                "kind": kind,
-                "inferred_role": role,
-                "missing": missing,
-                "missing_fraction": float(missing / len(s)) if len(s) else 0.0,
-                "unique": unique,
-                "numeric_fraction": numeric_fraction,
-                "stats": stats,
-            }
-        )
+        column_profile = {
+            "name": name,
+            "kind": kind,
+            "inferred_role": role,
+            "missing": missing,
+            "missing_fraction": float(missing / len(s)) if len(s) else 0.0,
+            "unique": unique,
+            "numeric_fraction": numeric_fraction,
+            "stats": stats,
+        }
+        if identifier_signals is not None:
+            column_profile["identifier_signals"] = identifier_signals
+        if temporal_signals is not None:
+            column_profile["temporal_signals"] = temporal_signals
+        profile["column_profiles"].append(column_profile)
     return profile
 
 

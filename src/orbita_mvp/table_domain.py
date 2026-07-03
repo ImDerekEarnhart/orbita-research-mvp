@@ -42,6 +42,138 @@ def _r2(y: np.ndarray, pred: np.ndarray) -> float:
     return max(-1.0, min(1.0, score))
 
 
+# ---------------------------------------------------------------------------
+# Nonlinear candidate families (quadratic / log-x / log-y / log-log power law).
+#
+# Every form is fit in its natural space but ALWAYS SCORED in the original
+# outcome units (predictions inverted back before R²) so scores are directly
+# comparable across forms of the same relationship — a log fit gets no unfair
+# advantage from being evaluated in log space (see metrics.py note).
+# ---------------------------------------------------------------------------
+
+# Model complexity (free parameters) per form, for complexity-aware selection.
+FORM_COMPLEXITY = {"linear": 2, "log_x": 2, "log_y": 2, "log_log": 2, "quadratic": 3}
+_NONLINEAR_FORMS = ("quadratic", "log_x", "log_y", "log_log")
+
+
+def _fit_form(x: np.ndarray, y: np.ndarray, form: str) -> dict[str, Any] | None:
+    """Fit ``form`` and return ``{params, r2}`` with r2 in ORIGINAL y units.
+
+    Returns None when the form is inapplicable (e.g. log of non-positive values)
+    or degenerate.
+    """
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 5 or np.ptp(x) <= 1e-12:
+        return None
+    if form == "quadratic":
+        X = np.column_stack([np.ones(len(x)), x, x ** 2])
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        pred = X @ beta
+        return {"params": {"intercept": float(beta[0]), "b1": float(beta[1]), "b2": float(beta[2])},
+                "r2": _r2(y, pred)}
+    if form == "log_x":
+        if np.any(x <= 0):
+            return None
+        lx = np.log(x)
+        X = np.column_stack([np.ones(len(lx)), lx])
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        pred = X @ beta
+        return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])}, "r2": _r2(y, pred)}
+    if form == "log_y":
+        if np.any(y <= 0):
+            return None
+        ly = np.log(y)
+        X = np.column_stack([np.ones(len(x)), x])
+        beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
+        pred = np.exp(np.clip(X @ beta, -300.0, 300.0))
+        return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])}, "r2": _r2(y, pred)}
+    if form == "log_log":
+        if np.any(x <= 0) or np.any(y <= 0):
+            return None
+        lx, ly = np.log(x), np.log(y)
+        X = np.column_stack([np.ones(len(lx)), lx])
+        beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
+        pred = np.exp(np.clip(X @ beta, -300.0, 300.0))
+        # slope in log-log space is the power-law exponent.
+        return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])},
+                "r2": _r2(y, pred), "exponent": float(beta[1])}
+    return None
+
+
+def _predict_form(x: np.ndarray, form: str, params: dict[str, float]) -> np.ndarray | None:
+    """Predict outcome values in ORIGINAL units for ``form`` given stored params."""
+    with np.errstate(all="ignore"):
+        if form == "quadratic":
+            return params["intercept"] + params["b1"] * x + params["b2"] * x ** 2
+        if form == "log_x":
+            out = np.full_like(x, np.nan, dtype=float)
+            ok = x > 0
+            out[ok] = params["intercept"] + params["slope"] * np.log(x[ok])
+            return out
+        if form == "log_y":
+            return np.exp(np.clip(params["intercept"] + params["slope"] * x, -300.0, 300.0))
+        if form == "log_log":
+            out = np.full_like(x, np.nan, dtype=float)
+            ok = x > 0
+            out[ok] = np.exp(np.clip(params["intercept"] + params["slope"] * np.log(x[ok]), -300.0, 300.0))
+            return out
+    return None
+
+
+def _nonlinear_statement(predictor: str, outcome: str, form: str, params: dict[str, float]) -> str:
+    if form == "quadratic":
+        return f"{outcome} has a quadratic (single-peak/curved) relationship with {predictor}."
+    if form == "log_x":
+        return f"{outcome} varies with the logarithm of {predictor} (diminishing-returns relationship)."
+    if form == "log_y":
+        return f"{outcome} grows exponentially with {predictor} (log {outcome} is linear in {predictor})."
+    if form == "log_log":
+        exp = params.get("slope")
+        exp_txt = f" with exponent ≈ {exp:.3g}" if isinstance(exp, (int, float)) else ""
+        return f"{outcome} follows an approximate power law in {predictor} ({outcome} ≈ a·{predictor}^b){exp_txt}."
+    return f"{outcome} has a nonlinear ({form}) relationship with {predictor}."
+
+
+def _nonlinear_form_specs(
+    scout: pd.DataFrame,
+    predictor: str,
+    outcome: str,
+    *,
+    screen_r2: float = 0.2,
+) -> list[tuple[float, dict[str, Any]]]:
+    """Fit each nonlinear form on the scout partition; emit specs that clear the screen."""
+    x = pd.to_numeric(scout[predictor], errors="coerce").to_numpy(float)
+    y = pd.to_numeric(scout[outcome], errors="coerce").to_numpy(float)
+    out: list[tuple[float, dict[str, Any]]] = []
+    for form in _NONLINEAR_FORMS:
+        fit = _fit_form(x, y, form)
+        if not fit:
+            continue
+        r2 = fit["r2"]
+        if not math.isfinite(r2) or r2 < screen_r2:
+            continue
+        spec = {
+            "id": _candidate_id("nlform", predictor, outcome, form),
+            "statement": _nonlinear_statement(predictor, outcome, form, fit["params"]),
+            "kind": "nonlinear_association",
+            "predictor": predictor,
+            "outcome": outcome,
+            "form": form,
+            "scout_metric": {
+                "r2": round(r2, 6),
+                "params": {k: round(v, 6) for k, v in fit["params"].items()},
+                "complexity": FORM_COMPLEXITY.get(form),
+                "n": int(np.isfinite(x).sum()),
+            },
+            "parents": [],
+        }
+        if "exponent" in fit:
+            spec["scout_metric"]["exponent"] = round(fit["exponent"], 6)
+        out.append((r2, spec))
+    return out
+
+
 def _goal_columns(goal: str, columns: Iterable[str]) -> list[str]:
     normalized_goal = re.sub(r"[^a-z0-9]+", " ", goal.lower())
     found = []
@@ -65,6 +197,10 @@ def generate_table_candidates(
     seed: int = 20260623,
     exclude_columns: list[str] | None = None,
     target_column: str | None = None,
+    near_copy_r2: float = 0.999,
+    near_copy_corr: float = 0.9995,
+    nonlinear_budget: int = 40,
+    max_nonlinear_per_family: int = 4,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if len(df) < 6:
         raise ValueError("At least 6 rows are required for discovery and held-out checking")
@@ -119,7 +255,10 @@ def generate_table_candidates(
             target_numeric = [target_column]
 
     # structural relations check all numeric predictor columns pairwise.
-    structural = detect_structural_relations(df, numeric_columns=numeric_columns)
+    structural = detect_structural_relations(
+        df, numeric_columns=numeric_columns,
+        near_copy_r2=near_copy_r2, near_copy_corr=near_copy_corr,
+    )
     structural_relations: list[dict[str, Any]] = []
     seen_structural: set[str] = set()
 
@@ -144,25 +283,44 @@ def generate_table_candidates(
                 key = _candidate_id("structural", x, y)
                 if key not in seen_structural:
                     seen_structural.add(key)
-                    structural_relations.append({
-                        "id": key,
-                        "statement": (
+                    akind = artifact["kind"]
+                    if akind in ("near_duplicate_copy", "near_copy_affine"):
+                        statement = (
+                            f"{y} is a likely derived variable / near-copy of {x} "
+                            f"(target-leakage risk): {artifact.get('detail', '')}"
+                        )
+                    else:
+                        statement = (
                             f"{x} and {y} are structurally related "
-                            f"({artifact['kind']}): {artifact.get('detail', '')}."
-                        ),
+                            f"({akind}): {artifact.get('detail', '')}."
+                        )
+                    rel = {
+                        "id": key,
+                        "statement": statement,
                         "kind": "structural_relation",
-                        "artifact_kind": artifact["kind"],
+                        "artifact_kind": akind,
                         "detail": artifact.get("detail", ""),
                         "columns": [x, y],
-                    })
+                    }
+                    # Carry near-copy / leakage evidence fields for persistence.
+                    for extra in (
+                        "leakage_risk", "similarity_metric", "similarity", "correlation",
+                        "residual_variance_ratio", "slope", "intercept",
+                        "suspected_source_column", "derived_column_candidate", "disposition",
+                    ):
+                        if extra in artifact:
+                            rel[extra] = artifact[extra]
+                    structural_relations.append(rel)
                 continue
             pair = scout[[x, y]].apply(pd.to_numeric, errors="coerce").dropna()
             if len(pair) < 5 or pair[x].nunique() < 3 or pair[y].nunique() < 3:
                 continue
             r = float(pair[x].corr(pair[y]))
-            if not math.isfinite(r) or abs(r) < 0.2:
+            if not math.isfinite(r):
                 continue
-            direction = "positive" if r >= 0 else "negative"
+            # Orientation is independent of the linear-correlation strength, so
+            # nonlinear forms can be screened even when |r| ≈ 0 (e.g. a
+            # symmetric inverted-U has near-zero linear correlation).
             # Explicit target takes precedence over goal_columns direction.
             if target_column and y == target_column:
                 predictor, outcome = x, y
@@ -177,6 +335,23 @@ def generate_table_candidates(
             # Hard guard: target_column must not be a predictor.
             if target_column and predictor == target_column:
                 continue
+
+            # Nonlinear candidate family (quadratic / log-x / log-y / log-log).
+            # Members of the same relationship family as the linear form; the
+            # selection layer picks the preferred form after falsification.
+            nonlinear_specs = _nonlinear_form_specs(scout, predictor, outcome)
+            for nl_score, nl_spec in nonlinear_specs:
+                scored.append((float(nl_score), nl_spec))
+
+            # Emit the linear form when it clears its own correlation screen OR
+            # when a nonlinear sibling exists — so a family always includes the
+            # raw linear baseline. A weak linear form (e.g. the failed linear
+            # fit of an inverted-U) is then killed and reclassified as
+            # functional_form_rejected against the surviving curved sibling,
+            # rather than the underlying relationship being called refuted.
+            if abs(r) < 0.2 and not nonlinear_specs:
+                continue
+            direction = "positive" if r >= 0 else "negative"
             spec = {
                 "id": _candidate_id("linear", predictor, outcome),
                 "statement": f"{predictor} and {outcome} show a stable {direction} linear association.",
@@ -228,8 +403,62 @@ def generate_table_candidates(
             }
             scored.append((float(eta2), spec))
 
+    # ------------------------------------------------------------------
+    # Candidate-family budgeting: linear/group and nonlinear forms draw from
+    # SEPARATE budgets so nonlinear candidates cannot crowd legitimate linear
+    # pairs out of a saturated global cap. Families are deduplicated and the
+    # strongest linear member of every selected family is always preserved.
+    # ------------------------------------------------------------------
+    def _fam_key(spec: dict[str, Any]) -> tuple[str, ...]:
+        kind = spec.get("kind")
+        if kind in ("linear_association", "nonlinear_association"):
+            p = re.sub(r"^(log10_|log1p_|log_|ln_)", "", str(spec.get("predictor", "")).lower())
+            o = re.sub(r"^(log10_|log1p_|log_|ln_)", "", str(spec.get("outcome", "")).lower())
+            return ("assoc", p, o)
+        if kind == "group_difference":
+            return ("group", str(spec.get("group", "")), str(spec.get("outcome", "")))
+        return ("other", spec.get("id", ""))
+
     scored.sort(key=lambda item: (-item[0], item[1]["id"]))
-    candidates = [spec for _, spec in scored[:max_candidates]]
+    linear_group = [(s, sp) for s, sp in scored if sp.get("kind") in ("linear_association", "group_difference")]
+    nonlinear = [(s, sp) for s, sp in scored if sp.get("kind") == "nonlinear_association"]
+
+    # 1. Linear + group keep the original global budget (reproduces the
+    #    linear-only selection exactly — no linear pair is displaced by nonlinear).
+    selected: list[dict[str, Any]] = [sp for _, sp in linear_group[:max_candidates]]
+    selected_ids = {sp["id"] for sp in selected}
+
+    # Strongest linear member per family (linear_group is already sorted by score).
+    strongest_linear: dict[tuple[str, ...], dict[str, Any]] = {}
+    for _s, sp in linear_group:
+        if sp.get("kind") == "linear_association":
+            strongest_linear.setdefault(_fam_key(sp), sp)
+
+    # 2. Nonlinear from its OWN budget, capped per family.
+    per_family: dict[tuple[str, ...], int] = {}
+    nonlinear_selected: list[dict[str, Any]] = []
+    for _s, sp in nonlinear:
+        fam = _fam_key(sp)
+        if per_family.get(fam, 0) >= max_nonlinear_per_family:
+            continue
+        per_family[fam] = per_family.get(fam, 0) + 1
+        nonlinear_selected.append(sp)
+        if len(nonlinear_selected) >= nonlinear_budget:
+            break
+
+    # 3. Preserve the linear anchor of every selected nonlinear family (so a
+    #    functional-form failure can always be linked to its linear baseline).
+    anchor_adds: list[dict[str, Any]] = []
+    for sp in nonlinear_selected:
+        anchor = strongest_linear.get(_fam_key(sp))
+        if anchor is not None and anchor["id"] not in selected_ids:
+            anchor_adds.append(anchor)
+            selected_ids.add(anchor["id"])
+
+    candidates: list[dict[str, Any]] = []
+    for sp in selected + anchor_adds + nonlinear_selected:
+        if sp["id"] not in {c["id"] for c in candidates}:
+            candidates.append(sp)
 
     # Post-generation leakage assertion: target_column must never be a predictor.
     if target_column:
@@ -255,6 +484,11 @@ def generate_table_candidates(
         "target_column": target_column,
         "generated_candidates": len(candidates),
         "candidate_budget": max_candidates,
+        "linear_group_budget": max_candidates,
+        "nonlinear_budget": nonlinear_budget,
+        "max_nonlinear_per_family": max_nonlinear_per_family,
+        "linear_group_selected": len(selected),
+        "nonlinear_selected": len(nonlinear_selected),
         "structural_relations": structural_relations,
         "structural_relation_count": len(structural_relations),
     }
@@ -329,6 +563,7 @@ class UploadedTableDomain:
         seed: int = 20260623,
         target_transform: str | None = None,
         evaluation_metric: str = "r2",
+        time_column: str | None = None,
     ):
         if not candidates:
             raise ValueError("The approved plan contains no testable candidates")
@@ -344,10 +579,16 @@ class UploadedTableDomain:
         self.specs = candidates
         self.target_transform = target_transform
         self.evaluation_metric = evaluation_metric
+        self.time_column = time_column if (time_column and time_column in self.df.columns) else None
 
         n = len(self.df)
-        indices = list(range(n))
-        random.Random(seed).shuffle(indices)
+        if self.time_column is not None:
+            # Chronological validation: earliest rows train, latest rows validate.
+            order = pd.to_numeric(self.df[self.time_column], errors="coerce")
+            indices = list(order.sort_values(kind="mergesort").index)
+        else:
+            indices = list(range(n))
+            random.Random(seed).shuffle(indices)
 
         scout_cut = max(3, min(n - 3, int(n * scout_fraction)))
         sel_cut = scout_cut + max(1, int(n * confirmation_fraction))
@@ -377,6 +618,13 @@ class UploadedTableDomain:
         return {"scout": self.scout, "confirmation": self.selection}
 
     def splits(self, evidence: Any, seed: int):
+        """Fixed-model validation-resample splits.
+
+        The training partition is ALWAYS the locked scout rows regardless of
+        seed; only the validation rows are bootstrap-resampled. This is what
+        ``validation_resample`` (formerly ``cross_seed``) uses. It intentionally
+        does NOT repartition/refit — see :meth:`repeated_refit_split`.
+        """
         train = evidence["scout"]
         confirmation = evidence["confirmation"]
         if seed in {0, 1} or len(confirmation) < 4:
@@ -384,6 +632,37 @@ class UploadedTableDomain:
         rng = np.random.default_rng(seed)
         picks = rng.integers(0, len(confirmation), size=len(confirmation))
         return train, confirmation.iloc[picks].copy()
+
+    def repeated_refit_split(self, seed: int, train_fraction: float = 0.7):
+        """Fresh train/validation partition for genuine repeated refitting.
+
+        Draws from the modelling pool (scout + selection) — never the reserved
+        ``final_validation`` partition — and produces a new random split per
+        seed so the candidate model is refit on independent training rows each
+        time. Used by :class:`RepeatedRefitValidator`.
+        """
+        frames = [self.scout]
+        if len(self.selection):
+            frames.append(self.selection)
+        pool = pd.concat(frames, ignore_index=True) if len(frames) > 1 else self.scout.reset_index(drop=True)
+        n = len(pool)
+        if n < 6:
+            return pool.copy(), pool.copy()
+        if self.time_column is not None and self.time_column in pool.columns:
+            # Chronological repeated-refit: order by time and vary the train/val
+            # cut point per seed (train earlier, validate later) — never shuffle
+            # future rows into the training window.
+            order = pd.to_numeric(pool[self.time_column], errors="coerce").sort_values(kind="mergesort").index
+            idx = np.asarray(order)
+            frac = 0.6 + 0.03 * (seed % 6)  # cut points from 60% to ~75%
+            cut = max(3, min(n - 3, int(n * frac)))
+            return pool.iloc[idx[:cut]].copy(), pool.iloc[idx[cut:]].copy()
+        idx = np.arange(n)
+        np.random.default_rng(1_000_003 + seed).shuffle(idx)
+        cut = max(3, min(n - 3, int(n * train_fraction)))
+        train = pool.iloc[idx[:cut]].copy()
+        val = pool.iloc[idx[cut:]].copy()
+        return train, val
 
     def _get_y(self, df: pd.DataFrame, col: str) -> np.ndarray:
         y = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
@@ -441,6 +720,23 @@ class UploadedTableDomain:
             temp = pd.DataFrame({"g": train[group].astype(str), "y": pd.to_numeric(train[outcome], errors="coerce")}).dropna()
             means = {str(label): float(part["y"].mean()) for label, part in temp.groupby("g")}
             return {"kind": kind, "valid": bool(means), "means": means, "overall": float(temp["y"].mean()) if len(temp) else 0.0}
+        if kind == "nonlinear_association":
+            form = c.payload["form"]
+            x_name, y_name = c.payload["predictor"], c.payload["outcome"]
+            x_s = pd.to_numeric(train[x_name], errors="coerce")
+            y_s = pd.to_numeric(train[y_name], errors="coerce")
+            mask = x_s.notna() & y_s.notna()
+            if mask.sum() < 5:
+                return {"kind": kind, "valid": False}
+            fit = _fit_form(x_s[mask].to_numpy(float), y_s[mask].to_numpy(float), form)
+            if fit is None:
+                return {"kind": kind, "valid": False}
+            params = fit["params"]
+            return {
+                "kind": kind, "valid": True, "form": form,
+                "intercept": float(params.get("intercept", 0.0)),
+                "params": params,
+            }
         return {"kind": kind, "valid": False}
 
     def _predict_raw(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> np.ndarray | None:
@@ -484,6 +780,24 @@ class UploadedTableDomain:
                 return None
             pred = np.array([model["means"].get(label, model["overall"]) for label in temp["g"]], dtype=float)
             return np.stack([temp["y"].to_numpy(float), pred])
+
+        if kind == "nonlinear_association":
+            x_name, y_name = c.payload["predictor"], c.payload["outcome"]
+            x_s = pd.to_numeric(test[x_name], errors="coerce")
+            y_s = pd.to_numeric(test[y_name], errors="coerce")
+            mask = x_s.notna() & y_s.notna()
+            if mask.sum() < 3:
+                return None
+            pred = _predict_form(x_s[mask].to_numpy(float), model["form"], model["params"])
+            if pred is None:
+                return None
+            y_true = y_s[mask].to_numpy(float)
+            # Nonlinear forms predict in ORIGINAL outcome units already; return
+            # them directly (score() computes R² in that comparable space).
+            valid = np.isfinite(pred) & np.isfinite(y_true)
+            if valid.sum() < 3:
+                return None
+            return np.stack([y_true[valid], pred[valid]])
         return None
 
     def score(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> float:

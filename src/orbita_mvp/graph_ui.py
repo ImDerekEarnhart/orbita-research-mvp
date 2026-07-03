@@ -69,6 +69,14 @@ def build_graph_data(case_id: str, conn: Any) -> dict[str, Any]:
             "full_data_score_diagnostic": detail.get("full_data_score_diagnostic"),
             "metric_name": detail.get("metric_name"),
             "cross_seed_summary": detail.get("cross_seed_summary"),
+            "validation_resample_summary": detail.get("validation_resample_summary"),
+            "repeated_refit_summary": detail.get("repeated_refit_summary"),
+            "association_evidence": detail.get("association_evidence"),
+            "predictive_utility": detail.get("predictive_utility"),
+            "model_family": detail.get("model_family"),
+            "missingness": detail.get("missingness"),
+            "subgroup_warning": detail.get("subgroup_warning"),
+            "artifact_warning": detail.get("artifact_warning"),
             "verdict_reason": detail.get("verdict_reason"),
             "rejection_reason": detail.get("rejection_reason"),
             "alternative_candidate_id": detail.get("alternative_candidate_id"),
@@ -538,6 +546,8 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <div class="lg-item"><div class="ld" style="background:#6b7280"></div>Unresolved</div>
         <div class="lg-item"><div class="ld" style="background:#94a3b8"></div>Not supported</div>
         <div class="lg-item"><div class="ld" style="background:#475569"></div>Inconclusive</div>
+        <div class="lg-item"><div class="ld" style="background:#14b8a6"></div>Supported association</div>
+        <div class="lg-item"><div class="ld" style="background:#a855f7"></div>Regime-dependent</div>
         <div class="lg-item"><div class="ld" style="background:#d97706"></div>Wrong functional form</div>
         <div class="lg-item"><div class="ld" style="background:#8b5cf6"></div>Evidence</div>
         <div class="lg-item"><div class="ld" style="background:#0ea5e9"></div>Analysis Run</div>
@@ -593,6 +603,8 @@ var NODE_CLR = {
   state_not_supported:          {background:'#94a3b8',border:'#64748b'},  // slate
   state_inconclusive:           {background:'#475569',border:'#334155'},  // dark slate
   state_functional_form_rejected: {background:'#d97706',border:'#b45309'},  // amber
+  state_supported_association:  {background:'#14b8a6',border:'#0d9488'},  // teal
+  state_regime_dependent:       {background:'#a855f7',border:'#9333ea'},  // purple
   state_:            {background:'#6b7280',border:'#4b5563'},
   evidence:         {background:'#8b5cf6',border:'#7c3aed'},
   evidence_rev:     {background:'#3b2b6b',border:'#2b1b5b'},
@@ -616,6 +628,8 @@ var STATUS_CLR = {
   not_supported: {bg:'#1e293b',fg:'#94a3b8',brd:'#64748b'},
   inconclusive:  {bg:'#0f172a',fg:'#64748b',brd:'#334155'},
   functional_form_rejected: {bg:'#451a03',fg:'#fbbf24',brd:'#b45309'},
+  supported_association: {bg:'#042f2e',fg:'#5eead4',brd:'#0d9488'},
+  regime_dependent: {bg:'#2e1065',fg:'#c4b5fd',brd:'#9333ea'},
   pending:     {bg:'#1f2937',fg:'#9ca3af',brd:'#4b5563'},
 };
 
@@ -663,7 +677,7 @@ function visNode(n, hidden) {
 function computeVisible(d) {
   if(showAllCandidates) return null;  // null => everything visible
   var visible = new Set();
-  var shown = {rejected:0, artifact:0, provisional:0, unresolved:0, not_supported:0, inconclusive:0, functional_form_rejected:0};
+  var shown = {rejected:0, artifact:0, provisional:0, unresolved:0, not_supported:0, inconclusive:0, functional_form_rejected:0, supported_association:0, regime_dependent:0};
   d.nodes.forEach(function(n){
     if(n.type!=='claim') return;
     var st = n.public_state||'unresolved';
@@ -853,6 +867,39 @@ function renderOverview(n) {
     if(n.cross_seed_summary&&n.cross_seed_summary.median!=null) scores.push('cross-seed median '+(+n.cross_seed_summary.median).toFixed(3));
     if(n.full_data_score_diagnostic!=null) scores.push('full-data fit '+(+n.full_data_score_diagnostic).toFixed(3)+' (diagnostic only)');
     if(scores.length) h+=row('Check scores','<span style="color:var(--dim)">'+esc(scores.join(' · '))+'</span>');
+    if(n.association_evidence&&n.association_evidence.effect_size!=null){
+      var ae=n.association_evidence, aline=esc(ae.effect_size_metric)+' = '+(+ae.effect_size).toFixed(3);
+      if(ae.omega_squared!=null) aline+=' (ω² '+(+ae.omega_squared).toFixed(3)+')';
+      if(ae.power_law_exponent!=null) aline+=' · exponent ≈ '+(+ae.power_law_exponent).toFixed(3);
+      h+=row('Association effect size','<span style="color:#5eead4">'+aline+'</span>');
+    }
+    if(n.predictive_utility&&n.predictive_utility.held_out_score!=null){
+      var pu=n.predictive_utility;
+      h+=row('Predictive utility','<span style="color:var(--dim)">held-out '+(+pu.held_out_score).toFixed(3)+' (n='+esc(pu.held_out_n)+')'+(pu.beats_baseline?' · beats baseline':' · limited')+'</span>');
+    }
+    if(n.model_family&&n.model_family.preferred_form){
+      var mf=n.model_family, ml='form '+esc(mf.form)+' · preferred '+esc(mf.preferred_form)+(mf.is_preferred?' (this)':'');
+      var mexp=mf.preferred_power_law_exponent!=null?mf.preferred_power_law_exponent:mf.power_law_exponent;
+      if(mexp!=null) ml+=' · exponent ≈ '+(+mexp).toFixed(3);
+      h+=row('Model family',esc(ml));
+    }
+    if(n.repeated_refit_summary&&n.repeated_refit_summary.valid_fits){
+      var rr=n.repeated_refit_summary;
+      h+=row('Repeated-refit stability','<span style="color:var(--dim)">median '+(rr.median!=null?(+rr.median).toFixed(3):'—')+' · direction '+(rr.direction_stability!=null?(+rr.direction_stability).toFixed(2):'—')+' · '+Math.round((rr.valid_fit_fraction||0)*100)+'% of '+esc(rr.valid_fits)+' valid</span>');
+    }
+    if(n.missingness&&n.missingness.substantial_missingness){
+      var mi=n.missingness;
+      h+=row('⚠ Missingness','<span style="color:#fb923c">effective n '+esc(mi.effective_n)+' of '+esc(mi.total_rows)+' ('+(+(mi.excluded_fraction||0)*100).toFixed(0)+'% excluded)</span>');
+    }
+    if(n.subgroup_warning&&n.subgroup_warning.conditioning_variable){
+      var sw=n.subgroup_warning, gd=(sw.groups||[]).map(function(g){return esc(g.group)+': '+esc(g.direction);}).join(', ');
+      h+='<div class="dr"><div class="dl" style="color:#c4b5fd">⚠ Subgroup reversal</div><div class="dv" style="line-height:1.5">pooled '+esc(sw.pooled_direction)+' vs within-'+esc(sw.conditioning_variable)+' ('+gd+')</div></div>';
+    }
+    if(n.artifact_warning&&n.artifact_warning.type){
+      var aw=n.artifact_warning, awl='type '+esc(aw.type)+' · risk '+esc(aw.leakage_risk||'—');
+      if(aw.correlation!=null) awl+=' · corr '+(+aw.correlation).toFixed(4);
+      h+='<div class="dr"><div class="dl" style="color:#fb923c">⚠ Artifact / leakage</div><div class="dv" style="line-height:1.5">'+esc(awl)+'</div></div>';
+    }
     h+=row('Claim type',esc(n.claim_type||'—'));
     h+=row('Created',fmt(n.created_at));
     h+='<div style="margin-top:8px"><a href="/claims/'+n.id+'/history" target="_blank">Full history →</a>&nbsp;&nbsp;<a href="/claims/'+n.id+'/impact" target="_blank">Impact →</a></div>';

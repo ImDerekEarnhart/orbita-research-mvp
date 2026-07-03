@@ -20,6 +20,8 @@ _VERDICT_LABELS = {
     "rejected": "refuted",
     "artifact": "data-quality artifacts",
     "unresolved": "unresolved",
+    "supported_association": "supported associations",
+    "regime_dependent": "regime-dependent",
 }
 # Always shown, in this order, even at zero — these are the four outcomes a
 # reader needs to see explicitly to trust the summary.
@@ -36,6 +38,68 @@ def _fmt(value: Any, digits: int = 3) -> str:
 
 def _escape(text: Any) -> str:
     return html.escape(str(text))
+
+
+def _evidence_bullets(detail: dict[str, Any]) -> list[str]:
+    """Render the separated evidence axes + warnings that every surface shows."""
+    out: list[str] = []
+    assoc = detail.get("association_evidence") or {}
+    if assoc.get("effect_size") is not None:
+        line = f"- **Association effect size:** {assoc.get('effect_size_metric')} = {_fmt(assoc.get('effect_size'))}"
+        if assoc.get("omega_squared") is not None:
+            line += f" (ω² = {_fmt(assoc.get('omega_squared'))})"
+        if assoc.get("ci95"):
+            line += f", 95% CI {assoc['ci95']}"
+        if assoc.get("power_law_exponent") is not None:
+            line += f", power-law exponent ≈ {_fmt(assoc.get('power_law_exponent'))}"
+        out.append(line)
+    pu = detail.get("predictive_utility") or {}
+    if pu.get("held_out_score") is not None:
+        out.append(
+            f"- **Predictive utility:** held-out {pu.get('metric_name') or 'score'} = "
+            f"{_fmt(pu.get('held_out_score'))} on n = {pu.get('held_out_n')}"
+            + (" (beats baseline)" if pu.get("beats_baseline") else " (does not beat baseline)")
+        )
+    mf = detail.get("model_family") or {}
+    if mf.get("preferred_form"):
+        note = f"- **Model family:** this is the `{mf.get('form')}` form; preferred form is `{mf.get('preferred_form')}`"
+        if mf.get("preferred_power_law_exponent") is not None:
+            note += f" (power-law exponent ≈ {_fmt(mf.get('preferred_power_law_exponent'))})"
+        elif mf.get("power_law_exponent") is not None:
+            note += f" (power-law exponent ≈ {_fmt(mf.get('power_law_exponent'))})"
+        if mf.get("is_preferred"):
+            note += " — this is the preferred model"
+        out.append(note)
+    rr = detail.get("repeated_refit_summary") or {}
+    if rr.get("valid_fits"):
+        out.append(
+            f"- **Repeated-refit stability:** median {_fmt(rr.get('median'))}, "
+            f"direction stability {_fmt(rr.get('direction_stability'))}, "
+            f"{int(round((rr.get('valid_fit_fraction') or 0) * 100))}% of {rr.get('valid_fits')} refits valid"
+        )
+    miss = detail.get("missingness") or {}
+    if miss.get("substantial_missingness"):
+        out.append(
+            f"- **⚠ Missingness:** effective n = {miss.get('effective_n')} of {miss.get('total_rows')} "
+            f"({_fmt(miss.get('excluded_fraction'))} excluded for missing values)"
+        )
+    sub = detail.get("subgroup_warning") or {}
+    if sub.get("conditioning_variable"):
+        groups = ", ".join(f"{g['group']}: {g['direction']}" for g in sub.get("groups", []))
+        out.append(
+            f"- **⚠ Subgroup reversal:** pooled {sub.get('pooled_direction')} vs within-`{sub.get('conditioning_variable')}` "
+            f"({groups}); the universal directional claim is blocked."
+        )
+    art = detail.get("artifact_warning") or {}
+    if art.get("type"):
+        out.append(
+            f"- **⚠ Artifact / leakage:** {art.get('type')} (risk {art.get('leakage_risk', '—')}"
+            + (f", correlation {_fmt(art.get('correlation'))}" if art.get("correlation") is not None else "")
+            + ")"
+        )
+    if detail.get("alternative_candidate_id"):
+        out.append(f"- **Preferred alternative model:** `{detail.get('alternative_candidate_id')}`")
+    return out
 
 
 def _verdict_count_summary(claim_rows: list[dict[str, Any]]) -> str:
@@ -90,8 +154,15 @@ class ReportCompiler:
                 return claim.get("verdict", f.get("final_status", "unknown"))
             return f.get("final_status", "unknown")
 
+        def _detail_for(f: dict[str, Any]) -> dict[str, Any]:
+            claim = claims_by_candidate_id.get(_candidate_id(f))
+            return (claim.get("finding_detail") or {}) if claim else {}
+
         survived = [f for f in findings if _verdict_for(f) in {"committed", "provisional"}]
-        failed = [f for f in findings if f not in survived]
+        supported_assoc = [f for f in findings if _verdict_for(f) == "supported_association"]
+        regime = [f for f in findings if _verdict_for(f) == "regime_dependent"]
+        _shown = {id(f) for f in survived + supported_assoc + regime}
+        failed = [f for f in findings if id(f) not in _shown]
         selected = plan.get("selected_dataset", {})
         lines: list[str] = [
             f"# Orbita Research Dossier: {case['name']}",
@@ -161,24 +232,56 @@ class ReportCompiler:
                     f"- **{attack.get('name')} check:** {'failed' if attack.get('killed') else 'passed'}; "
                     f"metric={_fmt(attack.get('metric'))}"
                 )
+            lines += _evidence_bullets(_detail_for(finding))
             lines += [
                 "- **Interpretation:** This relation remained predictive or structured in the locked confirmation checks used here. It does not establish causation.",
                 "- **Recommended next test:** Repeat the frozen candidate on an independent dataset; inspect subgroup consistency, outliers, measurement construction, and plausible confounders.",
                 "",
             ]
 
-        lines += ["## Candidates that failed or remained unresolved", ""]
+        # Supported associations — real effect, limited standalone predictive utility.
+        if supported_assoc:
+            lines += ["## Supported associations (real effect, limited standalone predictive utility)", ""]
+            for finding in supported_assoc:
+                candidate = finding.get("candidate", {})
+                lines.append(f"### {candidate.get('statement', candidate.get('id'))}")
+                lines.append("")
+                lines.append(f"- **Verdict:** {_verdict_for(finding)}")
+                lines += _evidence_bullets(_detail_for(finding))
+                reason = _detail_for(finding).get("rejection_reason")
+                if reason:
+                    lines.append(f"- **Why:** {reason}")
+                lines.append("")
+
+        # Regime-dependent / subgroup-reversal findings.
+        if regime:
+            lines += ["## Regime-dependent / subgroup-reversal findings", ""]
+            for finding in regime:
+                candidate = finding.get("candidate", {})
+                detail = _detail_for(finding)
+                lines.append(f"### {candidate.get('statement', candidate.get('id'))}")
+                lines.append("")
+                lines.append(f"- **Verdict:** {_verdict_for(finding)}")
+                lines += _evidence_bullets(detail)
+                reason = detail.get("rejection_reason") or (detail.get("subgroup_warning") or {}).get("reason")
+                if reason:
+                    lines.append(f"- **Why:** {reason}")
+                lines.append("")
+
+        lines += ["## Candidates that did not clear the bar", ""]
         if not failed:
             lines.append("None.")
         for finding in failed:
             killed_by = [a.get("name") for a in finding.get("falsifications", []) if a.get("killed")]
-            claim = claims_by_candidate_id.get(_candidate_id(finding))
-            reason = (claim.get("finding_detail", {}) or {}).get("rejection_reason") if claim else None
+            detail = _detail_for(finding)
+            reason = detail.get("rejection_reason")
+            alt = detail.get("alternative_candidate_id")
             lines.append(
                 f"- **{finding.get('candidate', {}).get('statement', finding.get('candidate', {}).get('id'))}** — "
                 f"verdict `{_verdict_for(finding)}`, score {_fmt(finding.get('verdict', {}).get('score'))}; "
                 f"failed: {', '.join(killed_by) or 'did not reach the governed threshold'}."
                 + (f" {reason}" if reason else "")
+                + (f" Preferred alternative model: `{alt}`." if alt else "")
             )
 
         lines += [

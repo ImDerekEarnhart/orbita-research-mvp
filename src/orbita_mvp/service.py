@@ -5,11 +5,168 @@ import math
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+
+def _candidate_columns(payload: dict[str, Any]) -> list[str]:
+    """Ordered, de-duplicated list of dataset columns a candidate depends on."""
+    cols: list[str] = []
+    for key in ("predictor", "outcome", "group"):
+        v = payload.get(key)
+        if v:
+            cols.append(str(v))
+    for p in payload.get("predictors", []) or []:
+        cols.append(str(p))
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cols:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _missingness_receipt(df: pd.DataFrame, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Per-candidate complete-case missingness receipt (never imputes)."""
+    cols = [c for c in _candidate_columns(payload) if c in df.columns]
+    if not cols:
+        return None
+    total = int(len(df))
+    complete = pd.Series(True, index=df.index)
+    per_var: dict[str, float] = {}
+    group_col = payload.get("group")
+    for c in cols:
+        col = df[c]
+        coerced = pd.to_numeric(col, errors="coerce")
+        # Numeric candidate columns: values that cannot be coerced are effectively
+        # missing. The categorical grouping column uses raw null semantics.
+        if c != group_col and float(coerced.notna().mean()) >= 0.5:
+            miss = coerced.isna()
+        else:
+            miss = col.isna()
+        per_var[c] = round(float(miss.mean()), 4)
+        complete &= ~miss
+    effective_n = int(complete.sum())
+    excluded = total - effective_n
+    return {
+        "total_rows": total,
+        "effective_n": effective_n,
+        "rows_excluded_missing": excluded,
+        "excluded_fraction": round(excluded / total, 4) if total else 0.0,
+        "missing_fraction_by_variable": per_var,
+        "substantial_missingness": bool(total and excluded / total >= 0.2),
+    }
+
+
+def _association_evidence(df: pd.DataFrame, payload: dict[str, Any], *, seed: int = 92617) -> dict[str, Any] | None:
+    """Effect-size + bootstrap-stability evidence, independent of predictive utility."""
+    kind = payload.get("kind")
+    rng = np.random.default_rng(seed)
+    if kind == "linear_association":
+        pred, out = payload.get("predictor"), payload.get("outcome")
+        if pred not in df.columns or out not in df.columns:
+            return None
+        x = pd.to_numeric(df[pred], errors="coerce")
+        y = pd.to_numeric(df[out], errors="coerce")
+        m = x.notna() & y.notna()
+        xa, ya = x[m].to_numpy(float), y[m].to_numpy(float)
+        if len(xa) < 5:
+            return None
+        r = float(np.corrcoef(xa, ya)[0, 1])
+        boots = []
+        for _ in range(300):
+            idx = rng.integers(0, len(xa), len(xa))
+            rr = np.corrcoef(xa[idx], ya[idx])[0, 1]
+            if np.isfinite(rr):
+                boots.append(float(rr))
+        ci = [round(float(np.percentile(boots, 2.5)), 4), round(float(np.percentile(boots, 97.5)), 4)] if boots else None
+        sign_stability = round(float(np.mean([(b > 0) == (r > 0) for b in boots])), 4) if boots else None
+        return {
+            "effect_size_metric": "pearson_r",
+            "effect_size": round(r, 4),
+            "ci95": ci,
+            "bootstrap_sign_stability": sign_stability,
+            "n": int(len(xa)),
+        }
+    if kind == "nonlinear_association":
+        from .table_domain import _fit_form
+        pred, out = payload.get("predictor"), payload.get("outcome")
+        form = payload.get("form")
+        if pred not in df.columns or out not in df.columns:
+            return None
+        x = pd.to_numeric(df[pred], errors="coerce").to_numpy(float)
+        y = pd.to_numeric(df[out], errors="coerce").to_numpy(float)
+        fit = _fit_form(x, y, form)
+        if not fit:
+            return None
+        evidence = {
+            "effect_size_metric": f"r2_{form}",
+            "effect_size": round(float(fit["r2"]), 4),
+            "form": form,
+            "n": int(np.isfinite(x).sum()),
+        }
+        if "exponent" in fit:
+            evidence["power_law_exponent"] = round(float(fit["exponent"]), 4)
+        return evidence
+    if kind == "group_difference":
+        group, out = payload.get("group"), payload.get("outcome")
+        if group not in df.columns or out not in df.columns:
+            return None
+        temp = pd.DataFrame({"g": df[group].astype(str), "y": pd.to_numeric(df[out], errors="coerce")}).dropna()
+        if len(temp) < 6 or temp["g"].nunique() < 2:
+            return None
+        overall = float(temp["y"].mean())
+        total_ss = float(((temp["y"] - overall) ** 2).sum())
+        if total_ss <= 1e-12:
+            return None
+        grp = list(temp.groupby("g"))
+        k, N = len(grp), len(temp)
+        between = float(sum(len(s) * (float(s["y"].mean()) - overall) ** 2 for _, s in grp))
+        eta2 = between / total_ss
+        ms_within = (total_ss - between) / (N - k) if N > k else 0.0
+        omega2 = (between - (k - 1) * ms_within) / (total_ss + ms_within) if (total_ss + ms_within) > 0 else None
+        means = {str(lab): round(float(s["y"].mean()), 4) for lab, s in grp}
+        counts = {str(lab): int(len(s)) for lab, s in grp}
+        # Largest-group reference contrast.
+        ref = max(counts, key=counts.get)
+        contrasts = {lab: round(means[lab] - means[ref], 4) for lab in means if lab != ref}
+        return {
+            "effect_size_metric": "eta_squared",
+            "effect_size": round(float(eta2), 4),
+            "omega_squared": round(float(omega2), 4) if omega2 is not None else None,
+            "group_means": means,
+            "group_counts": counts,
+            "reference_group": ref,
+            "group_contrasts_vs_reference": contrasts,
+            "n": int(N),
+            "n_groups": int(k),
+        }
+    return None
+
+
+def _qualifies_as_supported_association(assoc: dict[str, Any] | None) -> bool:
+    """A generated group effect is a *supported association* when it explains
+    variance beyond chance (omega² > 0) with a non-trivial effect size (η² ≥ 0.02,
+    the conventional small-effect boundary). Thresholds are effect-size
+    conventions, not tuned to any dataset's expected answer."""
+    if not assoc or assoc.get("effect_size_metric") != "eta_squared":
+        return False
+    eta2 = assoc.get("effect_size")
+    omega2 = assoc.get("omega_squared")
+    return (
+        isinstance(eta2, (int, float)) and eta2 >= 0.02
+        and isinstance(omega2, (int, float)) and omega2 > 0.005
+    )
 
 from orbita import ActorRole, EpistemicLedger, EvidenceKind, Stance
 from orbita_discovery.core import Candidate, Engine, Ledger, finding_to_dict, survivors
-from orbita_discovery.falsifiers import BaselineFalsifier, CrossSeedFalsifier, HeldOutFalsifier
+from orbita_discovery.falsifiers import (
+    BaselineFalsifier,
+    CrossSeedFalsifier,
+    HeldOutFalsifier,
+    RepeatedRefitValidator,
+)
 from orbita_discovery.judges import GatedJudge
 
 from .compiler import ResearchCompiler, compute_plan_hash, verify_plan_schema_executable
@@ -201,6 +358,9 @@ class ResearchMVP:
             confirmation_fraction = float(gen.get("confirmation_fraction", 0.25))
             final_validation_fraction = float(gen.get("final_validation_fraction", 0.15))
             seed = int(gen.get("seed", 20260623))
+            # Chronological validation axis (a clear ordered calendar/sequence
+            # column), when the dataset has one — else random validation.
+            time_column = plan.get("chronological_axis") or None
 
             domain = UploadedTableDomain(
                 df,
@@ -211,6 +371,7 @@ class ResearchMVP:
                 seed=seed,
                 target_transform=target_transform,
                 evaluation_metric=evaluation_metric,
+                time_column=time_column,
             )
             judge = GatedJudge(
                 commit_at=float(thresholds.get("commit_at", 0.25)),
@@ -223,6 +384,9 @@ class ResearchMVP:
                     seeds=int(thresholds.get("cross_seed_count", 9)),
                     min_median=float(thresholds.get("cross_seed_min", 0.15)),
                     max_spread=thresholds.get("cross_seed_max_spread", 0.65),
+                ),
+                RepeatedRefitValidator(
+                    seeds=int(thresholds.get("repeated_refit_count", 12)),
                 ),
             ]
             # Phase 1: pairwise candidate falsification
@@ -288,6 +452,7 @@ class ResearchMVP:
                     seed=seed,
                     target_transform=target_transform,
                     evaluation_metric=evaluation_metric,
+                    time_column=time_column,
                 )
                 reduced_specs = build_backward_eliminated_composites(
                     composite_specs,
@@ -309,6 +474,7 @@ class ResearchMVP:
                     seed=seed,
                     target_transform=target_transform,
                     evaluation_metric=evaluation_metric,
+                    time_column=time_column,
                 )
                 composite_falsifiers = [
                     ImprovementFalsifier(
@@ -322,6 +488,9 @@ class ResearchMVP:
                     ),
                     AblationFalsifier(
                         min_contribution=float(thresholds.get("ablation_min_contribution", 0.01))
+                    ),
+                    RepeatedRefitValidator(
+                        seeds=int(thresholds.get("repeated_refit_count", 12)),
                     ),
                 ]
                 phase2_ledger = Ledger(ledger_path, truncate=False)
@@ -733,10 +902,99 @@ class ResearchMVP:
             except Exception:
                 return False
 
+        # --- Association evidence + missingness receipts (per candidate) -----
+        # Computed from the full dataset, independent of predictive utility, so
+        # a real association is never collapsed into a single predictive score.
+        assoc_by_cid: dict[str, dict[str, Any] | None] = {}
+        missing_by_cid: dict[str, dict[str, Any] | None] = {}
+        if dataframe is not None:
+            for finding in findings_list:
+                cid = finding["candidate"]["id"]
+                payload = finding["candidate"].get("payload", {}) or {}
+                try:
+                    assoc_by_cid[cid] = _association_evidence(dataframe, payload)
+                except Exception:
+                    assoc_by_cid[cid] = None
+                try:
+                    missing_by_cid[cid] = _missingness_receipt(dataframe, payload)
+                except Exception:
+                    missing_by_cid[cid] = None
+
+        # --- Multivariable derived-variable / target-leakage detection -------
+        # Bounded scout-select + held-out validation: flag targets that are
+        # near-deterministically reconstructed from a small subset of columns.
+        derived_by_target: dict[str, dict[str, Any]] = {}
+        if domain is not None and getattr(domain, "scout", None) is not None and len(getattr(domain, "selection", [])) >= 5:
+            numeric_cols = list((plan.get("candidate_generation", {}) or {}).get("numeric_columns", []) or [])
+            if len(numeric_cols) >= 3:
+                try:
+                    from .derived import detect_multivariable_derived
+                    derived_by_target = detect_multivariable_derived(
+                        domain.scout, domain.selection, numeric_cols, numeric_cols
+                    )
+                except Exception:
+                    derived_by_target = {}
+
+        # Group derived-variable records into mutually-near-deterministic
+        # clusters (connected components over target↔source links). Within a
+        # collinear cluster the *constructed* column is NOT identifiable from
+        # values alone, so we flag the whole set and state that explicitly
+        # rather than singling out (or auto-contaminating) any one member.
+        _parent: dict[str, str] = {}
+
+        def _find(x: str) -> str:
+            _parent.setdefault(x, x)
+            while _parent[x] != x:
+                _parent[x] = _parent[_parent[x]]
+                x = _parent[x]
+            return x
+
+        def _union(a: str, b: str) -> None:
+            _parent[_find(a)] = _find(b)
+
+        for _tgt, _rec in derived_by_target.items():
+            for _s in _rec["source_variables"]:
+                _union(_tgt, _s)
+        derived_clusters: dict[str, dict[str, Any]] = {}
+        for _tgt, _rec in derived_by_target.items():
+            root = _find(_tgt)
+            cl = derived_clusters.setdefault(root, {"members": set(), "records": []})
+            cl["members"].update([_tgt, *_rec["source_variables"]])
+            cl["records"].append(_rec)
+
+        # --- Subgroup-reversal / regime-dependence detection ----------------
+        # For directional (linear_association) candidates, check whether the
+        # pooled direction reverses inside stable major subgroups of an eligible
+        # categorical conditioning variable (Simpson's paradox). If so, the
+        # universal directional claim must NOT be committed.
+        from .subgroup import detect_subgroup_reversal
+
+        eligible_conditioning = list(
+            (plan.get("candidate_generation", {}) or {}).get("categorical_columns", []) or []
+        )
+        min_group_n = int(thresholds.get("subgroup_min_group_n", 25))
+        subgroup_by_cid: dict[str, dict[str, Any] | None] = {}
+        if dataframe is not None and eligible_conditioning:
+            for finding in findings_list:
+                payload = finding["candidate"].get("payload", {}) or {}
+                if payload.get("kind") != "linear_association":
+                    continue
+                try:
+                    subgroup_by_cid[finding["candidate"]["id"]] = detect_subgroup_reversal(
+                        dataframe,
+                        str(payload.get("predictor")),
+                        str(payload.get("outcome")),
+                        eligible_conditioning,
+                        min_group_n=min_group_n,
+                    )
+                except Exception:
+                    subgroup_by_cid[finding["candidate"]["id"]] = None
+
         # --- Classification pre-pass ------------------------------------
         # Decide each finding's refined internal type (robust_relation /
         # promising_candidate / falsified_candidate / not_supported_candidate /
         # inconclusive_candidate / functional_form_rejected_candidate /
+        # supported_association_candidate / regime_dependent_candidate /
         # untestable_candidate) before doing any claim/evidence writes, so the
         # functional-form pass below can see which candidates in the same run
         # actually survived.
@@ -760,13 +1018,133 @@ class ResearchMVP:
                     is_explicit_predictive_claim=_is_predictive_claim(payload),
                     direction_conflict=_direction_conflict(cid, payload),
                 )
-                prelim[cid] = (ftype, diag)
+                # A composite whose ONLY killers are improvement/ablation did
+                # predict adequately — it just added no incremental value over
+                # the simpler model. That is redundancy, not a refutation, and
+                # must be reported distinctly from a model that failed
+                # validation (held_out / validation_resample).
+                killer_names = {a.get("name") for a in finding.get("falsifications", []) if a.get("killed")}
+                if payload.get("kind") == "composite_linear" and killer_names and killer_names <= {"improvement", "ablation"}:
+                    reasons = []
+                    if "improvement" in killer_names:
+                        reasons.append(
+                            "adding the extra predictor(s) did not beat the best single predictor by the "
+                            "required margin (no incremental value)"
+                        )
+                    if "ablation" in killer_names:
+                        reasons.append(
+                            "at least one predictor can be removed with no meaningful performance loss "
+                            "(redundant predictor)"
+                        )
+                    diag = dict(diag or {})
+                    diag["reason"] = (
+                        "The composite was not refuted; the simpler model dominates: " + "; ".join(reasons) + "."
+                    )
+                    diag["composite_failure_mode"] = sorted(killer_names)
+                    prelim[cid] = ("no_incremental_value_candidate", diag)
+                    continue
+                # A generated group effect that fails only the standalone
+                # predictive bar, but carries a real bootstrap-stable effect
+                # size, is a *supported association* (not merely "not
+                # supported"). Never upgrade an inconclusive (untrustworthy
+                # sample) or a hard refutation.
+                if (
+                    ftype == "not_supported_candidate"
+                    and payload.get("kind") == "group_difference"
+                    and _qualifies_as_supported_association(assoc_by_cid.get(cid))
+                ):
+                    diag = dict(diag or {})
+                    diag["reason"] = (
+                        "The group effect is a real, bootstrap-stable association (effect size "
+                        f"{assoc_by_cid.get(cid, {}).get('effect_size')}, omega² "
+                        f"{assoc_by_cid.get(cid, {}).get('omega_squared')}) but did not clear the "
+                        "standalone predictive-utility bar. Reported as a supported association with "
+                        "limited standalone predictive utility."
+                    )
+                    prelim[cid] = ("supported_association_candidate", diag)
+                else:
+                    prelim[cid] = (ftype, diag)
             else:
                 prelim[cid] = ("untestable_candidate", None)
+
+            # Subgroup reversal blocks any pooled directional verdict: whether
+            # or not the pooled fit would have committed, a universal directional
+            # claim cannot stand when it reverses inside the major subgroups.
+            reversal = subgroup_by_cid.get(cid)
+            if reversal:
+                prelim[cid] = ("regime_dependent_candidate", {"reason": reversal["reason"], "subgroup": reversal})
 
         overrides = apply_functional_form_overrides(
             [(finding, prelim[finding["candidate"]["id"]][0]) for finding in findings_list]
         )
+
+        # --- Preferred-form selection within each relationship family --------
+        # Linear + nonlinear forms of the same predictor→outcome pair form one
+        # family. Among the SURVIVING forms pick a preferred one on held-out
+        # score (never in-sample), preferring the SIMPLER form unless a more
+        # complex form beats it by a configured margin — so a quadratic/log-log
+        # is only "preferred" when it genuinely generalises better.
+        from .semantics import _candidate_family_key
+        from .table_domain import FORM_COMPLEXITY
+
+        min_form_improvement = float(thresholds.get("preferred_form_min_improvement", 0.01))
+        survivor_prelim = {"robust_relation", "promising_candidate"}
+
+        def _held_out(finding: dict[str, Any]) -> float:
+            for a in finding.get("falsifications", []):
+                if a.get("name") == "held_out":
+                    return float((a.get("detail", {}) or {}).get("score") or 0.0)
+            return 0.0
+
+        family_members: dict[Any, list[dict[str, Any]]] = {}
+        for finding in findings_list:
+            payload = finding["candidate"].get("payload", {}) or {}
+            if payload.get("kind") not in ("linear_association", "nonlinear_association"):
+                continue
+            key = _candidate_family_key(payload)
+            if key is None:
+                continue
+            cid = finding["candidate"]["id"]
+            family_members.setdefault(key, []).append({
+                "cid": cid,
+                "form": payload.get("form", "linear"),
+                "prelim": prelim[cid][0],
+                "held_out": _held_out(finding),
+                "assoc": assoc_by_cid.get(cid),
+            })
+
+        model_family_by_cid: dict[str, dict[str, Any]] = {}
+        for key, members in family_members.items():
+            if len(members) < 2:
+                continue
+            survivors_in_family = [m for m in members if m["prelim"] in survivor_prelim]
+            preferred_cid = None
+            preferred_form = None
+            if survivors_in_family:
+                top = max(m["held_out"] for m in survivors_in_family)
+                within = [m for m in survivors_in_family if top - m["held_out"] <= min_form_improvement]
+                pref = min(within, key=lambda m: (FORM_COMPLEXITY.get(m["form"], 2), -m["held_out"]))
+                preferred_cid, preferred_form = pref["cid"], pref["form"]
+            member_summ = [
+                {"candidate_id": m["cid"], "form": m["form"], "verdict_group": m["prelim"],
+                 "held_out_score": round(m["held_out"], 4)}
+                for m in members
+            ]
+            for m in members:
+                info: dict[str, Any] = {
+                    "family_size": len(members),
+                    "form": m["form"],
+                    "members": member_summ,
+                    "preferred_candidate_id": preferred_cid,
+                    "preferred_form": preferred_form,
+                    "is_preferred": m["cid"] == preferred_cid,
+                }
+                assoc = m.get("assoc") or {}
+                if m["form"] == "log_log" and assoc.get("power_law_exponent") is not None:
+                    info["power_law_exponent"] = assoc["power_law_exponent"]
+                if preferred_form == "log_log" and m["cid"] == preferred_cid and assoc.get("power_law_exponent") is not None:
+                    info["preferred_power_law_exponent"] = assoc["power_law_exponent"]
+                model_family_by_cid[m["cid"]] = info
 
         # --- Full-data diagnostic score (report-only, never gates anything) ---
         full_data_scores: dict[str, float | None] = {}
@@ -874,6 +1252,10 @@ class ResearchMVP:
                 functional_form_override=functional_form_override,
                 full_data_score=full_data_scores.get(candidate["id"]),
                 is_predictive_claim=_is_predictive_claim(payload),
+                association_evidence=assoc_by_cid.get(candidate["id"]),
+                missingness=missing_by_cid.get(candidate["id"]),
+                model_family=model_family_by_cid.get(candidate["id"]),
+                subgroup_warning=subgroup_by_cid.get(candidate["id"]),
             )
             self.store.link_claim(
                 case_id=case_id,
@@ -896,6 +1278,67 @@ class ResearchMVP:
                     metadata={"case_id": case_id, "run_id": case_run_id},
                     actor="research-compiler",
                     actor_role=ActorRole.TOOL,
+                )
+
+        # Scoped per-subgroup claims for every detected reversal: the pooled
+        # directional claim is blocked (regime_dependent) and the real
+        # within-subgroup associations are recorded as supported scoped claims.
+        for cid, reversal in subgroup_by_cid.items():
+            if not reversal:
+                continue
+            for si, scoped in enumerate(reversal.get("scoped_claims", []), start=1):
+                scoped_claim_id, _ = self.memory.resolve_or_create_claim(
+                    scoped["statement"],
+                    scope={
+                        "dataset_sha256": dataset_file["sha256"],
+                        "conditioning_variable": scoped["group_col"],
+                        "group_value": scoped["group_value"],
+                        "direction": scoped["direction"],
+                        "type": "scoped_association",
+                    },
+                    claim_type="research_finding",
+                    metadata={
+                        "case_id": case_id,
+                        "generated_from_case": case_id,
+                        "parent_candidate_id": cid,
+                        "conditioning_variable": scoped["group_col"],
+                    },
+                )
+                evidence = self.ledger.add_evidence(
+                    f"file://{dataset_file['stored_path']}",
+                    scoped["statement"],
+                    source_kind=EvidenceKind.DATASET,
+                    independence_key=f"dataset:{dataset_file['sha256']}:scoped:{cid}:{scoped['group_value']}",
+                    content=json.dumps(scoped, sort_keys=True),
+                    metadata={"case_id": case_id, "conditioning_variable": scoped["group_col"]},
+                )
+                self.ledger.attest(scoped_claim_id, evidence, Stance.SUPPORT,
+                                   actor="subgroup-reversal-detector", actor_role=ActorRole.TOOL)
+                self.memory.synchronize_status(scoped_claim_id, rationale="Scoped within-subgroup association")
+                claim_ids.append(scoped_claim_id)
+                self.store.link_claim(
+                    case_id=case_id,
+                    run_id=case_run_id,
+                    claim_id=scoped_claim_id,
+                    finding_type="scoped_association",
+                    source_candidate_id=f"scoped:{cid}:{si}",
+                    finding_detail={
+                        "hypothesis_text": scoped["statement"],
+                        "finding_type": "scoped_association",
+                        "verdict": "supported_association",
+                        "is_candidate_hypothesis": False,
+                        "association_evidence": {
+                            "effect_size_metric": "within_group_slope_sign",
+                            "direction": scoped["direction"],
+                            "sign_stability": scoped["sign_stability"],
+                            "n": scoped["n"],
+                        },
+                        "scope": {
+                            "conditioning_variable": scoped["group_col"],
+                            "group_value": scoped["group_value"],
+                        },
+                        "parent_candidate_id": cid,
+                    },
                 )
 
         artifact_count = 0
@@ -947,19 +1390,108 @@ class ResearchMVP:
             )
             self.ledger.attest(claim_id, evidence, Stance.SUPPORT, actor="artifact-detector", actor_role=ActorRole.TOOL)
             claim_ids.append(claim_id)
+            artifact_detail: dict[str, Any] = {
+                "hypothesis_text": artifact["statement"],
+                "finding_type": "artifact",
+                "verdict": "artifact",
+                "artifact_kind": artifact.get("artifact_kind"),
+                "detail": artifact.get("detail", ""),
+                "is_candidate_hypothesis": True,
+            }
+            if artifact.get("artifact_kind") in ("near_duplicate_copy", "near_copy_affine"):
+                artifact_detail["artifact_warning"] = {
+                    "type": "target_leakage_near_copy",
+                    "leakage_risk": artifact.get("leakage_risk", "high"),
+                    "similarity_metric": artifact.get("similarity_metric"),
+                    "similarity": artifact.get("similarity"),
+                    "correlation": artifact.get("correlation"),
+                    "residual_variance_ratio": artifact.get("residual_variance_ratio"),
+                    "suspected_source_column": artifact.get("suspected_source_column"),
+                    "derived_column_candidate": artifact.get("derived_column_candidate"),
+                    "disposition": artifact.get("disposition", "downgraded_to_artifact"),
+                    "columns": artifact.get("columns"),
+                    # For a symmetric near-copy the derivation direction cannot be
+                    # determined from values alone, so neither column's other
+                    # relationships are auto-contaminated (the source is not flagged).
+                    "derivation_direction": "undetermined",
+                }
             self.store.link_claim(
                 case_id=case_id,
                 run_id=case_run_id,
                 claim_id=claim_id,
                 finding_type="artifact",
                 source_candidate_id=artifact["id"],
+                finding_detail=artifact_detail,
+            )
+            artifact_count += 1
+
+        # Multivariable derived-variable artifacts: one per near-deterministic
+        # dependency cluster. The constructed column cannot be identified from
+        # values alone, so every member is named as a candidate and the
+        # direction is stated as undetermined (no member is auto-contaminated).
+        for _root, cluster in derived_clusters.items():
+            members = sorted(cluster["members"])
+            best_rec = max(cluster["records"], key=lambda r: r["held_out_r2"])
+            statement = (
+                f"Columns [{', '.join(members)}] are mutually near-deterministic — at least one is a "
+                f"likely constructed/derived index ({best_rec['construction']}), reconstructed from the "
+                f"others at held-out R²={best_rec['held_out_r2']} (residual variance ratio="
+                f"{best_rec['residual_variance_ratio']}). Which column is the derived index cannot be "
+                f"determined from the data alone; treat this set as artifact-contaminated, not as "
+                f"independent discoveries."
+            )
+            d_claim_id, _ = self.memory.resolve_or_create_claim(
+                statement,
+                scope={
+                    "dataset_sha256": dataset_file["sha256"],
+                    "artifact_kind": "likely_derived_variable",
+                    "members": members,
+                },
+                claim_type="structural_artifact",
+                metadata={"case_id": case_id, "artifact_kind": "likely_derived_variable"},
+            )
+            evidence = self.ledger.add_evidence(
+                f"file://{dataset_file['stored_path']}",
+                statement,
+                source_kind=EvidenceKind.DATASET,
+                independence_key=f"dataset:{dataset_file['sha256']}:derived:{'|'.join(members)}",
+                content=json.dumps({"members": members, "records": cluster["records"]}, sort_keys=True),
+                metadata={"case_id": case_id, "artifact_kind": "likely_derived_variable"},
+            )
+            self.ledger.attest(d_claim_id, evidence, Stance.SUPPORT,
+                               actor="multivariable-derived-detector", actor_role=ActorRole.TOOL)
+            self.memory.synchronize_status(d_claim_id, rationale="Multivariable derived-variable artifact")
+            claim_ids.append(d_claim_id)
+            self.store.link_claim(
+                case_id=case_id,
+                run_id=case_run_id,
+                claim_id=d_claim_id,
+                finding_type="artifact",
+                source_candidate_id=f"derived:{'|'.join(members)}",
                 finding_detail={
-                    "hypothesis_text": artifact["statement"],
+                    "hypothesis_text": statement,
                     "finding_type": "artifact",
                     "verdict": "artifact",
-                    "artifact_kind": artifact.get("artifact_kind"),
-                    "detail": artifact.get("detail", ""),
+                    "artifact_kind": "likely_derived_variable",
                     "is_candidate_hypothesis": True,
+                    "artifact_warning": {
+                        "type": "likely_derived_variable",
+                        "leakage_risk": "high",
+                        "member_columns": members,
+                        "derivation_direction": "undetermined",
+                        "best_reconstruction": {
+                            "target_candidate": best_rec["target"],
+                            "source_variables": best_rec["source_variables"],
+                            "coefficients": best_rec["coefficients"],
+                            "held_out_r2": best_rec["held_out_r2"],
+                            "residual_variance_ratio": best_rec["residual_variance_ratio"],
+                            "best_single_predictor_r2": best_rec["best_single_predictor_r2"],
+                            "margin_over_best_single": best_rec["margin_over_best_single"],
+                            "refit_median_r2": best_rec["refit_median_r2"],
+                            "construction": best_rec["construction"],
+                        },
+                        "disposition": "artifact_qualified",
+                    },
                 },
             )
             artifact_count += 1

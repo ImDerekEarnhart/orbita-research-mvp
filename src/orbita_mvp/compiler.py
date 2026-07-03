@@ -143,12 +143,39 @@ class ResearchCompiler:
         identifier_columns = [
             c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "identifier"
         ]
+        # Temporal-index columns stay AVAILABLE for mining (not excluded like
+        # identifiers). A clear ordered calendar/sequence axis additionally drives
+        # chronological (time-ordered) validation.
+        from .ingestion import CHRONO_AXIS_KINDS
+        temporal_columns = [
+            c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "temporal_index"
+        ]
+        chronological_axis = next(
+            (
+                c["name"]
+                for c in profile.get("column_profiles", [])
+                if c.get("inferred_role") == "temporal_index"
+                and (c.get("temporal_signals", {}) or {}).get("is_ordered_axis")
+                and (c.get("temporal_signals", {}) or {}).get("axis_kind") in CHRONO_AXIS_KINDS
+            ),
+            None,
+        )
+        near_copy_r2 = 0.999
+        near_copy_corr = 0.9995
+        # Separate budget for nonlinear family members so they never crowd
+        # linear/group candidates out of the shared cap (candidate-family budgeting).
+        nonlinear_budget = max(20, max_candidates)
+        max_nonlinear_per_family = 4
         candidates, generation = generate_table_candidates(
             df,
             goal=case.get("goal", ""),
             max_candidates=max_candidates,
             exclude_columns=identifier_columns,
             target_column=target_column,
+            near_copy_r2=near_copy_r2,
+            near_copy_corr=near_copy_corr,
+            nonlinear_budget=nonlinear_budget,
+            max_nonlinear_per_family=max_nonlinear_per_family,
         )
         # Augment generation dict with all partition fractions so the service
         # can reconstruct the exact same split as candidate generation used.
@@ -175,6 +202,8 @@ class ResearchCompiler:
             "data_profile": profile,
             "quality_findings": quality_findings,
             "excluded_from_candidate_generation": identifier_columns,
+            "temporal_columns": temporal_columns,
+            "chronological_axis": chronological_axis,
             "candidate_generation": generation,
             "structural_relations": generation.get("structural_relations", []),
             "routes": ["uploaded_table_association", "data_quality_audit", "belief_graph_import"],
@@ -191,6 +220,21 @@ class ResearchCompiler:
                 "cross_seed_count": 9,
                 "cross_seed_min": 0.15,
                 "cross_seed_max_spread": 0.65,
+                # Number of independent fresh-partition refits used by the
+                # diagnostic-only RepeatedRefitValidator (model reproducibility).
+                "repeated_refit_count": 12,
+                # A more complex form (e.g. quadratic, log-log) is only chosen as
+                # the preferred member of a relationship family when it beats the
+                # simplest within-margin form's held-out score by at least this.
+                "preferred_form_min_improvement": 0.01,
+                # Minimum per-subgroup sample size for a conditioning variable to
+                # be analysed by the subgroup-reversal / regime-dependence guard.
+                "subgroup_min_group_n": 25,
+                # Near-copy / target-leakage band: a column pair with affine R²
+                # AND |correlation| above these (but not machine-exact) is
+                # downgraded to an artifact instead of mined as a discovery.
+                "near_copy_r2": near_copy_r2,
+                "near_copy_corr": near_copy_corr,
                 "composite_min_predictors": 2,
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,
@@ -281,12 +325,22 @@ class ResearchCompiler:
                     }
                 )
             if column.get("inferred_role") == "identifier":
+                signals = column.get("identifier_signals", {}) or {}
+                shape = signals.get("shape", "near-unique")
+                uniq = signals.get("uniqueness")
+                uniq_txt = f" ({uniq:.0%} unique)" if isinstance(uniq, (int, float)) else ""
                 findings.append(
                     {
                         "type": "artifact_guard",
                         "severity": "low",
                         "title": f"Identifier excluded: {column['name']}",
-                        "detail": "The column appears unique per row and is excluded from automatic relation mining.",
+                        "detail": (
+                            f"Detected as a likely row identifier (shape: {shape}{uniq_txt}) and "
+                            f"excluded from automatic relation mining. It is recorded as a data-quality "
+                            f"artifact rather than silently dropped."
+                        ),
+                        "identifier_signals": signals,
+                        "column": column["name"],
                     }
                 )
         return findings

@@ -83,6 +83,11 @@ def _coefficients_from_model(model: dict, payload: dict) -> tuple[float, dict[st
         order = list(model["predictors"])
         coefs = {p: float(model["coefficients"][p]) for p in order}
         return intercept, coefs, order
+    elif kind == "nonlinear_association":
+        params = model.get("params", {}) or {}
+        order = [k for k in params if k != "intercept"]
+        coefs = {k: float(params[k]) for k in order}
+        return intercept, coefs, order
     raise ValueError(f"Artifact serialization not supported for kind={kind!r}")
 
 
@@ -108,6 +113,13 @@ def model_from_artifact(artifact: dict[str, Any], payload: dict[str, Any]) -> di
             "coefficients": artifact["coefficients"],
             "predictors": artifact["predictor_order"],
             "target_transform": artifact.get("target_transform"),
+        }
+    elif kind == "nonlinear_association":
+        return {
+            "kind": kind, "valid": True,
+            "form": artifact.get("form") or payload.get("form"),
+            "intercept": intercept,
+            "params": {"intercept": intercept, **artifact["coefficients"]},
         }
     return {"kind": kind, "valid": False}
 
@@ -160,6 +172,7 @@ def serialize_selection_artifact(
         "selected_model_id": candidate["id"],
         "outcome": outcome,
         "kind": kind,
+        "form": payload.get("form"),
         "predictor_order": predictor_order,
         "intercept": intercept,
         "coefficients": coefficients,
@@ -241,6 +254,7 @@ def serialize_deployment_artifact(
         "selected_model_id": candidate["id"],
         "outcome": outcome,
         "kind": kind,
+        "form": payload.get("form"),
         "predictor_order": predictor_order,
         "intercept": intercept,
         "coefficients": coefficients,
