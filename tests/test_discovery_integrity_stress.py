@@ -207,6 +207,79 @@ def test_stress_sparse_sensor_missingness_receipt_and_effective_n():
                for c in qf), "sparse_sensor high-missingness receipt must be present"
 
 
+# ---------------------------------------------------------------------------
+# Generic unit test — nonlinear forms are scored in original units and recover
+# the true power-law exponent.
+# ---------------------------------------------------------------------------
+
+def test_fit_form_recovers_power_law_exponent_in_original_space():
+    from orbita_mvp.table_domain import _fit_form
+
+    rng = np.random.default_rng(3)
+    x = rng.uniform(1, 50, size=400)
+    y = 4.5 * x ** 0.73 * np.exp(rng.normal(scale=0.03, size=400))  # power law + small noise
+
+    ll = _fit_form(x, y, "log_log")
+    assert ll is not None
+    assert abs(ll["exponent"] - 0.73) < 0.05
+    # Original-space R² must be high and comparable to a linear fit's R².
+    assert ll["r2"] > 0.9
+
+    quad = _fit_form(x, y, "quadratic")
+    assert quad is not None and quad["r2"] > 0.9
+
+    # Log of non-positive values is inapplicable, not a crash.
+    yneg = y - y.mean()
+    assert _fit_form(x, yneg, "log_y") is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end stress-CSV assertions available after Commit 2 (nonlinear families)
+# ---------------------------------------------------------------------------
+
+@_needs_stress
+def test_stress_power_law_family_grouped_and_preferred_exponent():
+    claims, _counts, _plan = _run_stress()
+    fam = _by_text(claims, "energy_rate", "mass_kg")
+    forms = {c["finding_detail"].get("model_family", {}).get("form") for c in fam
+             if c["finding_detail"].get("model_family")}
+    # Raw linear and the log-log power law are members of ONE family.
+    assert {"linear", "log_log"} <= forms, forms
+    # The power-law form is preferred and its exponent is close to the true 0.73.
+    loglog = [c for c in fam if c["finding_detail"].get("model_family", {}).get("form") == "log_log"]
+    assert loglog
+    mf = loglog[0]["finding_detail"]["model_family"]
+    assert mf["preferred_form"] == "log_log", mf
+    assert mf["is_preferred"] is True
+    exp = mf.get("power_law_exponent") or mf.get("preferred_power_law_exponent")
+    assert exp is not None and 0.6 <= exp <= 0.85, exp
+    # Both forms survived; the raw linear is supported but not preferred.
+    linear = [c for c in fam if c["finding_detail"].get("model_family", {}).get("form") == "linear"]
+    assert linear and linear[0]["verdict"] == "committed"
+    assert linear[0]["finding_detail"]["model_family"]["is_preferred"] is False
+
+
+@_needs_stress
+def test_stress_temperature_quadratic_preferred_linear_is_functional_form_rejected():
+    claims, _counts, _plan = _run_stress()
+    fam = _by_text(claims, "temperature_c", "growth_index")
+    assert fam, "temperature/growth family must be generated (nonlinear screen)"
+
+    quad = [c for c in fam if "quadratic" in c["canonical_text"]]
+    assert quad, "a quadratic form must be generated for the inverted-U relationship"
+    assert quad[0]["verdict"] == "committed"
+    assert quad[0]["finding_detail"]["model_family"]["is_preferred"] is True
+
+    linear = [c for c in fam if c["finding_detail"].get("model_family", {}).get("form") == "linear"]
+    assert linear, "the raw linear form must be present as a family member"
+    lc = linear[0]
+    # The failed linear fit is a wrong functional form, NOT a refutation of the
+    # underlying relationship.
+    assert lc["verdict"] == "functional_form_rejected"
+    assert lc["verdict"] != "rejected"
+    assert lc["finding_detail"].get("alternative_candidate_id"), "must point at the surviving curved sibling"
+
+
 @_needs_stress
 def test_stress_every_finding_has_both_validator_summaries():
     claims, _counts, _plan = _run_stress()

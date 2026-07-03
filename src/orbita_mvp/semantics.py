@@ -311,11 +311,14 @@ def _candidate_family_key(payload: dict[str, Any]) -> tuple[str, ...] | None:
     if not outcome:
         return None
     outcome_base = _strip_transform_prefix(str(outcome))
-    if kind == "linear_association":
+    # Linear and nonlinear (quadratic / log-x / log-y / log-log) forms of the
+    # same predictor→outcome pair are members of ONE relationship family, so a
+    # killed form can be linked to a surviving sibling form of the same pair.
+    if kind in ("linear_association", "nonlinear_association"):
         predictor = payload.get("predictor")
         if not predictor:
             return None
-        return (kind, _strip_transform_prefix(str(predictor)), outcome_base)
+        return ("assoc", _strip_transform_prefix(str(predictor)), outcome_base)
     if kind == "composite_linear":
         predictors = payload.get("predictors") or []
         bases = tuple(sorted(_strip_transform_prefix(str(p)) for p in predictors))
@@ -558,7 +561,9 @@ def derive_finding_record(
         "full_data_score_diagnostic": full_data_score,
     }
     record["functional_form_stability"] = {
-        "model_family": (model_family or {}).get("family") if model_family else None,
+        "form": (model_family or {}).get("form") if model_family else None,
+        "preferred_form": (model_family or {}).get("preferred_form") if model_family else None,
+        "is_preferred_form": (model_family or {}).get("is_preferred") if model_family else None,
         "validation_resample": resample,
         "repeated_refit": repeated,
         "direction_stability": (repeated or {}).get("direction_stability") if repeated else None,

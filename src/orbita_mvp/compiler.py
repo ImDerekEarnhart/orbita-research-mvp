@@ -194,6 +194,10 @@ class ResearchCompiler:
                 # Number of independent fresh-partition refits used by the
                 # diagnostic-only RepeatedRefitValidator (model reproducibility).
                 "repeated_refit_count": 12,
+                # A more complex form (e.g. quadratic, log-log) is only chosen as
+                # the preferred member of a relationship family when it beats the
+                # simplest within-margin form's held-out score by at least this.
+                "preferred_form_min_improvement": 0.01,
                 "composite_min_predictors": 2,
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,

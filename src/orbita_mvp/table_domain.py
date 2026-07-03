@@ -42,6 +42,138 @@ def _r2(y: np.ndarray, pred: np.ndarray) -> float:
     return max(-1.0, min(1.0, score))
 
 
+# ---------------------------------------------------------------------------
+# Nonlinear candidate families (quadratic / log-x / log-y / log-log power law).
+#
+# Every form is fit in its natural space but ALWAYS SCORED in the original
+# outcome units (predictions inverted back before R²) so scores are directly
+# comparable across forms of the same relationship — a log fit gets no unfair
+# advantage from being evaluated in log space (see metrics.py note).
+# ---------------------------------------------------------------------------
+
+# Model complexity (free parameters) per form, for complexity-aware selection.
+FORM_COMPLEXITY = {"linear": 2, "log_x": 2, "log_y": 2, "log_log": 2, "quadratic": 3}
+_NONLINEAR_FORMS = ("quadratic", "log_x", "log_y", "log_log")
+
+
+def _fit_form(x: np.ndarray, y: np.ndarray, form: str) -> dict[str, Any] | None:
+    """Fit ``form`` and return ``{params, r2}`` with r2 in ORIGINAL y units.
+
+    Returns None when the form is inapplicable (e.g. log of non-positive values)
+    or degenerate.
+    """
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 5 or np.ptp(x) <= 1e-12:
+        return None
+    if form == "quadratic":
+        X = np.column_stack([np.ones(len(x)), x, x ** 2])
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        pred = X @ beta
+        return {"params": {"intercept": float(beta[0]), "b1": float(beta[1]), "b2": float(beta[2])},
+                "r2": _r2(y, pred)}
+    if form == "log_x":
+        if np.any(x <= 0):
+            return None
+        lx = np.log(x)
+        X = np.column_stack([np.ones(len(lx)), lx])
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        pred = X @ beta
+        return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])}, "r2": _r2(y, pred)}
+    if form == "log_y":
+        if np.any(y <= 0):
+            return None
+        ly = np.log(y)
+        X = np.column_stack([np.ones(len(x)), x])
+        beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
+        pred = np.exp(X @ beta)
+        return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])}, "r2": _r2(y, pred)}
+    if form == "log_log":
+        if np.any(x <= 0) or np.any(y <= 0):
+            return None
+        lx, ly = np.log(x), np.log(y)
+        X = np.column_stack([np.ones(len(lx)), lx])
+        beta, *_ = np.linalg.lstsq(X, ly, rcond=None)
+        pred = np.exp(X @ beta)
+        # slope in log-log space is the power-law exponent.
+        return {"params": {"intercept": float(beta[0]), "slope": float(beta[1])},
+                "r2": _r2(y, pred), "exponent": float(beta[1])}
+    return None
+
+
+def _predict_form(x: np.ndarray, form: str, params: dict[str, float]) -> np.ndarray | None:
+    """Predict outcome values in ORIGINAL units for ``form`` given stored params."""
+    with np.errstate(all="ignore"):
+        if form == "quadratic":
+            return params["intercept"] + params["b1"] * x + params["b2"] * x ** 2
+        if form == "log_x":
+            out = np.full_like(x, np.nan, dtype=float)
+            ok = x > 0
+            out[ok] = params["intercept"] + params["slope"] * np.log(x[ok])
+            return out
+        if form == "log_y":
+            return np.exp(params["intercept"] + params["slope"] * x)
+        if form == "log_log":
+            out = np.full_like(x, np.nan, dtype=float)
+            ok = x > 0
+            out[ok] = np.exp(params["intercept"] + params["slope"] * np.log(x[ok]))
+            return out
+    return None
+
+
+def _nonlinear_statement(predictor: str, outcome: str, form: str, params: dict[str, float]) -> str:
+    if form == "quadratic":
+        return f"{outcome} has a quadratic (single-peak/curved) relationship with {predictor}."
+    if form == "log_x":
+        return f"{outcome} varies with the logarithm of {predictor} (diminishing-returns relationship)."
+    if form == "log_y":
+        return f"{outcome} grows exponentially with {predictor} (log {outcome} is linear in {predictor})."
+    if form == "log_log":
+        exp = params.get("slope")
+        exp_txt = f" with exponent ≈ {exp:.3g}" if isinstance(exp, (int, float)) else ""
+        return f"{outcome} follows an approximate power law in {predictor} ({outcome} ≈ a·{predictor}^b){exp_txt}."
+    return f"{outcome} has a nonlinear ({form}) relationship with {predictor}."
+
+
+def _nonlinear_form_specs(
+    scout: pd.DataFrame,
+    predictor: str,
+    outcome: str,
+    *,
+    screen_r2: float = 0.2,
+) -> list[tuple[float, dict[str, Any]]]:
+    """Fit each nonlinear form on the scout partition; emit specs that clear the screen."""
+    x = pd.to_numeric(scout[predictor], errors="coerce").to_numpy(float)
+    y = pd.to_numeric(scout[outcome], errors="coerce").to_numpy(float)
+    out: list[tuple[float, dict[str, Any]]] = []
+    for form in _NONLINEAR_FORMS:
+        fit = _fit_form(x, y, form)
+        if not fit:
+            continue
+        r2 = fit["r2"]
+        if not math.isfinite(r2) or r2 < screen_r2:
+            continue
+        spec = {
+            "id": _candidate_id("nlform", predictor, outcome, form),
+            "statement": _nonlinear_statement(predictor, outcome, form, fit["params"]),
+            "kind": "nonlinear_association",
+            "predictor": predictor,
+            "outcome": outcome,
+            "form": form,
+            "scout_metric": {
+                "r2": round(r2, 6),
+                "params": {k: round(v, 6) for k, v in fit["params"].items()},
+                "complexity": FORM_COMPLEXITY.get(form),
+                "n": int(np.isfinite(x).sum()),
+            },
+            "parents": [],
+        }
+        if "exponent" in fit:
+            spec["scout_metric"]["exponent"] = round(fit["exponent"], 6)
+        out.append((r2, spec))
+    return out
+
+
 def _goal_columns(goal: str, columns: Iterable[str]) -> list[str]:
     normalized_goal = re.sub(r"[^a-z0-9]+", " ", goal.lower())
     found = []
@@ -160,9 +292,11 @@ def generate_table_candidates(
             if len(pair) < 5 or pair[x].nunique() < 3 or pair[y].nunique() < 3:
                 continue
             r = float(pair[x].corr(pair[y]))
-            if not math.isfinite(r) or abs(r) < 0.2:
+            if not math.isfinite(r):
                 continue
-            direction = "positive" if r >= 0 else "negative"
+            # Orientation is independent of the linear-correlation strength, so
+            # nonlinear forms can be screened even when |r| ≈ 0 (e.g. a
+            # symmetric inverted-U has near-zero linear correlation).
             # Explicit target takes precedence over goal_columns direction.
             if target_column and y == target_column:
                 predictor, outcome = x, y
@@ -177,6 +311,23 @@ def generate_table_candidates(
             # Hard guard: target_column must not be a predictor.
             if target_column and predictor == target_column:
                 continue
+
+            # Nonlinear candidate family (quadratic / log-x / log-y / log-log).
+            # Members of the same relationship family as the linear form; the
+            # selection layer picks the preferred form after falsification.
+            nonlinear_specs = _nonlinear_form_specs(scout, predictor, outcome)
+            for nl_score, nl_spec in nonlinear_specs:
+                scored.append((float(nl_score), nl_spec))
+
+            # Emit the linear form when it clears its own correlation screen OR
+            # when a nonlinear sibling exists — so a family always includes the
+            # raw linear baseline. A weak linear form (e.g. the failed linear
+            # fit of an inverted-U) is then killed and reclassified as
+            # functional_form_rejected against the surviving curved sibling,
+            # rather than the underlying relationship being called refuted.
+            if abs(r) < 0.2 and not nonlinear_specs:
+                continue
+            direction = "positive" if r >= 0 else "negative"
             spec = {
                 "id": _candidate_id("linear", predictor, outcome),
                 "statement": f"{predictor} and {outcome} show a stable {direction} linear association.",
@@ -470,6 +621,23 @@ class UploadedTableDomain:
             temp = pd.DataFrame({"g": train[group].astype(str), "y": pd.to_numeric(train[outcome], errors="coerce")}).dropna()
             means = {str(label): float(part["y"].mean()) for label, part in temp.groupby("g")}
             return {"kind": kind, "valid": bool(means), "means": means, "overall": float(temp["y"].mean()) if len(temp) else 0.0}
+        if kind == "nonlinear_association":
+            form = c.payload["form"]
+            x_name, y_name = c.payload["predictor"], c.payload["outcome"]
+            x_s = pd.to_numeric(train[x_name], errors="coerce")
+            y_s = pd.to_numeric(train[y_name], errors="coerce")
+            mask = x_s.notna() & y_s.notna()
+            if mask.sum() < 5:
+                return {"kind": kind, "valid": False}
+            fit = _fit_form(x_s[mask].to_numpy(float), y_s[mask].to_numpy(float), form)
+            if fit is None:
+                return {"kind": kind, "valid": False}
+            params = fit["params"]
+            return {
+                "kind": kind, "valid": True, "form": form,
+                "intercept": float(params.get("intercept", 0.0)),
+                "params": params,
+            }
         return {"kind": kind, "valid": False}
 
     def _predict_raw(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> np.ndarray | None:
@@ -513,6 +681,24 @@ class UploadedTableDomain:
                 return None
             pred = np.array([model["means"].get(label, model["overall"]) for label in temp["g"]], dtype=float)
             return np.stack([temp["y"].to_numpy(float), pred])
+
+        if kind == "nonlinear_association":
+            x_name, y_name = c.payload["predictor"], c.payload["outcome"]
+            x_s = pd.to_numeric(test[x_name], errors="coerce")
+            y_s = pd.to_numeric(test[y_name], errors="coerce")
+            mask = x_s.notna() & y_s.notna()
+            if mask.sum() < 3:
+                return None
+            pred = _predict_form(x_s[mask].to_numpy(float), model["form"], model["params"])
+            if pred is None:
+                return None
+            y_true = y_s[mask].to_numpy(float)
+            # Nonlinear forms predict in ORIGINAL outcome units already; return
+            # them directly (score() computes R² in that comparable space).
+            valid = np.isfinite(pred) & np.isfinite(y_true)
+            if valid.sum() < 3:
+                return None
+            return np.stack([y_true[valid], pred[valid]])
         return None
 
     def score(self, c: Candidate, model: dict[str, Any], test: pd.DataFrame) -> float:

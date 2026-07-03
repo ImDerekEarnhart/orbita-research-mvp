@@ -89,6 +89,26 @@ def _association_evidence(df: pd.DataFrame, payload: dict[str, Any], *, seed: in
             "bootstrap_sign_stability": sign_stability,
             "n": int(len(xa)),
         }
+    if kind == "nonlinear_association":
+        from .table_domain import _fit_form
+        pred, out = payload.get("predictor"), payload.get("outcome")
+        form = payload.get("form")
+        if pred not in df.columns or out not in df.columns:
+            return None
+        x = pd.to_numeric(df[pred], errors="coerce").to_numpy(float)
+        y = pd.to_numeric(df[out], errors="coerce").to_numpy(float)
+        fit = _fit_form(x, y, form)
+        if not fit:
+            return None
+        evidence = {
+            "effect_size_metric": f"r2_{form}",
+            "effect_size": round(float(fit["r2"]), 4),
+            "form": form,
+            "n": int(np.isfinite(x).sum()),
+        }
+        if "exponent" in fit:
+            evidence["power_law_exponent"] = round(float(fit["exponent"]), 4)
+        return evidence
     if kind == "group_difference":
         group, out = payload.get("group"), payload.get("outcome")
         if group not in df.columns or out not in df.columns:
@@ -949,6 +969,74 @@ class ResearchMVP:
             [(finding, prelim[finding["candidate"]["id"]][0]) for finding in findings_list]
         )
 
+        # --- Preferred-form selection within each relationship family --------
+        # Linear + nonlinear forms of the same predictor→outcome pair form one
+        # family. Among the SURVIVING forms pick a preferred one on held-out
+        # score (never in-sample), preferring the SIMPLER form unless a more
+        # complex form beats it by a configured margin — so a quadratic/log-log
+        # is only "preferred" when it genuinely generalises better.
+        from .semantics import _candidate_family_key
+        from .table_domain import FORM_COMPLEXITY
+
+        min_form_improvement = float(thresholds.get("preferred_form_min_improvement", 0.01))
+        survivor_prelim = {"robust_relation", "promising_candidate"}
+
+        def _held_out(finding: dict[str, Any]) -> float:
+            for a in finding.get("falsifications", []):
+                if a.get("name") == "held_out":
+                    return float((a.get("detail", {}) or {}).get("score") or 0.0)
+            return 0.0
+
+        family_members: dict[Any, list[dict[str, Any]]] = {}
+        for finding in findings_list:
+            payload = finding["candidate"].get("payload", {}) or {}
+            if payload.get("kind") not in ("linear_association", "nonlinear_association"):
+                continue
+            key = _candidate_family_key(payload)
+            if key is None:
+                continue
+            cid = finding["candidate"]["id"]
+            family_members.setdefault(key, []).append({
+                "cid": cid,
+                "form": payload.get("form", "linear"),
+                "prelim": prelim[cid][0],
+                "held_out": _held_out(finding),
+                "assoc": assoc_by_cid.get(cid),
+            })
+
+        model_family_by_cid: dict[str, dict[str, Any]] = {}
+        for key, members in family_members.items():
+            if len(members) < 2:
+                continue
+            survivors_in_family = [m for m in members if m["prelim"] in survivor_prelim]
+            preferred_cid = None
+            preferred_form = None
+            if survivors_in_family:
+                top = max(m["held_out"] for m in survivors_in_family)
+                within = [m for m in survivors_in_family if top - m["held_out"] <= min_form_improvement]
+                pref = min(within, key=lambda m: (FORM_COMPLEXITY.get(m["form"], 2), -m["held_out"]))
+                preferred_cid, preferred_form = pref["cid"], pref["form"]
+            member_summ = [
+                {"candidate_id": m["cid"], "form": m["form"], "verdict_group": m["prelim"],
+                 "held_out_score": round(m["held_out"], 4)}
+                for m in members
+            ]
+            for m in members:
+                info: dict[str, Any] = {
+                    "family_size": len(members),
+                    "form": m["form"],
+                    "members": member_summ,
+                    "preferred_candidate_id": preferred_cid,
+                    "preferred_form": preferred_form,
+                    "is_preferred": m["cid"] == preferred_cid,
+                }
+                assoc = m.get("assoc") or {}
+                if m["form"] == "log_log" and assoc.get("power_law_exponent") is not None:
+                    info["power_law_exponent"] = assoc["power_law_exponent"]
+                if preferred_form == "log_log" and m["cid"] == preferred_cid and assoc.get("power_law_exponent") is not None:
+                    info["preferred_power_law_exponent"] = assoc["power_law_exponent"]
+                model_family_by_cid[m["cid"]] = info
+
         # --- Full-data diagnostic score (report-only, never gates anything) ---
         full_data_scores: dict[str, float | None] = {}
         for finding in findings_list:
@@ -1057,6 +1145,7 @@ class ResearchMVP:
                 is_predictive_claim=_is_predictive_claim(payload),
                 association_evidence=assoc_by_cid.get(candidate["id"]),
                 missingness=missing_by_cid.get(candidate["id"]),
+                model_family=model_family_by_cid.get(candidate["id"]),
             )
             self.store.link_claim(
                 case_id=case_id,
