@@ -199,6 +199,8 @@ def generate_table_candidates(
     target_column: str | None = None,
     near_copy_r2: float = 0.999,
     near_copy_corr: float = 0.9995,
+    nonlinear_budget: int = 40,
+    max_nonlinear_per_family: int = 4,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if len(df) < 6:
         raise ValueError("At least 6 rows are required for discovery and held-out checking")
@@ -401,8 +403,62 @@ def generate_table_candidates(
             }
             scored.append((float(eta2), spec))
 
+    # ------------------------------------------------------------------
+    # Candidate-family budgeting: linear/group and nonlinear forms draw from
+    # SEPARATE budgets so nonlinear candidates cannot crowd legitimate linear
+    # pairs out of a saturated global cap. Families are deduplicated and the
+    # strongest linear member of every selected family is always preserved.
+    # ------------------------------------------------------------------
+    def _fam_key(spec: dict[str, Any]) -> tuple[str, ...]:
+        kind = spec.get("kind")
+        if kind in ("linear_association", "nonlinear_association"):
+            p = re.sub(r"^(log10_|log1p_|log_|ln_)", "", str(spec.get("predictor", "")).lower())
+            o = re.sub(r"^(log10_|log1p_|log_|ln_)", "", str(spec.get("outcome", "")).lower())
+            return ("assoc", p, o)
+        if kind == "group_difference":
+            return ("group", str(spec.get("group", "")), str(spec.get("outcome", "")))
+        return ("other", spec.get("id", ""))
+
     scored.sort(key=lambda item: (-item[0], item[1]["id"]))
-    candidates = [spec for _, spec in scored[:max_candidates]]
+    linear_group = [(s, sp) for s, sp in scored if sp.get("kind") in ("linear_association", "group_difference")]
+    nonlinear = [(s, sp) for s, sp in scored if sp.get("kind") == "nonlinear_association"]
+
+    # 1. Linear + group keep the original global budget (reproduces the
+    #    linear-only selection exactly — no linear pair is displaced by nonlinear).
+    selected: list[dict[str, Any]] = [sp for _, sp in linear_group[:max_candidates]]
+    selected_ids = {sp["id"] for sp in selected}
+
+    # Strongest linear member per family (linear_group is already sorted by score).
+    strongest_linear: dict[tuple[str, ...], dict[str, Any]] = {}
+    for _s, sp in linear_group:
+        if sp.get("kind") == "linear_association":
+            strongest_linear.setdefault(_fam_key(sp), sp)
+
+    # 2. Nonlinear from its OWN budget, capped per family.
+    per_family: dict[tuple[str, ...], int] = {}
+    nonlinear_selected: list[dict[str, Any]] = []
+    for _s, sp in nonlinear:
+        fam = _fam_key(sp)
+        if per_family.get(fam, 0) >= max_nonlinear_per_family:
+            continue
+        per_family[fam] = per_family.get(fam, 0) + 1
+        nonlinear_selected.append(sp)
+        if len(nonlinear_selected) >= nonlinear_budget:
+            break
+
+    # 3. Preserve the linear anchor of every selected nonlinear family (so a
+    #    functional-form failure can always be linked to its linear baseline).
+    anchor_adds: list[dict[str, Any]] = []
+    for sp in nonlinear_selected:
+        anchor = strongest_linear.get(_fam_key(sp))
+        if anchor is not None and anchor["id"] not in selected_ids:
+            anchor_adds.append(anchor)
+            selected_ids.add(anchor["id"])
+
+    candidates: list[dict[str, Any]] = []
+    for sp in selected + anchor_adds + nonlinear_selected:
+        if sp["id"] not in {c["id"] for c in candidates}:
+            candidates.append(sp)
 
     # Post-generation leakage assertion: target_column must never be a predictor.
     if target_column:
@@ -428,6 +484,11 @@ def generate_table_candidates(
         "target_column": target_column,
         "generated_candidates": len(candidates),
         "candidate_budget": max_candidates,
+        "linear_group_budget": max_candidates,
+        "nonlinear_budget": nonlinear_budget,
+        "max_nonlinear_per_family": max_nonlinear_per_family,
+        "linear_group_selected": len(selected),
+        "nonlinear_selected": len(nonlinear_selected),
         "structural_relations": structural_relations,
         "structural_relation_count": len(structural_relations),
     }
@@ -502,6 +563,7 @@ class UploadedTableDomain:
         seed: int = 20260623,
         target_transform: str | None = None,
         evaluation_metric: str = "r2",
+        time_column: str | None = None,
     ):
         if not candidates:
             raise ValueError("The approved plan contains no testable candidates")
@@ -517,10 +579,16 @@ class UploadedTableDomain:
         self.specs = candidates
         self.target_transform = target_transform
         self.evaluation_metric = evaluation_metric
+        self.time_column = time_column if (time_column and time_column in self.df.columns) else None
 
         n = len(self.df)
-        indices = list(range(n))
-        random.Random(seed).shuffle(indices)
+        if self.time_column is not None:
+            # Chronological validation: earliest rows train, latest rows validate.
+            order = pd.to_numeric(self.df[self.time_column], errors="coerce")
+            indices = list(order.sort_values(kind="mergesort").index)
+        else:
+            indices = list(range(n))
+            random.Random(seed).shuffle(indices)
 
         scout_cut = max(3, min(n - 3, int(n * scout_fraction)))
         sel_cut = scout_cut + max(1, int(n * confirmation_fraction))
@@ -580,6 +648,15 @@ class UploadedTableDomain:
         n = len(pool)
         if n < 6:
             return pool.copy(), pool.copy()
+        if self.time_column is not None and self.time_column in pool.columns:
+            # Chronological repeated-refit: order by time and vary the train/val
+            # cut point per seed (train earlier, validate later) — never shuffle
+            # future rows into the training window.
+            order = pd.to_numeric(pool[self.time_column], errors="coerce").sort_values(kind="mergesort").index
+            idx = np.asarray(order)
+            frac = 0.6 + 0.03 * (seed % 6)  # cut points from 60% to ~75%
+            cut = max(3, min(n - 3, int(n * frac)))
+            return pool.iloc[idx[:cut]].copy(), pool.iloc[idx[cut:]].copy()
         idx = np.arange(n)
         np.random.default_rng(1_000_003 + seed).shuffle(idx)
         cut = max(3, min(n - 3, int(n * train_fraction)))

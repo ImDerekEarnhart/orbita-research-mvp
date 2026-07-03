@@ -143,8 +143,29 @@ class ResearchCompiler:
         identifier_columns = [
             c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "identifier"
         ]
+        # Temporal-index columns stay AVAILABLE for mining (not excluded like
+        # identifiers). A clear ordered calendar/sequence axis additionally drives
+        # chronological (time-ordered) validation.
+        from .ingestion import CHRONO_AXIS_KINDS
+        temporal_columns = [
+            c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "temporal_index"
+        ]
+        chronological_axis = next(
+            (
+                c["name"]
+                for c in profile.get("column_profiles", [])
+                if c.get("inferred_role") == "temporal_index"
+                and (c.get("temporal_signals", {}) or {}).get("is_ordered_axis")
+                and (c.get("temporal_signals", {}) or {}).get("axis_kind") in CHRONO_AXIS_KINDS
+            ),
+            None,
+        )
         near_copy_r2 = 0.999
         near_copy_corr = 0.9995
+        # Separate budget for nonlinear family members so they never crowd
+        # linear/group candidates out of the shared cap (candidate-family budgeting).
+        nonlinear_budget = max(20, max_candidates)
+        max_nonlinear_per_family = 4
         candidates, generation = generate_table_candidates(
             df,
             goal=case.get("goal", ""),
@@ -153,6 +174,8 @@ class ResearchCompiler:
             target_column=target_column,
             near_copy_r2=near_copy_r2,
             near_copy_corr=near_copy_corr,
+            nonlinear_budget=nonlinear_budget,
+            max_nonlinear_per_family=max_nonlinear_per_family,
         )
         # Augment generation dict with all partition fractions so the service
         # can reconstruct the exact same split as candidate generation used.
@@ -179,6 +202,8 @@ class ResearchCompiler:
             "data_profile": profile,
             "quality_findings": quality_findings,
             "excluded_from_candidate_generation": identifier_columns,
+            "temporal_columns": temporal_columns,
+            "chronological_axis": chronological_axis,
             "candidate_generation": generation,
             "structural_relations": generation.get("structural_relations", []),
             "routes": ["uploaded_table_association", "data_quality_audit", "belief_graph_import"],

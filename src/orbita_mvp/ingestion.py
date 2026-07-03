@@ -18,6 +18,18 @@ class IngestionError(RuntimeError):
 
 
 _ID_NAME_TOKENS = ("id", "uuid", "guid", "subject", "patient", "sample", "record", "index", "key")
+# Temporal-axis name hints. A monotonic-unique column matching one of these is a
+# temporal index (an ordered axis), NOT a row identifier.
+_TEMPORAL_NAME_TOKENS = (
+    "year", "date", "time", "timestamp", "datetime", "epoch", "month", "week",
+    "day", "hour", "minute", "second", "age", "duration", "elapsed", "tick",
+    "step", "period", "gps",
+)
+# Axis kinds for which chronological (time-ordered) validation is auto-enabled.
+# Restricted to clear calendar/sequence axes; feature-like temporal quantities
+# (age, duration, gps event time, arbitrary step) are left on random validation
+# unless a caller opts in.
+CHRONO_AXIS_KINDS = frozenset({"year", "date", "datetime", "timestamp"})
 # String identifier shapes: UUIDs, and prefixed sequences like OBS-0001 / SUBJ_12.
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _PREFIXED_SEQ_RE = re.compile(r"^[A-Za-z]{1,12}[-_ ]?\d{1,}$")
@@ -89,6 +101,42 @@ def detect_identifier(series: pd.Series, name: str) -> dict[str, Any] | None:
     return None
 
 
+def detect_temporal(series: pd.Series, name: str, identifier_signals: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Detect a temporal-index column (an ordered axis), distinct from an identifier.
+
+    A monotonic-unique numeric column with a temporal name (year/date/…), or any
+    datetime-parseable column, is a temporal index — it should stay AVAILABLE for
+    mining as an axis rather than being excluded as a row id. Returns the axis
+    signals (or None). ``is_ordered_axis`` marks a genuinely time-ordered column
+    that can drive chronological validation.
+    """
+    normalized = name.lower().replace(" ", "_")
+    name_temporal = any(tok in normalized for tok in _TEMPORAL_NAME_TOKENS)
+
+    # Datetime-parseable columns are temporal regardless of cardinality.
+    if any(tok in normalized for tok in ("date", "time", "timestamp", "datetime")):
+        parsed = pd.to_datetime(series, errors="coerce")
+        if len(series) and float(parsed.notna().mean()) >= 0.9:
+            return {
+                "axis_kind": "datetime",
+                "is_ordered_axis": bool(parsed.dropna().is_monotonic_increasing),
+                "name_token_match": True,
+            }
+
+    # Otherwise a temporal index must look like an ordered index (i.e. it would
+    # have been an identifier by shape) AND carry a temporal name — so a plain
+    # non-unique ``age_years`` feature stays a measurement.
+    if identifier_signals is not None and name_temporal:
+        numeric = pd.to_numeric(series, errors="coerce").dropna()
+        axis_kind = next((tok for tok in _TEMPORAL_NAME_TOKENS if tok in normalized), "temporal")
+        return {
+            "axis_kind": axis_kind,
+            "is_ordered_axis": bool(len(numeric) and numeric.is_monotonic_increasing),
+            "name_token_match": True,
+        }
+    return None
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -140,11 +188,19 @@ def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
                 stats = {"top_values": {str(k): int(v) for k, v in counts.items()}}
         normalized = name.lower().replace(" ", "_")
         identifier_signals = detect_identifier(s, name)
-        if identifier_signals is not None:
+        # Temporal-axis detection takes precedence over identifier: an ordered
+        # time axis (year/date/…) must not be excluded as a row id.
+        temporal_signals = detect_temporal(s, name, identifier_signals)
+        if temporal_signals is not None:
+            role = "temporal_index"
+            identifier_signals = None
+        elif identifier_signals is not None:
             role = "identifier"
-        if any(token in normalized for token in ("date", "time", "timestamp")):
+        if role not in ("identifier", "temporal_index") and any(
+            token in normalized for token in ("date", "time", "timestamp")
+        ):
             role = "time"
-        if role != "identifier" and any(
+        if role not in ("identifier", "temporal_index") and any(
             token in normalized for token in ("label", "class", "group", "condition", "diagnosis", "treatment")
         ):
             role = "group_or_category"
@@ -160,6 +216,8 @@ def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
         }
         if identifier_signals is not None:
             column_profile["identifier_signals"] = identifier_signals
+        if temporal_signals is not None:
+            column_profile["temporal_signals"] = temporal_signals
         profile["column_profiles"].append(column_profile)
     return profile
 

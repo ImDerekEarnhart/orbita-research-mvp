@@ -358,6 +358,9 @@ class ResearchMVP:
             confirmation_fraction = float(gen.get("confirmation_fraction", 0.25))
             final_validation_fraction = float(gen.get("final_validation_fraction", 0.15))
             seed = int(gen.get("seed", 20260623))
+            # Chronological validation axis (a clear ordered calendar/sequence
+            # column), when the dataset has one — else random validation.
+            time_column = plan.get("chronological_axis") or None
 
             domain = UploadedTableDomain(
                 df,
@@ -368,6 +371,7 @@ class ResearchMVP:
                 seed=seed,
                 target_transform=target_transform,
                 evaluation_metric=evaluation_metric,
+                time_column=time_column,
             )
             judge = GatedJudge(
                 commit_at=float(thresholds.get("commit_at", 0.25)),
@@ -448,6 +452,7 @@ class ResearchMVP:
                     seed=seed,
                     target_transform=target_transform,
                     evaluation_metric=evaluation_metric,
+                    time_column=time_column,
                 )
                 reduced_specs = build_backward_eliminated_composites(
                     composite_specs,
@@ -469,6 +474,7 @@ class ResearchMVP:
                     seed=seed,
                     target_transform=target_transform,
                     evaluation_metric=evaluation_metric,
+                    time_column=time_column,
                 )
                 composite_falsifiers = [
                     ImprovementFalsifier(
@@ -913,6 +919,48 @@ class ResearchMVP:
                     missing_by_cid[cid] = _missingness_receipt(dataframe, payload)
                 except Exception:
                     missing_by_cid[cid] = None
+
+        # --- Multivariable derived-variable / target-leakage detection -------
+        # Bounded scout-select + held-out validation: flag targets that are
+        # near-deterministically reconstructed from a small subset of columns.
+        derived_by_target: dict[str, dict[str, Any]] = {}
+        if domain is not None and getattr(domain, "scout", None) is not None and len(getattr(domain, "selection", [])) >= 5:
+            numeric_cols = list((plan.get("candidate_generation", {}) or {}).get("numeric_columns", []) or [])
+            if len(numeric_cols) >= 3:
+                try:
+                    from .derived import detect_multivariable_derived
+                    derived_by_target = detect_multivariable_derived(
+                        domain.scout, domain.selection, numeric_cols, numeric_cols
+                    )
+                except Exception:
+                    derived_by_target = {}
+
+        # Group derived-variable records into mutually-near-deterministic
+        # clusters (connected components over target↔source links). Within a
+        # collinear cluster the *constructed* column is NOT identifiable from
+        # values alone, so we flag the whole set and state that explicitly
+        # rather than singling out (or auto-contaminating) any one member.
+        _parent: dict[str, str] = {}
+
+        def _find(x: str) -> str:
+            _parent.setdefault(x, x)
+            while _parent[x] != x:
+                _parent[x] = _parent[_parent[x]]
+                x = _parent[x]
+            return x
+
+        def _union(a: str, b: str) -> None:
+            _parent[_find(a)] = _find(b)
+
+        for _tgt, _rec in derived_by_target.items():
+            for _s in _rec["source_variables"]:
+                _union(_tgt, _s)
+        derived_clusters: dict[str, dict[str, Any]] = {}
+        for _tgt, _rec in derived_by_target.items():
+            root = _find(_tgt)
+            cl = derived_clusters.setdefault(root, {"members": set(), "records": []})
+            cl["members"].update([_tgt, *_rec["source_variables"]])
+            cl["records"].append(_rec)
 
         # --- Subgroup-reversal / regime-dependence detection ----------------
         # For directional (linear_association) candidates, check whether the
@@ -1362,6 +1410,10 @@ class ResearchMVP:
                     "derived_column_candidate": artifact.get("derived_column_candidate"),
                     "disposition": artifact.get("disposition", "downgraded_to_artifact"),
                     "columns": artifact.get("columns"),
+                    # For a symmetric near-copy the derivation direction cannot be
+                    # determined from values alone, so neither column's other
+                    # relationships are auto-contaminated (the source is not flagged).
+                    "derivation_direction": "undetermined",
                 }
             self.store.link_claim(
                 case_id=case_id,
@@ -1370,6 +1422,77 @@ class ResearchMVP:
                 finding_type="artifact",
                 source_candidate_id=artifact["id"],
                 finding_detail=artifact_detail,
+            )
+            artifact_count += 1
+
+        # Multivariable derived-variable artifacts: one per near-deterministic
+        # dependency cluster. The constructed column cannot be identified from
+        # values alone, so every member is named as a candidate and the
+        # direction is stated as undetermined (no member is auto-contaminated).
+        for _root, cluster in derived_clusters.items():
+            members = sorted(cluster["members"])
+            best_rec = max(cluster["records"], key=lambda r: r["held_out_r2"])
+            statement = (
+                f"Columns [{', '.join(members)}] are mutually near-deterministic — at least one is a "
+                f"likely constructed/derived index ({best_rec['construction']}), reconstructed from the "
+                f"others at held-out R²={best_rec['held_out_r2']} (residual variance ratio="
+                f"{best_rec['residual_variance_ratio']}). Which column is the derived index cannot be "
+                f"determined from the data alone; treat this set as artifact-contaminated, not as "
+                f"independent discoveries."
+            )
+            d_claim_id, _ = self.memory.resolve_or_create_claim(
+                statement,
+                scope={
+                    "dataset_sha256": dataset_file["sha256"],
+                    "artifact_kind": "likely_derived_variable",
+                    "members": members,
+                },
+                claim_type="structural_artifact",
+                metadata={"case_id": case_id, "artifact_kind": "likely_derived_variable"},
+            )
+            evidence = self.ledger.add_evidence(
+                f"file://{dataset_file['stored_path']}",
+                statement,
+                source_kind=EvidenceKind.DATASET,
+                independence_key=f"dataset:{dataset_file['sha256']}:derived:{'|'.join(members)}",
+                content=json.dumps({"members": members, "records": cluster["records"]}, sort_keys=True),
+                metadata={"case_id": case_id, "artifact_kind": "likely_derived_variable"},
+            )
+            self.ledger.attest(d_claim_id, evidence, Stance.SUPPORT,
+                               actor="multivariable-derived-detector", actor_role=ActorRole.TOOL)
+            self.memory.synchronize_status(d_claim_id, rationale="Multivariable derived-variable artifact")
+            claim_ids.append(d_claim_id)
+            self.store.link_claim(
+                case_id=case_id,
+                run_id=case_run_id,
+                claim_id=d_claim_id,
+                finding_type="artifact",
+                source_candidate_id=f"derived:{'|'.join(members)}",
+                finding_detail={
+                    "hypothesis_text": statement,
+                    "finding_type": "artifact",
+                    "verdict": "artifact",
+                    "artifact_kind": "likely_derived_variable",
+                    "is_candidate_hypothesis": True,
+                    "artifact_warning": {
+                        "type": "likely_derived_variable",
+                        "leakage_risk": "high",
+                        "member_columns": members,
+                        "derivation_direction": "undetermined",
+                        "best_reconstruction": {
+                            "target_candidate": best_rec["target"],
+                            "source_variables": best_rec["source_variables"],
+                            "coefficients": best_rec["coefficients"],
+                            "held_out_r2": best_rec["held_out_r2"],
+                            "residual_variance_ratio": best_rec["residual_variance_ratio"],
+                            "best_single_predictor_r2": best_rec["best_single_predictor_r2"],
+                            "margin_over_best_single": best_rec["margin_over_best_single"],
+                            "refit_median_r2": best_rec["refit_median_r2"],
+                            "construction": best_rec["construction"],
+                        },
+                        "disposition": "artifact_qualified",
+                    },
+                },
             )
             artifact_count += 1
 

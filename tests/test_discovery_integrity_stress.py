@@ -28,10 +28,30 @@ import pytest
 from orbita_mvp import ResearchMVP
 
 STRESS_CSV = Path(r"C:\Users\Dereks\Downloads\orbita_pre_release_stress_test.csv")
+TCELL_CSV = Path(r"C:\Users\Dereks\Downloads\tcell_orbita_blind_challenge.csv")
+CRUCIBLE_D_CSV = Path(r"C:\Users\Dereks\Downloads\orbita_crucible_v1_discovery_files\crucible_task_d_discovery.csv")
 
 _needs_stress = pytest.mark.skipif(
     not STRESS_CSV.exists(), reason="stress-test CSV not available on this machine"
 )
+
+
+def _run_csv(csv_path: Path):
+    with tempfile.TemporaryDirectory() as td:
+        svc = ResearchMVP(Path(td) / "o.db", Path(td) / "ws")
+        try:
+            case = svc.create_case(name=csv_path.stem, goal="")
+            svc.add_file(case["id"], csv_path)
+            plan = svc.compile_case(case["id"])
+            svc.approve_plan(plan["id"], reviewer="tester")
+            svc.run_case(case["id"], plan_id=plan["id"])
+            return svc.store.case_claims(case["id"]), plan["plan"]
+        finally:
+            svc.close()
+
+
+def _derived_clusters(claims):
+    return [c for c in claims if (c.get("finding_detail", {}) or {}).get("artifact_kind") == "likely_derived_variable"]
 
 
 def _run_stress():
@@ -439,6 +459,152 @@ def test_stress_leakage_proxy_flagged_as_near_copy_artifact_not_committed():
              and "output_linear" in c["canonical_text"] and "leakage_proxy" in c["canonical_text"]
              and "linear association" in c["canonical_text"]]
     assert not mined, "the near-copy pair must not be committed as a linear discovery"
+
+
+# ===========================================================================
+# Commit 6 — general fixes (A multivariable derived, B budgeting, C temporal,
+# D artifact propagation).
+# ===========================================================================
+
+# --- A: multivariable noisy-derived-variable detection ---------------------
+
+def test_multivariable_derived_flags_constructed_index_not_genuine_relationship():
+    from orbita_mvp.derived import detect_multivariable_derived
+
+    rng = np.random.default_rng(4)
+    n = 400
+    x1, x2, x3 = rng.normal(size=n), rng.normal(size=n), rng.normal(size=n)
+    # A near-deterministic 3-variable constructed index.
+    idx = x1 + 2.0 * x2 - 0.5 * x3 + rng.normal(scale=0.01, size=n)
+    # A GENUINE strong multivariable scientific relationship with real residual.
+    y_real = x1 + x2 + rng.normal(scale=2.0, size=n)
+    df = pd.DataFrame({"x1": x1, "x2": x2, "x3": x3, "idx": idx, "y_real": y_real})
+    scout, heldout = df.iloc[:250], df.iloc[250:]
+    cols = ["x1", "x2", "x3", "idx", "y_real"]
+
+    res = detect_multivariable_derived(scout, heldout, cols, cols)
+    # The constructed index is flagged as near-deterministically reconstructed.
+    assert "idx" in res
+    assert res["idx"]["held_out_r2"] >= 0.99
+    assert res["idx"]["n_predictors"] >= 2
+    # The genuine noisy multivariable relationship is NOT auto-flagged.
+    assert "y_real" not in res
+
+
+@pytest.mark.skipif(not TCELL_CSV.exists(), reason="T-cell CSV not available")
+def test_tcell_adenosine_pressure_is_artifact_qualified():
+    claims, _plan = _run_csv(TCELL_CSV)
+    clusters = _derived_clusters(claims)
+    named = set()
+    for c in clusters:
+        named.update(c["finding_detail"]["artifact_warning"]["member_columns"])
+    assert "adenosine_pressure" in named, "adenosine_pressure must be artifact-qualified"
+    # A derived cluster verdict is an artifact, with direction stated as undetermined.
+    for c in clusters:
+        assert c["verdict"] == "artifact"
+        assert c["finding_detail"]["artifact_warning"]["derivation_direction"] == "undetermined"
+
+
+@pytest.mark.skipif(not CRUCIBLE_D_CSV.exists(), reason="Crucible D CSV not available")
+def test_crucible_d_derived_index_is_artifact_qualified():
+    claims, _plan = _run_csv(CRUCIBLE_D_CSV)
+    named = set()
+    for c in _derived_clusters(claims):
+        named.update(c["finding_detail"]["artifact_warning"]["member_columns"])
+    assert "derived_index" in named, "derived_index must be artifact-qualified"
+    # The planted null must never be pulled into a derived cluster or committed.
+    assert "null_chemistry" not in named
+    assert not [c for c in claims if "null_chemistry" in c["canonical_text"].lower() and c["verdict"] == "committed"]
+
+
+# --- B: candidate-family budgeting -----------------------------------------
+
+def test_nonlinear_budget_does_not_crowd_out_linear_pairs():
+    from orbita_mvp.table_domain import generate_table_candidates
+
+    rng = np.random.default_rng(7)
+    n = 300
+    base = rng.normal(size=n)
+    data = {f"v{i}": base * (0.5 + 0.15 * i) + rng.normal(scale=1.0, size=n) for i in range(8)}
+    df = pd.DataFrame(data)
+
+    # Linear-only baseline (nonlinear budget 0) under a small saturated cap.
+    lin_only, _ = generate_table_candidates(df, max_candidates=10, nonlinear_budget=0)
+    linear_ids_only = {c["id"] for c in lin_only if c["kind"] == "linear_association"}
+
+    # Same cap, but with nonlinear search enabled.
+    full, _ = generate_table_candidates(df, max_candidates=10, nonlinear_budget=20)
+    linear_ids_full = {c["id"] for c in full if c["kind"] == "linear_association"}
+
+    # No legitimate linear pair is dropped solely because nonlinear search was added.
+    assert linear_ids_only <= linear_ids_full
+    # Nonlinear candidates come from a SEPARATE budget (added on top).
+    assert any(c["kind"] == "nonlinear_association" for c in full)
+    assert len(full) > len(lin_only)
+
+
+# --- C: temporal-axis detection --------------------------------------------
+
+def test_temporal_axis_distinguished_from_identifier():
+    from orbita_mvp.ingestion import detect_identifier, detect_temporal, profile_dataframe
+
+    n = 300
+    year = pd.Series(range(1700, 1700 + n), name="year")
+    ids = detect_identifier(year, "year")
+    assert detect_temporal(year, "year", ids) is not None  # temporal, not identifier
+
+    sid = pd.Series([f"OBS-{i:04d}" for i in range(n)], name="sample_id")
+    sid_ids = detect_identifier(sid, "sample_id")
+    assert sid_ids is not None and detect_temporal(sid, "sample_id", sid_ids) is None  # stays identifier
+
+    rown = pd.Series(range(n), name="row_number")
+    rown_ids = detect_identifier(rown, "row_number")
+    assert rown_ids is not None and detect_temporal(rown, "row_number", rown_ids) is None  # stays identifier
+
+    df = pd.DataFrame({
+        "year": range(1700, 1700 + n),
+        "sample_id": [f"S{i:04d}" for i in range(n)],
+        "val": np.random.default_rng(0).normal(size=n),
+    })
+    roles = {c["name"]: c["inferred_role"] for c in profile_dataframe(df)["column_profiles"]}
+    assert roles["year"] == "temporal_index"
+    assert roles["sample_id"] == "identifier"
+
+
+def test_chronological_validation_orders_partitions_by_time():
+    from orbita_mvp.table_domain import UploadedTableDomain
+
+    n = 120
+    rng = np.random.default_rng(1)
+    x = np.arange(n) + rng.normal(scale=1.0, size=n)
+    df = pd.DataFrame({"year": range(2000, 2000 + n), "x": x, "y": 2.0 * x + rng.normal(scale=1.0, size=n)})
+    spec = {
+        "id": "linear:x_y", "statement": "x and y show a stable positive linear association.",
+        "kind": "linear_association", "predictor": "x", "outcome": "y", "expected_direction": "positive",
+    }
+    dom = UploadedTableDomain(df, [spec], time_column="year")
+    # Earliest rows train, latest rows are the held-out final validation.
+    assert dom.scout["year"].max() < dom.selection["year"].min()
+    assert dom.selection["year"].max() < dom.final_validation["year"].min()
+    # Repeated-refit windows are also time-ordered (train precedes validation).
+    train, val = dom.repeated_refit_split(0)
+    assert train["year"].max() <= val["year"].min()
+
+
+# --- D: artifact-column propagation (direction stated, source not contaminated) ---
+
+@_needs_stress
+def test_near_copy_direction_undetermined_and_source_not_contaminated():
+    claims, _counts, _plan = _run_stress()
+    near_copies = [c for c in claims
+                   if (c.get("finding_detail", {}) or {}).get("artifact_kind") == "near_duplicate_copy"]
+    assert near_copies
+    assert near_copies[0]["finding_detail"]["artifact_warning"]["derivation_direction"] == "undetermined"
+    # Because direction is undetermined, no ordinary finding is auto-marked
+    # artifact_contaminated (the legitimate source column keeps its findings).
+    contaminated = [c for c in claims
+                    if (c.get("finding_detail", {}) or {}).get("artifact_warning", {}).get("type") == "artifact_contaminated"]
+    assert not contaminated
 
 
 # ---------------------------------------------------------------------------
