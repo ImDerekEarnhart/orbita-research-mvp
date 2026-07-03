@@ -41,10 +41,21 @@ INCONCLUSIVE = "inconclusive"
 # survived. The underlying relationship is not refuted — the specific model
 # shape tried here was the wrong one.
 FUNCTIONAL_FORM_REJECTED = "functional_form_rejected"
+# A real, stable group/variable association (meaningful effect size, stable
+# under bootstrap) that nonetheless does NOT clear the standalone predictive
+# bar. Distinct from both COMMITTED (which asserts predictive utility) and
+# NOT_SUPPORTED (which found no clearing evidence at all): the association is
+# supported; its standalone predictive utility is limited.
+SUPPORTED_ASSOCIATION = "supported_association"
+# The pooled relationship reverses (or materially changes) inside identifiable
+# subgroups, so no universal directional claim can be committed. Scoped
+# per-group claims are recorded instead.
+REGIME_DEPENDENT = "regime_dependent"
 
 PUBLIC_STATES = {
     COMMITTED, REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED,
     NOT_SUPPORTED, INCONCLUSIVE, FUNCTIONAL_FORM_REJECTED,
+    SUPPORTED_ASSOCIATION, REGIME_DEPENDENT,
 }
 
 # Canonical mapping required by the spec. Legacy finding-type spellings are
@@ -64,6 +75,11 @@ FINDING_TYPE_TO_STATE: dict[str, str] = {
     # functional form) survived — the relationship exists, this shape of it
     # doesn't.
     "functional_form_rejected_candidate": FUNCTIONAL_FORM_REJECTED,
+    # A real association with limited standalone predictive utility.
+    "supported_association_candidate": SUPPORTED_ASSOCIATION,
+    # Pooled relationship reverses inside subgroups.
+    "regime_dependent_candidate": REGIME_DEPENDENT,
+    "subgroup_reversal_candidate": REGIME_DEPENDENT,
     # Structural / transform tautology, not a scientific hypothesis.
     "artifact": ARTIFACT,
     "structural_relation": ARTIFACT,
@@ -89,6 +105,8 @@ STATE_COLOR = {
     NOT_SUPPORTED: "slate",
     INCONCLUSIVE: "blue-gray",
     FUNCTIONAL_FORM_REJECTED: "amber",
+    SUPPORTED_ASSOCIATION: "teal",
+    REGIME_DEPENDENT: "purple",
 }
 
 
@@ -126,7 +144,15 @@ def is_rejected(finding_type: str | None) -> bool:
 # dicts (which now report "n", the test-partition size used) without
 # changing the generic engine's contract.
 
-_PAIRWISE_CHECK_NAMES = ("baseline", "held_out", "cross_seed")
+# The fixed-model validation-resample check is emitted under the honest name
+# ``validation_resample``; ``cross_seed`` is the historical name kept as a
+# recognised alias so old ledgers/plans/APIs still classify identically.
+RESAMPLE_CHECK_NAMES = ("validation_resample", "cross_seed")
+
+# Checks whose failure is a *pairwise* fitness signal (not composite predictive
+# machinery). ``repeated_refit`` is a diagnostic-only validator and is excluded
+# so it never counts as a "predictive check" that could refute a candidate.
+_PAIRWISE_CHECK_NAMES = ("baseline", "held_out", "validation_resample", "cross_seed", "repeated_refit")
 
 
 def _check_detail(falsifications: list[dict[str, Any]], name: str) -> dict[str, Any]:
@@ -217,7 +243,7 @@ def classify_pairwise_finding(
         if attack.get("killed"):
             score = detail.get("score") if name in ("baseline", "held_out") else detail.get("median")
             diagnostics["killed_checks"].append({"name": name, "score": score, "n": n})
-            if name == "cross_seed":
+            if name in RESAMPLE_CHECK_NAMES:
                 cross_seed_killed = True
                 if isinstance(score, (int, float)):
                     cross_seed_median = score
@@ -371,35 +397,68 @@ _VERDICT_REASON = {
                               "does not by itself refute the underlying variable relationship. If a "
                               "transformed version of the same pair survived, it is named in "
                               "alternative_candidate_id.",
+    SUPPORTED_ASSOCIATION: "A real, bootstrap-stable association with a meaningful effect size, which "
+                           "nonetheless does not reach the standalone predictive-utility bar. The "
+                           "association is supported; its usefulness as a lone predictor is limited.",
+    REGIME_DEPENDENT: "The pooled relationship reverses or materially changes direction inside "
+                      "identifiable subgroups, so no universal directional claim is committed. "
+                      "Scoped per-subgroup claims are recorded instead.",
 }
 
 
 def _check_score(falsifications: list[dict[str, Any]], name: str) -> float | None:
+    match = RESAMPLE_CHECK_NAMES if name in RESAMPLE_CHECK_NAMES else (name,)
     for attack in falsifications:
-        if attack.get("name") == name:
+        if attack.get("name") in match:
             detail = attack.get("detail", {}) or {}
             # Each falsifier reports its primary metric under a stable key.
             if name == "baseline":
                 return detail.get("score")
             if name == "held_out":
                 return detail.get("score")
-            if name == "cross_seed":
+            if name in RESAMPLE_CHECK_NAMES:
                 return detail.get("median")
             return attack.get("metric")
     return None
 
 
 def _cross_seed_summary(falsifications: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Fixed-model validation-resample summary (matches ``validation_resample``
+    or the ``cross_seed`` alias)."""
     for attack in falsifications:
-        if attack.get("name") == "cross_seed":
+        if attack.get("name") in RESAMPLE_CHECK_NAMES:
             detail = attack.get("detail", {}) or {}
             return {
+                "check_kind": detail.get("check_kind", "fixed_model_validation_resample"),
                 "median": detail.get("median"),
                 "spread": detail.get("spread"),
                 "seeds": detail.get("seeds"),
                 "min_median": detail.get("min_median"),
                 "max_spread": detail.get("max_spread"),
                 "killed": bool(attack.get("killed")),
+            }
+    return None
+
+
+def _repeated_refit_summary(falsifications: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Genuine repeated-independent-refit stability summary."""
+    for attack in falsifications:
+        if attack.get("name") == "repeated_refit":
+            detail = attack.get("detail", {}) or {}
+            if detail.get("skipped"):
+                return None
+            return {
+                "check_kind": detail.get("check_kind", "repeated_independent_refit"),
+                "median": detail.get("median"),
+                "lower_quantile": detail.get("lower_quantile"),
+                "score_variance": detail.get("score_variance"),
+                "valid_fits": detail.get("valid_fits"),
+                "valid_fit_fraction": detail.get("valid_fit_fraction"),
+                "fit_failures": detail.get("fit_failures"),
+                "direction_stability": detail.get("direction_stability"),
+                "coefficient_stability": detail.get("coefficient_stability"),
+                "train_n_median": detail.get("train_n_median"),
+                "val_n_median": detail.get("val_n_median"),
             }
     return None
 
@@ -413,6 +472,11 @@ def derive_finding_record(
     functional_form_override: dict[str, Any] | None = None,
     full_data_score: float | None = None,
     is_predictive_claim: bool = False,
+    association_evidence: dict[str, Any] | None = None,
+    missingness: dict[str, Any] | None = None,
+    model_family: dict[str, Any] | None = None,
+    subgroup_warning: dict[str, Any] | None = None,
+    artifact_warning: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Split an affirmative candidate into hypothesis + verdict + check scores.
 
@@ -451,6 +515,7 @@ def derive_finding_record(
         "is_candidate_hypothesis": state in {
             REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED,
             NOT_SUPPORTED, INCONCLUSIVE, FUNCTIONAL_FORM_REJECTED,
+            REGIME_DEPENDENT,
         },
         "is_predictive_claim": is_predictive_claim,
         "passed_checks": passed,
@@ -462,9 +527,53 @@ def derive_finding_record(
         "held_out_n": _check_detail(falsifications, "held_out").get("n"),
         "baseline_n": _check_detail(falsifications, "baseline").get("n"),
         "full_data_score_diagnostic": full_data_score,
+        # Fixed-model validation-resample summary. ``cross_seed_summary`` is kept
+        # as a backward-compatible alias; ``validation_resample_summary`` is the
+        # honest name. Both point at the same data.
         "cross_seed_summary": _cross_seed_summary(falsifications),
+        "validation_resample_summary": _cross_seed_summary(falsifications),
+        # Genuine repeated-independent-refit stability (model reproducibility).
+        "repeated_refit_summary": _repeated_refit_summary(falsifications),
         "final_status": finding.get("final_status"),
     }
+
+    # ------------------------------------------------------------------
+    # Separated evidence axes (association / predictive / functional-form).
+    # Each axis is persisted independently so a real association is never
+    # collapsed into a single predictive score. Flat legacy fields above are
+    # retained for backward compatibility with existing surfaces and tests.
+    # ------------------------------------------------------------------
+    resample = record["validation_resample_summary"]
+    repeated = record["repeated_refit_summary"]
+    record["predictive_utility"] = {
+        "metric_name": record["metric_name"],
+        "held_out_score": record["held_out_score"],
+        "held_out_n": record["held_out_n"],
+        "baseline_score": record["baseline_score"],
+        "beats_baseline": (
+            record["held_out_score"] is not None
+            and record["baseline_score"] is not None
+            and record["held_out_score"] > record["baseline_score"]
+        ),
+        "full_data_score_diagnostic": full_data_score,
+    }
+    record["functional_form_stability"] = {
+        "model_family": (model_family or {}).get("family") if model_family else None,
+        "validation_resample": resample,
+        "repeated_refit": repeated,
+        "direction_stability": (repeated or {}).get("direction_stability") if repeated else None,
+    }
+    if association_evidence:
+        record["association_evidence"] = association_evidence
+    if model_family:
+        record["model_family"] = model_family
+    if missingness:
+        record["missingness"] = missingness
+    if subgroup_warning:
+        record["subgroup_warning"] = subgroup_warning
+    if artifact_warning:
+        record["artifact_warning"] = artifact_warning
+
     if influence_warning:
         record["influence_warning"] = influence_warning
     if classification_diagnostics:

@@ -5,11 +5,148 @@ import math
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+
+def _candidate_columns(payload: dict[str, Any]) -> list[str]:
+    """Ordered, de-duplicated list of dataset columns a candidate depends on."""
+    cols: list[str] = []
+    for key in ("predictor", "outcome", "group"):
+        v = payload.get(key)
+        if v:
+            cols.append(str(v))
+    for p in payload.get("predictors", []) or []:
+        cols.append(str(p))
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cols:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _missingness_receipt(df: pd.DataFrame, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Per-candidate complete-case missingness receipt (never imputes)."""
+    cols = [c for c in _candidate_columns(payload) if c in df.columns]
+    if not cols:
+        return None
+    total = int(len(df))
+    complete = pd.Series(True, index=df.index)
+    per_var: dict[str, float] = {}
+    group_col = payload.get("group")
+    for c in cols:
+        col = df[c]
+        coerced = pd.to_numeric(col, errors="coerce")
+        # Numeric candidate columns: values that cannot be coerced are effectively
+        # missing. The categorical grouping column uses raw null semantics.
+        if c != group_col and float(coerced.notna().mean()) >= 0.5:
+            miss = coerced.isna()
+        else:
+            miss = col.isna()
+        per_var[c] = round(float(miss.mean()), 4)
+        complete &= ~miss
+    effective_n = int(complete.sum())
+    excluded = total - effective_n
+    return {
+        "total_rows": total,
+        "effective_n": effective_n,
+        "rows_excluded_missing": excluded,
+        "excluded_fraction": round(excluded / total, 4) if total else 0.0,
+        "missing_fraction_by_variable": per_var,
+        "substantial_missingness": bool(total and excluded / total >= 0.2),
+    }
+
+
+def _association_evidence(df: pd.DataFrame, payload: dict[str, Any], *, seed: int = 92617) -> dict[str, Any] | None:
+    """Effect-size + bootstrap-stability evidence, independent of predictive utility."""
+    kind = payload.get("kind")
+    rng = np.random.default_rng(seed)
+    if kind == "linear_association":
+        pred, out = payload.get("predictor"), payload.get("outcome")
+        if pred not in df.columns or out not in df.columns:
+            return None
+        x = pd.to_numeric(df[pred], errors="coerce")
+        y = pd.to_numeric(df[out], errors="coerce")
+        m = x.notna() & y.notna()
+        xa, ya = x[m].to_numpy(float), y[m].to_numpy(float)
+        if len(xa) < 5:
+            return None
+        r = float(np.corrcoef(xa, ya)[0, 1])
+        boots = []
+        for _ in range(300):
+            idx = rng.integers(0, len(xa), len(xa))
+            rr = np.corrcoef(xa[idx], ya[idx])[0, 1]
+            if np.isfinite(rr):
+                boots.append(float(rr))
+        ci = [round(float(np.percentile(boots, 2.5)), 4), round(float(np.percentile(boots, 97.5)), 4)] if boots else None
+        sign_stability = round(float(np.mean([(b > 0) == (r > 0) for b in boots])), 4) if boots else None
+        return {
+            "effect_size_metric": "pearson_r",
+            "effect_size": round(r, 4),
+            "ci95": ci,
+            "bootstrap_sign_stability": sign_stability,
+            "n": int(len(xa)),
+        }
+    if kind == "group_difference":
+        group, out = payload.get("group"), payload.get("outcome")
+        if group not in df.columns or out not in df.columns:
+            return None
+        temp = pd.DataFrame({"g": df[group].astype(str), "y": pd.to_numeric(df[out], errors="coerce")}).dropna()
+        if len(temp) < 6 or temp["g"].nunique() < 2:
+            return None
+        overall = float(temp["y"].mean())
+        total_ss = float(((temp["y"] - overall) ** 2).sum())
+        if total_ss <= 1e-12:
+            return None
+        grp = list(temp.groupby("g"))
+        k, N = len(grp), len(temp)
+        between = float(sum(len(s) * (float(s["y"].mean()) - overall) ** 2 for _, s in grp))
+        eta2 = between / total_ss
+        ms_within = (total_ss - between) / (N - k) if N > k else 0.0
+        omega2 = (between - (k - 1) * ms_within) / (total_ss + ms_within) if (total_ss + ms_within) > 0 else None
+        means = {str(lab): round(float(s["y"].mean()), 4) for lab, s in grp}
+        counts = {str(lab): int(len(s)) for lab, s in grp}
+        # Largest-group reference contrast.
+        ref = max(counts, key=counts.get)
+        contrasts = {lab: round(means[lab] - means[ref], 4) for lab in means if lab != ref}
+        return {
+            "effect_size_metric": "eta_squared",
+            "effect_size": round(float(eta2), 4),
+            "omega_squared": round(float(omega2), 4) if omega2 is not None else None,
+            "group_means": means,
+            "group_counts": counts,
+            "reference_group": ref,
+            "group_contrasts_vs_reference": contrasts,
+            "n": int(N),
+            "n_groups": int(k),
+        }
+    return None
+
+
+def _qualifies_as_supported_association(assoc: dict[str, Any] | None) -> bool:
+    """A generated group effect is a *supported association* when it explains
+    variance beyond chance (omega² > 0) with a non-trivial effect size (η² ≥ 0.02,
+    the conventional small-effect boundary). Thresholds are effect-size
+    conventions, not tuned to any dataset's expected answer."""
+    if not assoc or assoc.get("effect_size_metric") != "eta_squared":
+        return False
+    eta2 = assoc.get("effect_size")
+    omega2 = assoc.get("omega_squared")
+    return (
+        isinstance(eta2, (int, float)) and eta2 >= 0.02
+        and isinstance(omega2, (int, float)) and omega2 > 0.005
+    )
 
 from orbita import ActorRole, EpistemicLedger, EvidenceKind, Stance
 from orbita_discovery.core import Candidate, Engine, Ledger, finding_to_dict, survivors
-from orbita_discovery.falsifiers import BaselineFalsifier, CrossSeedFalsifier, HeldOutFalsifier
+from orbita_discovery.falsifiers import (
+    BaselineFalsifier,
+    CrossSeedFalsifier,
+    HeldOutFalsifier,
+    RepeatedRefitValidator,
+)
 from orbita_discovery.judges import GatedJudge
 
 from .compiler import ResearchCompiler, compute_plan_hash, verify_plan_schema_executable
@@ -224,6 +361,9 @@ class ResearchMVP:
                     min_median=float(thresholds.get("cross_seed_min", 0.15)),
                     max_spread=thresholds.get("cross_seed_max_spread", 0.65),
                 ),
+                RepeatedRefitValidator(
+                    seeds=int(thresholds.get("repeated_refit_count", 12)),
+                ),
             ]
             # Phase 1: pairwise candidate falsification
             phase1_ledger = Ledger(ledger_path)
@@ -322,6 +462,9 @@ class ResearchMVP:
                     ),
                     AblationFalsifier(
                         min_contribution=float(thresholds.get("ablation_min_contribution", 0.01))
+                    ),
+                    RepeatedRefitValidator(
+                        seeds=int(thresholds.get("repeated_refit_count", 12)),
                     ),
                 ]
                 phase2_ledger = Ledger(ledger_path, truncate=False)
@@ -733,13 +876,31 @@ class ResearchMVP:
             except Exception:
                 return False
 
+        # --- Association evidence + missingness receipts (per candidate) -----
+        # Computed from the full dataset, independent of predictive utility, so
+        # a real association is never collapsed into a single predictive score.
+        assoc_by_cid: dict[str, dict[str, Any] | None] = {}
+        missing_by_cid: dict[str, dict[str, Any] | None] = {}
+        if dataframe is not None:
+            for finding in findings_list:
+                cid = finding["candidate"]["id"]
+                payload = finding["candidate"].get("payload", {}) or {}
+                try:
+                    assoc_by_cid[cid] = _association_evidence(dataframe, payload)
+                except Exception:
+                    assoc_by_cid[cid] = None
+                try:
+                    missing_by_cid[cid] = _missingness_receipt(dataframe, payload)
+                except Exception:
+                    missing_by_cid[cid] = None
+
         # --- Classification pre-pass ------------------------------------
         # Decide each finding's refined internal type (robust_relation /
         # promising_candidate / falsified_candidate / not_supported_candidate /
         # inconclusive_candidate / functional_form_rejected_candidate /
-        # untestable_candidate) before doing any claim/evidence writes, so the
-        # functional-form pass below can see which candidates in the same run
-        # actually survived.
+        # supported_association_candidate / untestable_candidate) before doing
+        # any claim/evidence writes, so the functional-form pass below can see
+        # which candidates in the same run actually survived.
         prelim: dict[str, tuple[str, dict[str, Any] | None]] = {}
         for finding in findings_list:
             cid = finding["candidate"]["id"]
@@ -760,7 +921,27 @@ class ResearchMVP:
                     is_explicit_predictive_claim=_is_predictive_claim(payload),
                     direction_conflict=_direction_conflict(cid, payload),
                 )
-                prelim[cid] = (ftype, diag)
+                # A generated group effect that fails only the standalone
+                # predictive bar, but carries a real bootstrap-stable effect
+                # size, is a *supported association* (not merely "not
+                # supported"). Never upgrade an inconclusive (untrustworthy
+                # sample) or a hard refutation.
+                if (
+                    ftype == "not_supported_candidate"
+                    and payload.get("kind") == "group_difference"
+                    and _qualifies_as_supported_association(assoc_by_cid.get(cid))
+                ):
+                    diag = dict(diag or {})
+                    diag["reason"] = (
+                        "The group effect is a real, bootstrap-stable association (effect size "
+                        f"{assoc_by_cid.get(cid, {}).get('effect_size')}, omega² "
+                        f"{assoc_by_cid.get(cid, {}).get('omega_squared')}) but did not clear the "
+                        "standalone predictive-utility bar. Reported as a supported association with "
+                        "limited standalone predictive utility."
+                    )
+                    prelim[cid] = ("supported_association_candidate", diag)
+                else:
+                    prelim[cid] = (ftype, diag)
             else:
                 prelim[cid] = ("untestable_candidate", None)
 
@@ -874,6 +1055,8 @@ class ResearchMVP:
                 functional_form_override=functional_form_override,
                 full_data_score=full_data_scores.get(candidate["id"]),
                 is_predictive_claim=_is_predictive_claim(payload),
+                association_evidence=assoc_by_cid.get(candidate["id"]),
+                missingness=missing_by_cid.get(candidate["id"]),
             )
             self.store.link_claim(
                 case_id=case_id,

@@ -377,6 +377,13 @@ class UploadedTableDomain:
         return {"scout": self.scout, "confirmation": self.selection}
 
     def splits(self, evidence: Any, seed: int):
+        """Fixed-model validation-resample splits.
+
+        The training partition is ALWAYS the locked scout rows regardless of
+        seed; only the validation rows are bootstrap-resampled. This is what
+        ``validation_resample`` (formerly ``cross_seed``) uses. It intentionally
+        does NOT repartition/refit — see :meth:`repeated_refit_split`.
+        """
         train = evidence["scout"]
         confirmation = evidence["confirmation"]
         if seed in {0, 1} or len(confirmation) < 4:
@@ -384,6 +391,28 @@ class UploadedTableDomain:
         rng = np.random.default_rng(seed)
         picks = rng.integers(0, len(confirmation), size=len(confirmation))
         return train, confirmation.iloc[picks].copy()
+
+    def repeated_refit_split(self, seed: int, train_fraction: float = 0.7):
+        """Fresh train/validation partition for genuine repeated refitting.
+
+        Draws from the modelling pool (scout + selection) — never the reserved
+        ``final_validation`` partition — and produces a new random split per
+        seed so the candidate model is refit on independent training rows each
+        time. Used by :class:`RepeatedRefitValidator`.
+        """
+        frames = [self.scout]
+        if len(self.selection):
+            frames.append(self.selection)
+        pool = pd.concat(frames, ignore_index=True) if len(frames) > 1 else self.scout.reset_index(drop=True)
+        n = len(pool)
+        if n < 6:
+            return pool.copy(), pool.copy()
+        idx = np.arange(n)
+        np.random.default_rng(1_000_003 + seed).shuffle(idx)
+        cut = max(3, min(n - 3, int(n * train_fraction)))
+        train = pool.iloc[idx[:cut]].copy()
+        val = pool.iloc[idx[cut:]].copy()
+        return train, val
 
     def _get_y(self, df: pd.DataFrame, col: str) -> np.ndarray:
         y = pd.to_numeric(df[col], errors="coerce").to_numpy(float)

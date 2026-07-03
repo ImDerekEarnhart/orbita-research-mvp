@@ -191,6 +191,9 @@ class ResearchCompiler:
                 "cross_seed_count": 9,
                 "cross_seed_min": 0.15,
                 "cross_seed_max_spread": 0.65,
+                # Number of independent fresh-partition refits used by the
+                # diagnostic-only RepeatedRefitValidator (model reproducibility).
+                "repeated_refit_count": 12,
                 "composite_min_predictors": 2,
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,
@@ -281,12 +284,22 @@ class ResearchCompiler:
                     }
                 )
             if column.get("inferred_role") == "identifier":
+                signals = column.get("identifier_signals", {}) or {}
+                shape = signals.get("shape", "near-unique")
+                uniq = signals.get("uniqueness")
+                uniq_txt = f" ({uniq:.0%} unique)" if isinstance(uniq, (int, float)) else ""
                 findings.append(
                     {
                         "type": "artifact_guard",
                         "severity": "low",
                         "title": f"Identifier excluded: {column['name']}",
-                        "detail": "The column appears unique per row and is excluded from automatic relation mining.",
+                        "detail": (
+                            f"Detected as a likely row identifier (shape: {shape}{uniq_txt}) and "
+                            f"excluded from automatic relation mining. It is recorded as a data-quality "
+                            f"artifact rather than silently dropped."
+                        ),
+                        "identifier_signals": signals,
+                        "column": column["name"],
                     }
                 )
         return findings

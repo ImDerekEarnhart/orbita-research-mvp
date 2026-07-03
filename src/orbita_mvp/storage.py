@@ -395,6 +395,7 @@ class CaseStore:
         counts = {
             "committed": 0, "rejected": 0, "artifact": 0, "provisional": 0, "unresolved": 0,
             "not_supported": 0, "inconclusive": 0, "functional_form_rejected": 0,
+            "supported_association": 0, "regime_dependent": 0,
         }
         for claim in claims:
             state = public_state(claim.get("finding_type"))
@@ -422,6 +423,8 @@ class CaseStore:
             "not_supported_count": counts["not_supported"],
             "inconclusive_count": counts["inconclusive"],
             "functional_form_rejected_count": counts["functional_form_rejected"],
+            "supported_association_count": counts["supported_association"],
+            "regime_dependent_count": counts["regime_dependent"],
             "filtered_count": max(0, max(generated, persisted) - persisted),
             "structural_relations_detected": structural,
         }

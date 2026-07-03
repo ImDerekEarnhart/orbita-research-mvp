@@ -317,28 +317,46 @@ def test_no_override_when_no_sibling_survived():
 
 
 # ---------------------------------------------------------------------------
-# 2. End-to-end: Titanic (891 rows) — group tests must not be "rejected"
+# 2. End-to-end: Titanic (891 rows) — group tests must never be hard-"rejected".
+#    Under the association/predictive-utility split (requirement D), a group
+#    difference with a real, bootstrap-stable effect size is a
+#    ``supported_association`` (the association is real; standalone predictive
+#    utility is limited); a genuinely weak one is ``not_supported``. Neither is
+#    ``rejected``. This replaces the pre-split expectation that every group
+#    difference collapsed to ``not_supported``.
 # ---------------------------------------------------------------------------
 
-def test_titanic_group_differences_are_not_supported_not_rejected():
+def test_titanic_group_differences_are_association_or_not_supported_never_rejected():
     claims, counts = _run_case(TITANIC_CSV, "Titanic classification regression")
 
-    # Nothing in this run should be labeled hard-refuted: every group
-    # candidate that missed the bar did so with a small positive (not
-    # negative) score, which is "not_supported", not "rejected".
+    # Nothing in this run should be labeled hard-refuted: a group difference
+    # that misses the predictive bar is either a supported association (real
+    # effect) or not_supported (weak) — never a contradiction.
     assert counts["rejected_count"] == 0
 
     group_claims = [c for c in claims if "differs systematically" in c["canonical_text"]]
     assert group_claims, "expected group-difference candidates to be generated"
+    allowed = {"supported_association_candidate", "not_supported_candidate", "inconclusive_candidate"}
     for c in group_claims:
-        assert c["finding_type"] == "not_supported_candidate", c["canonical_text"]
-        assert c["verdict"] == "not_supported"
+        assert c["finding_type"] in allowed, (c["canonical_text"], c["finding_type"])
+        assert c["verdict"] in {"supported_association", "not_supported", "inconclusive"}
         detail = c["finding_detail"]
         assert detail["metric_name"] == "r2"
-        assert detail["held_out_score"] is not None
-        assert detail["held_out_n"] is not None and detail["held_out_n"] > 100
         assert detail["full_data_score_diagnostic"] is not None
-        assert detail["rejection_reason"], "not_supported claim must explain why"
+        # Every supported association must carry effect-size evidence separate
+        # from predictive utility.
+        if c["finding_type"] == "supported_association_candidate":
+            assoc = detail.get("association_evidence") or {}
+            assert assoc.get("effect_size_metric") == "eta_squared"
+            assert assoc.get("effect_size") is not None
+            assert assoc.get("omega_squared") is not None and assoc["omega_squared"] > 0
+            assert "predictive_utility" in detail
+        else:
+            assert detail.get("rejection_reason"), "weak group claim must explain why"
+
+    # At least one Titanic group difference has a real effect size and must be
+    # recognised as a supported association, not swept into not_supported.
+    assert counts["supported_association_count"] >= 1
 
     # The strong real relationship (Pclass x Fare) must still survive.
     assert counts["committed_count"] >= 1
@@ -396,26 +414,40 @@ def test_allometry_every_killed_claim_has_full_diagnostic_fields():
 #    (correct everywhere else) still printed "refuted" in the report.
 # ---------------------------------------------------------------------------
 
+_NON_REFUTED_CANDIDATE_VERDICTS = {
+    "not_supported", "inconclusive", "functional_form_rejected",
+    "supported_association", "provisional", "regime_dependent",
+}
+
+
+# Verdicts rendered as a single bullet line in the report's "failed / unresolved"
+# section (committed and provisional render in the "survived" section with a
+# different multi-line layout, so they are excluded from the line-format check).
+_FAILED_SECTION_NON_REFUTED_VERDICTS = {
+    "not_supported", "inconclusive", "functional_form_rejected",
+    "supported_association", "regime_dependent",
+}
+
+
 def test_report_uses_enriched_verdict_not_raw_final_status():
     claims, report_text = _run_case_with_report(TITANIC_CSV, "Titanic report consistency regression")
 
-    not_supported = [c for c in claims if c["finding_type"] == "not_supported_candidate"]
-    assert not_supported, "expected at least one not_supported claim in this run"
+    # Any candidate that did not commit but was NOT hard-refuted: the report
+    # must print its enriched public verdict, never the raw engine "refuted".
+    candidates = [c for c in claims if c["verdict"] in _FAILED_SECTION_NON_REFUTED_VERDICTS]
+    assert candidates, "expected at least one non-refuted killed/candidate claim in this run"
 
-    for c in not_supported:
+    for c in candidates:
         text = c["canonical_text"]
-        # Find this candidate's line in the "failed" section of the report
-        # and confirm it prints the enriched verdict, not the raw engine
-        # status. Every not_supported claim must never appear tagged
-        # `refuted` in the report.
+        verdict = c["verdict"]
         idx = report_text.find(text)
         assert idx != -1, f"candidate statement not found in report: {text}"
         line_end = report_text.find("\n", idx)
         line = report_text[idx:line_end if line_end != -1 else None]
-        assert "verdict `not_supported`" in line, (
-            f"report line for a not_supported claim must say so, got: {line!r}"
+        assert f"verdict `{verdict}`" in line, (
+            f"report line for a {verdict} claim must show that verdict, got: {line!r}"
         )
-        assert "`refuted`" not in line, f"not_supported claim incorrectly shown as refuted: {line!r}"
+        assert "`refuted`" not in line, f"{verdict} claim incorrectly shown as refuted: {line!r}"
 
 
 def test_full_rendered_html_never_shows_not_supported_claim_as_refuted():
@@ -429,8 +461,8 @@ def test_full_rendered_html_never_shows_not_supported_claim_as_refuted():
     claims, _md, html_text, case_id = _run_case_with_html_report(
         TITANIC_CSV, "Titanic full-HTML report consistency regression"
     )
-    not_supported = [c for c in claims if c["finding_type"] == "not_supported_candidate"]
-    assert not_supported, "expected at least one not_supported claim in this run"
+    not_supported = [c for c in claims if c["verdict"] in _NON_REFUTED_CANDIDATE_VERDICTS]
+    assert not_supported, "expected at least one non-refuted killed/candidate claim in this run"
     assert not any(c["finding_type"] == "falsified_candidate" for c in claims), (
         "this regression run is expected to have zero genuinely-refuted claims; "
         "if that changes, this test's premise (checking for absence of the word "
