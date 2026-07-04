@@ -143,6 +143,11 @@ class ResearchCompiler:
         identifier_columns = [
             c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "identifier"
         ]
+        # Repeated-entity / grouping-key columns (e.g. episode_id) are recognised
+        # as entity labels and excluded from feature mining like identifiers.
+        repeated_entity_columns = [
+            c["name"] for c in profile.get("column_profiles", []) if c.get("inferred_role") == "repeated_entity"
+        ]
         # Temporal-index columns stay AVAILABLE for mining (not excluded like
         # identifiers). A clear ordered calendar/sequence axis additionally drives
         # chronological (time-ordered) validation.
@@ -174,7 +179,7 @@ class ResearchCompiler:
             df,
             goal=case.get("goal", ""),
             max_candidates=max_candidates,
-            exclude_columns=identifier_columns,
+            exclude_columns=identifier_columns + repeated_entity_columns,
             target_column=target_column,
             near_copy_r2=near_copy_r2,
             near_copy_corr=near_copy_corr,
@@ -206,7 +211,8 @@ class ResearchCompiler:
             "source_context": [self._source_summary(item) for item in texts],
             "data_profile": profile,
             "quality_findings": quality_findings,
-            "excluded_from_candidate_generation": identifier_columns,
+            "excluded_from_candidate_generation": identifier_columns + repeated_entity_columns,
+            "repeated_entity_columns": repeated_entity_columns,
             "temporal_columns": temporal_columns,
             "chronological_axis": chronological_axis,
             "candidate_generation": generation,
@@ -346,6 +352,39 @@ class ResearchCompiler:
                             f"artifact rather than silently dropped."
                         ),
                         "identifier_signals": signals,
+                        "column": column["name"],
+                    }
+                )
+            if column.get("inferred_role") == "repeated_entity":
+                sig = column.get("entity_signals", {}) or {}
+                findings.append(
+                    {
+                        "type": "artifact_guard",
+                        "severity": "low",
+                        "title": f"Repeated-entity column: {column['name']}",
+                        "detail": (
+                            f"Detected as a repeated-entity / grouping key "
+                            f"({sig.get('n_groups', '?')} entities, ~{sig.get('mean_group_size', '?')} rows each). "
+                            f"Excluded from feature mining; its rows belong to the same entity and should be "
+                            f"split/validated together rather than treated as independent observations."
+                        ),
+                        "entity_signals": sig,
+                        "column": column["name"],
+                    }
+                )
+            if column.get("inferred_role") == "temporal_index":
+                sig = column.get("temporal_signals", {}) or {}
+                findings.append(
+                    {
+                        "type": "data_quality",
+                        "severity": "low",
+                        "title": f"Temporal index: {column['name']}",
+                        "detail": (
+                            f"Detected as a temporal index (axis kind: {sig.get('axis_kind', 'temporal')}). "
+                            f"Kept available for mining as an ordered axis; drives chronological validation "
+                            f"when it is a clear ordered calendar/sequence axis."
+                        ),
+                        "temporal_signals": sig,
                         "column": column["name"],
                     }
                 )

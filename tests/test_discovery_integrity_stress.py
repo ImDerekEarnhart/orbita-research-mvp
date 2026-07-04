@@ -625,6 +625,31 @@ def test_nonlinear_budget_does_not_crowd_out_linear_pairs():
     assert len(full) > len(lin_only)
 
 
+# --- Repeated-entity (grouping-key) role ------------------------------------
+
+def test_repeated_entity_role_distinct_from_identifier_and_category():
+    from orbita_mvp.ingestion import detect_repeated_entity, profile_dataframe
+
+    n = 300
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({
+        "transition_id": range(n),                       # unique -> identifier
+        "episode_id": np.repeat(np.arange(n // 6), 6),   # 50 entities x 6 rows -> repeated_entity
+        "world_mode": rng.choice(["A", "B", "C"], n),    # low-cardinality category, NOT entity
+        "value": rng.normal(size=n),
+    })
+    # Direct detector: episode_id is a repeated entity; world_mode is not.
+    assert detect_repeated_entity(df["episode_id"], "episode_id") is not None
+    assert detect_repeated_entity(df["world_mode"], "world_mode") is None
+    # A non-unique column WITHOUT an entity-style name is not swept in.
+    assert detect_repeated_entity(pd.Series(np.repeat(np.arange(50), 6), name="score_band"), "score_band") is None
+
+    roles = {c["name"]: c["inferred_role"] for c in profile_dataframe(df)["column_profiles"]}
+    assert roles["transition_id"] == "identifier"
+    assert roles["episode_id"] == "repeated_entity"
+    assert roles["world_mode"] == "group_or_category"
+
+
 # --- C: temporal-axis detection --------------------------------------------
 
 def test_temporal_axis_distinguished_from_identifier():

@@ -33,6 +33,14 @@ CHRONO_AXIS_KINDS = frozenset({"year", "date", "datetime", "timestamp"})
 # String identifier shapes: UUIDs, and prefixed sequences like OBS-0001 / SUBJ_12.
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _PREFIXED_SEQ_RE = re.compile(r"^[A-Za-z]{1,12}[-_ ]?\d{1,}$")
+# Repeated-entity (grouping-key) name hints: a NON-unique id that labels a
+# repeated entity/unit each appearing on multiple rows (e.g. episode_id,
+# subject_id, patient_id). Distinct from a unique row identifier.
+_ENTITY_NAME_TOKENS = (
+    "episode", "subject", "patient", "participant", "session", "trial",
+    "entity", "cluster", "unit", "group_id", "series", "run_id", "case_id",
+    "user", "customer", "account", "device", "batch",
+)
 
 
 def detect_identifier(series: pd.Series, name: str) -> dict[str, Any] | None:
@@ -137,6 +145,41 @@ def detect_temporal(series: pd.Series, name: str, identifier_signals: dict[str, 
     return None
 
 
+def detect_repeated_entity(series: pd.Series, name: str) -> dict[str, Any] | None:
+    """Detect a repeated-entity / grouping-key column (e.g. ``episode_id``).
+
+    Distinct from a unique row identifier: this labels an entity that recurs
+    across multiple rows (each value appears more than once). Requires an
+    entity-style name token plus a grouping cardinality — non-unique, with a
+    meaningful mean group size — so ordinary low-cardinality categoricals
+    (e.g. ``world_mode``) and unique identifiers are not swept in. Such a column
+    marks rows that should be split/validated together, not mined as a feature.
+    """
+    n = int(len(series))
+    if n < 20:
+        return None
+    normalized = name.lower().replace(" ", "_")
+    if not any(tok in normalized for tok in _ENTITY_NAME_TOKENS):
+        return None
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return None
+    unique = int(non_null.nunique())
+    if unique < 2 or unique >= len(non_null):  # must repeat, and not be unique
+        return None
+    uniqueness = unique / len(non_null)
+    mean_group_size = len(non_null) / unique
+    # Grouping-like: repeats present (mean group size >= 2) and not near-unique.
+    if mean_group_size < 2.0 or uniqueness > 0.6:
+        return None
+    return {
+        "n_groups": unique,
+        "mean_group_size": round(mean_group_size, 3),
+        "uniqueness": round(uniqueness, 4),
+        "name_token_match": True,
+    }
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -191,16 +234,23 @@ def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
         # Temporal-axis detection takes precedence over identifier: an ordered
         # time axis (year/date/…) must not be excluded as a row id.
         temporal_signals = detect_temporal(s, name, identifier_signals)
+        entity_signals = None
         if temporal_signals is not None:
             role = "temporal_index"
             identifier_signals = None
         elif identifier_signals is not None:
             role = "identifier"
-        if role not in ("identifier", "temporal_index") and any(
+        else:
+            # Repeated-entity / grouping key (non-unique id) — recognised before
+            # the generic group/measurement fallthrough.
+            entity_signals = detect_repeated_entity(s, name)
+            if entity_signals is not None:
+                role = "repeated_entity"
+        if role not in ("identifier", "temporal_index", "repeated_entity") and any(
             token in normalized for token in ("date", "time", "timestamp")
         ):
             role = "time"
-        if role not in ("identifier", "temporal_index") and any(
+        if role not in ("identifier", "temporal_index", "repeated_entity") and any(
             token in normalized for token in ("label", "class", "group", "condition", "diagnosis", "treatment")
         ):
             role = "group_or_category"
@@ -218,6 +268,8 @@ def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
             column_profile["identifier_signals"] = identifier_signals
         if temporal_signals is not None:
             column_profile["temporal_signals"] = temporal_signals
+        if entity_signals is not None:
+            column_profile["entity_signals"] = entity_signals
         profile["column_profiles"].append(column_profile)
     return profile
 
