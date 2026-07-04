@@ -86,12 +86,47 @@ def _forward_select(scout: pd.DataFrame, target: str, pool: list[str], max_predi
     return chosen
 
 
+def _encode_categoricals(
+    scout: pd.DataFrame,
+    heldout: pd.DataFrame,
+    categorical_columns: list[str],
+    max_levels: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict[str, str]]:
+    """Bounded one-hot/binary encoding of low-cardinality categorical predictors.
+
+    Levels are taken from the union of scout+heldout so both frames get the same
+    dummy columns. High-cardinality columns (> ``max_levels`` levels) are skipped,
+    keeping IDs / repeated entities out. Returns augmented frames, the new dummy
+    column names, and a ``dummy -> source column`` map for reporting.
+    """
+    aug_scout = scout.copy()
+    aug_heldout = heldout.copy()
+    dummy_pool: list[str] = []
+    dummy_source: dict[str, str] = {}
+    for col in categorical_columns:
+        if col not in scout.columns or col not in heldout.columns:
+            continue
+        levels = pd.unique(pd.concat([scout[col], heldout[col]], ignore_index=True).dropna().astype(str))
+        if len(levels) < 2 or len(levels) > max_levels:
+            continue
+        # Drop the first level to avoid perfect collinearity (reference category).
+        for lvl in sorted(levels)[1:]:
+            dummy = f"{col}=={lvl}"
+            aug_scout[dummy] = (scout[col].astype(str) == lvl).astype(float)
+            aug_heldout[dummy] = (heldout[col].astype(str) == lvl).astype(float)
+            dummy_pool.append(dummy)
+            dummy_source[dummy] = col
+    return aug_scout, aug_heldout, dummy_pool, dummy_source
+
+
 def detect_multivariable_derived(
     scout: pd.DataFrame,
     heldout: pd.DataFrame,
     target_columns: list[str],
     predictor_pool: list[str],
     *,
+    categorical_columns: list[str] | None = None,
+    max_categorical_levels: int = 8,
     recon_r2_min: float = 0.998,
     residual_ratio_max: float = 0.005,
     margin_min: float = 0.02,
@@ -102,13 +137,31 @@ def detect_multivariable_derived(
     """Return ``{target -> derived-record}`` for near-deterministically reconstructed targets.
 
     Uses scout-only feature selection + fitting and untouched held-out validation.
-    Thresholds are near-determinism conventions (extremely high held-out R²,
-    near-zero residual, real margin over the best single predictor), NOT tuned to
-    any dataset.
+    Low-cardinality categorical/binary predictors are one-hot encoded (bounded) so
+    a constructed index that depends on a categorical term (e.g. a gate/flag) can
+    be reconstructed; high-cardinality categoricals are skipped. Thresholds are
+    near-determinism conventions (extremely high held-out R², near-zero residual,
+    real margin over the best single predictor), NOT tuned to any dataset.
     """
     out: dict[str, dict[str, Any]] = {}
     if len(scout) < 10 or len(heldout) < 5:
         return out
+    dummy_source: dict[str, str] = {}
+    if categorical_columns:
+        scout, heldout, dummy_pool, dummy_source = _encode_categoricals(
+            scout, heldout, categorical_columns, max_categorical_levels
+        )
+        # Categorical dummies expand the predictor pool only (never targets).
+        predictor_pool = list(predictor_pool) + [d for d in dummy_pool if d not in predictor_pool]
+
+    def _to_source_vars(feats: list[str]) -> list[str]:
+        """Map dummy features back to their source categorical column (de-duplicated)."""
+        out_vars: list[str] = []
+        for f in feats:
+            src = dummy_source.get(f, f)
+            if src not in out_vars:
+                out_vars.append(src)
+        return out_vars
     for target in target_columns:
         pool = [c for c in predictor_pool if c != target]
         if len(pool) < min_predictors:
@@ -171,9 +224,16 @@ def detect_multivariable_derived(
         if refit_median < refit_stability_min:
             continue
         coefs = {f: round(float(c), 6) for f, c in zip(feats, best[1][1:1 + len(feats)])}
+        source_vars = _to_source_vars(feats)
+        # A cluster needs >= 2 DISTINCT source variables — a target reconstructed
+        # from the dummies of a single categorical is just a lookup/group effect,
+        # not a multivariable dependency cluster.
+        if len({target, *source_vars}) < min_predictors + 1:
+            continue
         out[target] = {
             "target": target,
-            "source_variables": feats,
+            "source_variables": source_vars,
+            "encoded_features": feats,
             "construction": construction,
             "coefficients": coefs,
             "intercept": round(float(best[1][0]), 6),

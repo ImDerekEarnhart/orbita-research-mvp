@@ -625,6 +625,48 @@ def test_nonlinear_budget_does_not_crowd_out_linear_pairs():
     assert len(full) > len(lin_only)
 
 
+# --- Categorical-aware multivariable dependency clusters (HW-05) ------------
+
+def test_dependency_cluster_with_numeric_and_categorical_term():
+    from orbita_mvp.derived import detect_multivariable_derived
+
+    rng = np.random.default_rng(0)
+    n = 400
+    x1 = rng.uniform(0, 10, n)
+    x2 = rng.uniform(0, 10, n)
+    cat = rng.choice(["A", "B"], n)
+    # A constructed index that depends on numeric terms AND a binary/categorical term.
+    idx = 2.0 * x1 + 3.0 * x2 + 5.0 * (cat == "B") + rng.normal(0, 0.01, n)
+    df = pd.DataFrame({"x1": x1, "x2": x2, "cat": cat, "idx": idx})
+    scout, heldout = df.iloc[:250], df.iloc[250:]
+
+    res = detect_multivariable_derived(
+        scout, heldout, ["x1", "x2", "idx"], ["x1", "x2", "idx"], categorical_columns=["cat"]
+    )
+    assert "idx" in res, "a constructed index depending on a categorical term must be detected"
+    assert "cat" in res["idx"]["source_variables"], "the categorical member must be named (mapped from its dummy)"
+    assert res["idx"]["held_out_r2"] >= 0.99
+
+
+def test_ordinary_group_difference_not_flagged_as_dependency_cluster():
+    from orbita_mvp.derived import detect_multivariable_derived
+
+    rng = np.random.default_rng(1)
+    n = 400
+    g = rng.choice(["A", "B", "C"], n)
+    base = {"A": 1.0, "B": 5.0, "C": 9.0}
+    y = np.array([base[gg] for gg in g]) + rng.normal(0, 2.0, n)   # noisy group effect
+    x1 = rng.uniform(0, 10, n)
+    x2 = rng.uniform(0, 10, n)
+    df = pd.DataFrame({"g": g, "y": y, "x1": x1, "x2": x2})
+    scout, heldout = df.iloc[:250], df.iloc[250:]
+
+    res = detect_multivariable_derived(
+        scout, heldout, ["y", "x1", "x2"], ["y", "x1", "x2"], categorical_columns=["g"]
+    )
+    assert "y" not in res, "an ordinary (noisy) group difference must NOT be flagged as a dependency cluster"
+
+
 # --- Informative missingness (MNAR) diagnostic ------------------------------
 
 def test_informative_missingness_detects_mnar_not_mcar():

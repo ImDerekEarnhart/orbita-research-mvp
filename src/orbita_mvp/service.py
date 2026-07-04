@@ -925,12 +925,19 @@ class ResearchMVP:
         # near-deterministically reconstructed from a small subset of columns.
         derived_by_target: dict[str, dict[str, Any]] = {}
         if domain is not None and getattr(domain, "scout", None) is not None and len(getattr(domain, "selection", [])) >= 5:
-            numeric_cols = list((plan.get("candidate_generation", {}) or {}).get("numeric_columns", []) or [])
+            gen_meta = plan.get("candidate_generation", {}) or {}
+            numeric_cols = list(gen_meta.get("numeric_columns", []) or [])
+            # Low-cardinality categorical/binary columns (already exclude
+            # identifiers / repeated entities) are one-hot encoded inside the
+            # detector so a constructed index that depends on a categorical/binary
+            # term can be reconstructed.
+            categorical_cols = list(gen_meta.get("categorical_columns", []) or [])
             if len(numeric_cols) >= 3:
                 try:
                     from .derived import detect_multivariable_derived
                     derived_by_target = detect_multivariable_derived(
-                        domain.scout, domain.selection, numeric_cols, numeric_cols
+                        domain.scout, domain.selection, numeric_cols, numeric_cols,
+                        categorical_columns=categorical_cols,
                     )
                 except Exception:
                     derived_by_target = {}
