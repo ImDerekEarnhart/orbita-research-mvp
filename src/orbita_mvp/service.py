@@ -1415,6 +1415,21 @@ class ResearchMVP:
                     # relationships are auto-contaminated (the source is not flagged).
                     "derivation_direction": "undetermined",
                 }
+            elif artifact.get("artifact_kind") in ("derived_field", "near_derived_field"):
+                artifact_detail["artifact_warning"] = {
+                    "type": "derived_dependency_field",
+                    "leakage_risk": artifact.get("leakage_risk", "high"),
+                    "op": artifact.get("op"),
+                    "inputs": artifact.get("inputs"),
+                    "similarity": artifact.get("similarity"),
+                    "residual_variance_ratio": artifact.get("residual_variance_ratio"),
+                    "disposition": artifact.get("disposition", "downgraded_to_artifact"),
+                    "note": (
+                        "This column is a (near-)deterministic algebraic function of other columns "
+                        "(an accounting identity), so its relationships are derived, not independent "
+                        "discoveries."
+                    ),
+                }
             self.store.link_claim(
                 case_id=case_id,
                 run_id=case_run_id,

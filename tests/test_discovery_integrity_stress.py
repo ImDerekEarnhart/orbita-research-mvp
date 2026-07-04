@@ -569,6 +569,36 @@ def test_derived_cluster_public_label_and_drawer_fields_display_only():
             svc.close()
 
 
+# --- Near-exact accounting identity (derived-field) detection --------------
+
+def test_near_exact_accounting_identity_flagged_but_weighted_composite_is_not():
+    from orbita_mvp.artifacts import detect_structural_relations
+
+    rng = np.random.default_rng(0)
+    n = 300
+    a = rng.uniform(10, 100, n)
+    b = rng.uniform(1, 20, n)
+    # A near-exact UNIT-coefficient accounting identity (a - b + tiny noise).
+    identity = a - b + rng.normal(0, 0.01, n)
+    # A genuine WEIGHTED composite (fitted coefficients) -- must NOT be flagged.
+    composite = 5.0 * a + 5.0 * b + rng.normal(0, 0.02, n)
+    df = pd.DataFrame({"a": a, "b": b, "identity": identity, "composite": composite})
+    rel = detect_structural_relations(df, numeric_columns=["a", "b", "identity", "composite"])
+    kinds = {v.get("kind") for v in rel.values()}
+    cols_flagged = set()
+    for v in rel.values():
+        cols_flagged.update(v.get("inputs", []) or [])
+        cols_flagged.update(c for c in (v.get("columns") or []))
+    # The unit identity is caught as a (near-)derived field...
+    derived = [v for v in rel.values() if v.get("kind") in ("derived_field", "near_derived_field")
+               and "identity" in (v.get("columns") or [])]
+    assert derived, "near-exact unit accounting identity should be flagged as derived"
+    # ...but the weighted composite is left mineable, not flagged as derived.
+    comp_derived = [v for v in rel.values() if v.get("kind") in ("derived_field", "near_derived_field")
+                    and "composite" in (v.get("columns") or [])]
+    assert not comp_derived, "a weighted composite (slope != 1) must not be flagged as a derived field"
+
+
 # --- B: candidate-family budgeting -----------------------------------------
 
 def test_nonlinear_budget_does_not_crowd_out_linear_pairs():

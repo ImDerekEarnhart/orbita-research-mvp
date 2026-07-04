@@ -162,27 +162,87 @@ def _classify_pair(
     return None
 
 
-def _classify_derived(df: pd.DataFrame, target: str, others: list[str]) -> dict[str, Any] | None:
-    """Detect target ≈ f(a, b) for a deterministic two-column combination."""
+def _classify_derived(
+    df: pd.DataFrame,
+    target: str,
+    others: list[str],
+    *,
+    near_derived_r2: float = _NEAR_COPY_R2,
+) -> dict[str, Any] | None:
+    """Detect ``target ≈ f(a, b)`` for a (near-)deterministic two-column combination.
+
+    Two bands, mirroring the near-copy logic:
+
+    * **Exact** (``R² ≥ _EXACT_R2``): a machine-exact algebraic construction
+      (e.g. ``total_mass = m1 + m2``) → ``derived_field``.
+    * **Near-exact** (``near_derived_r2 ≤ R² < _EXACT_R2``): a noisy accounting
+      identity — the target is an algebraic combination of two columns plus small
+      residual noise or output rounding (e.g. ``energy_after ≈ energy_before −
+      energy_cost``) → ``near_derived_field``. A genuine empirical law almost
+      never reconstructs to an *exact algebraic op of two specific columns* at
+      R² ≥ 0.999 with real scatter, so this is a strong, general derived-field
+      signal — not tuned to any dataset.
+
+    Returns the tightest match across all column pairs and ops.
+    """
     y = _numeric(df, target)
+    finite_y = y[np.isfinite(y)]
+    std_y = float(np.std(finite_y)) if len(finite_y) else 0.0
     ops = (
         ("sum", lambda a, b: a + b),
         ("difference", lambda a, b: a - b),
         ("product", lambda a, b: a * b),
         ("ratio", lambda a, b: np.divide(a, b, out=np.full_like(a, np.nan), where=np.abs(b) > 1e-12)),
     )
+    # Track the best EXACT reconstruction (any coefficients) and, separately, the
+    # best near-exact reconstruction that is a UNIT-coefficient identity.
+    best_exact: tuple[float, str, str, str] | None = None
+    best_identity: tuple[float, str, str, str] | None = None
     for a_name, b_name in combinations(others, 2):
         a, b = _numeric(df, a_name), _numeric(df, b_name)
         for op_name, fn in ops:
             with np.errstate(all="ignore"):
                 combo = fn(a, b)
             r2, slope, intercept = _affine_r2(combo, y)
-            if math.isfinite(r2) and r2 >= _EXACT_R2:
-                return {
-                    "kind": "derived_field",
-                    "detail": f"{target} ≈ {op_name}({a_name}, {b_name})",
-                    "inputs": [a_name, b_name],
-                }
+            if not math.isfinite(r2):
+                continue
+            if r2 >= _EXACT_R2 and (best_exact is None or r2 > best_exact[0]):
+                best_exact = (r2, op_name, a_name, b_name)
+            # Near-exact band requires a UNIT-COEFFICIENT identity (slope ≈ ±1,
+            # intercept ≈ 0): the target literally equals a ± b (an accounting
+            # identity) plus small residual noise — NOT a weighted regression like
+            # y = 5·x2 + 5·x3, which is a genuine composite to be discovered.
+            near_identity = (
+                abs(abs(slope) - 1.0) <= 0.05
+                and (std_y == 0.0 or abs(intercept) <= 0.05 * std_y)
+            )
+            if r2 >= near_derived_r2 and near_identity and (best_identity is None or r2 > best_identity[0]):
+                best_identity = (r2, op_name, a_name, b_name)
+
+    if best_exact is not None:
+        r2, op_name, a_name, b_name = best_exact
+        return {
+            "kind": "derived_field",
+            "detail": f"{target} ≈ {op_name}({a_name}, {b_name})",
+            "inputs": [a_name, b_name],
+        }
+    if best_identity is not None:
+        r2, op_name, a_name, b_name = best_identity
+        residual_ratio = max(0.0, 1.0 - float(r2))
+        return {
+            "kind": "near_derived_field",
+            "detail": (
+                f"{target} ≈ {op_name}({a_name}, {b_name}) "
+                f"(near-exact accounting identity, R²={r2:.6f}, residual variance ratio={residual_ratio:.2e})"
+            ),
+            "inputs": [a_name, b_name],
+            "leakage_risk": "high",
+            "similarity_metric": "affine_r2",
+            "similarity": round(float(r2), 6),
+            "residual_variance_ratio": round(residual_ratio, 8),
+            "op": op_name,
+            "disposition": "downgraded_to_artifact",
+        }
     return None
 
 
@@ -193,6 +253,7 @@ def detect_structural_relations(
     *,
     near_copy_r2: float = _NEAR_COPY_R2,
     near_copy_corr: float = _NEAR_COPY_CORR,
+    near_derived_r2: float = _NEAR_COPY_R2,
 ) -> dict[str, dict[str, Any]]:
     """Return a map from "colA||colB" (sorted) to a structural classification.
 
@@ -222,11 +283,14 @@ def detect_structural_relations(
         if _single_key(target) in relations:
             continue
         others = [c for c in numeric_columns if c != target]
-        derived = _classify_derived(df, target, others)
+        derived = _classify_derived(df, target, others, near_derived_r2=near_derived_r2)
         if derived:
             inputs = derived.get("inputs", [])
             for src in inputs:
-                relations[_pair_key(target, src)] = {**derived, "columns": [target, src]}
+                # setdefault: never overwrite a more specific pair classification
+                # already found by _classify_pair (e.g. a near-copy), which is the
+                # correct label for that exact pair.
+                relations.setdefault(_pair_key(target, src), {**derived, "columns": [target, src]})
 
     for ident in identifier_columns:
         relations[_single_key(str(ident))] = {

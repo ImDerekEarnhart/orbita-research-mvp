@@ -162,6 +162,10 @@ class ResearchCompiler:
         )
         near_copy_r2 = 0.999
         near_copy_corr = 0.9995
+        # Near-exact algebraic accounting identities (a±b, a·b, a/b of two columns
+        # reconstructing a third with small residual noise) are flagged as
+        # derived/dependency fields, not mined as discoveries.
+        near_derived_r2 = 0.999
         # Separate budget for nonlinear family members so they never crowd
         # linear/group candidates out of the shared cap (candidate-family budgeting).
         nonlinear_budget = max(20, max_candidates)
@@ -174,6 +178,7 @@ class ResearchCompiler:
             target_column=target_column,
             near_copy_r2=near_copy_r2,
             near_copy_corr=near_copy_corr,
+            near_derived_r2=near_derived_r2,
             nonlinear_budget=nonlinear_budget,
             max_nonlinear_per_family=max_nonlinear_per_family,
         )
@@ -235,6 +240,7 @@ class ResearchCompiler:
                 # downgraded to an artifact instead of mined as a discovery.
                 "near_copy_r2": near_copy_r2,
                 "near_copy_corr": near_copy_corr,
+                "near_derived_r2": near_derived_r2,
                 "composite_min_predictors": 2,
                 "composite_max_predictors": 10,
                 "composite_min_improvement": 0.01,

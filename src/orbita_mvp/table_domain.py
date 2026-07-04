@@ -199,6 +199,7 @@ def generate_table_candidates(
     target_column: str | None = None,
     near_copy_r2: float = 0.999,
     near_copy_corr: float = 0.9995,
+    near_derived_r2: float = 0.999,
     nonlinear_budget: int = 40,
     max_nonlinear_per_family: int = 4,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -258,6 +259,7 @@ def generate_table_candidates(
     structural = detect_structural_relations(
         df, numeric_columns=numeric_columns,
         near_copy_r2=near_copy_r2, near_copy_corr=near_copy_corr,
+        near_derived_r2=near_derived_r2,
     )
     structural_relations: list[dict[str, Any]] = []
     seen_structural: set[str] = set()
@@ -289,6 +291,11 @@ def generate_table_candidates(
                             f"{y} is a likely derived variable / near-copy of {x} "
                             f"(target-leakage risk): {artifact.get('detail', '')}"
                         )
+                    elif akind in ("derived_field", "near_derived_field"):
+                        statement = (
+                            f"{artifact.get('detail', '')} — a derived/dependency relationship "
+                            f"(accounting identity), not an independent discovery."
+                        )
                     else:
                         statement = (
                             f"{x} and {y} are structurally related "
@@ -302,11 +309,12 @@ def generate_table_candidates(
                         "detail": artifact.get("detail", ""),
                         "columns": [x, y],
                     }
-                    # Carry near-copy / leakage evidence fields for persistence.
+                    # Carry near-copy / leakage / derived evidence fields for persistence.
                     for extra in (
                         "leakage_risk", "similarity_metric", "similarity", "correlation",
                         "residual_variance_ratio", "slope", "intercept",
                         "suspected_source_column", "derived_column_candidate", "disposition",
+                        "inputs", "op",
                     ):
                         if extra in artifact:
                             rel[extra] = artifact[extra]
