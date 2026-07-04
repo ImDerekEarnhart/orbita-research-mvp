@@ -194,6 +194,15 @@ class ResearchCompiler:
         generation["scout_fraction"] = scout_fraction
 
         quality_findings = self._quality_findings(profile)
+        # Informative-missingness (MNAR) diagnostics — a measurement-process
+        # observation, appended to the data-quality findings.
+        from .missingness import detect_informative_missingness
+        try:
+            informative_missingness = detect_informative_missingness(df)
+        except Exception:
+            informative_missingness = []
+        quality_findings = quality_findings + informative_missingness
+        informative_missingness_columns = [f["column"] for f in informative_missingness]
 
         plan: dict[str, Any] = {
             "schema_version": PLAN_SCHEMA_V03,
@@ -213,6 +222,7 @@ class ResearchCompiler:
             "quality_findings": quality_findings,
             "excluded_from_candidate_generation": identifier_columns + repeated_entity_columns,
             "repeated_entity_columns": repeated_entity_columns,
+            "informative_missingness_columns": informative_missingness_columns,
             "temporal_columns": temporal_columns,
             "chronological_axis": chronological_axis,
             "candidate_generation": generation,

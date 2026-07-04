@@ -1233,6 +1233,25 @@ class ResearchMVP:
             functional_form_override = None
             if candidate["id"] in overrides:
                 finding_type, functional_form_override = overrides[candidate["id"]]
+            # Informative-missingness reliability guard: a relationship on a column
+            # whose missingness is not-missing-at-random has biased complete-case
+            # evidence, so it is reported as provisional rather than committed.
+            informative_missingness_warning = None
+            _im_cols = set(plan.get("informative_missingness_columns", []) or [])
+            if _im_cols:
+                _hit = set(_candidate_columns(payload)) & _im_cols
+                if _hit:
+                    informative_missingness_warning = {
+                        "type": "informative_missingness",
+                        "columns": sorted(_hit),
+                        "note": (
+                            "A variable in this relationship has not-missing-at-random missingness; "
+                            "complete-case evidence may be biased, so this is reported as provisional, "
+                            "not committed."
+                        ),
+                    }
+                    if finding_type == "robust_relation":
+                        finding_type = "promising_candidate"
             influence_warning = None
             if (
                 dataframe is not None
@@ -1257,6 +1276,8 @@ class ResearchMVP:
                 model_family=model_family_by_cid.get(candidate["id"]),
                 subgroup_warning=subgroup_by_cid.get(candidate["id"]),
             )
+            if informative_missingness_warning:
+                detail["informative_missingness_warning"] = informative_missingness_warning
             self.store.link_claim(
                 case_id=case_id,
                 run_id=case_run_id,
@@ -1361,12 +1382,24 @@ class ResearchMVP:
             self.ledger.attest(claim_id, evidence, Stance.SUPPORT, actor="data-profiler", actor_role=ActorRole.TOOL)
             self.memory.synchronize_status(claim_id, rationale="Deterministic data-profile finding")
             claim_ids.append(claim_id)
+            quality_detail: dict[str, Any] = {
+                "hypothesis_text": text,
+                "finding_type": item.get("type", "data_quality"),
+                "verdict": "artifact",
+                "is_candidate_hypothesis": True,
+                "title": item.get("title"),
+                "detail": item.get("detail"),
+                "column": item.get("column"),
+            }
+            if item.get("informative_missingness"):
+                quality_detail["informative_missingness"] = item["informative_missingness"]
             self.store.link_claim(
                 case_id=case_id,
                 run_id=case_run_id,
                 claim_id=claim_id,
                 finding_type=item.get("type", "data_quality"),
                 source_candidate_id=f"quality:{index}",
+                finding_detail=quality_detail,
             )
 
         for artifact in plan.get("structural_relations", []):

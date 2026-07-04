@@ -625,6 +625,64 @@ def test_nonlinear_budget_does_not_crowd_out_linear_pairs():
     assert len(full) > len(lin_only)
 
 
+# --- Informative missingness (MNAR) diagnostic ------------------------------
+
+def test_informative_missingness_detects_mnar_not_mcar():
+    from orbita_mvp.missingness import detect_informative_missingness
+
+    rng = np.random.default_rng(0)
+    n = 500
+    z = rng.uniform(0, 10, n)
+    x = 2.0 * z + rng.normal(0, 1, n)
+    x[z > 7] = np.nan                      # MNAR: x missing when z is high
+    y = rng.normal(size=n)
+    y[rng.random(n) < 0.2] = np.nan        # MCAR: missing at random
+    df = pd.DataFrame({"z": z, "x": x, "y": y, "w": rng.normal(size=n)})
+
+    findings = detect_informative_missingness(df)
+    flagged = {f["column"] for f in findings}
+    assert "x" in flagged, "MNAR missingness (depends on z) must be flagged"
+    assert "y" not in flagged, "MCAR (random) missingness must NOT be flagged"
+
+    xf = next(f for f in findings if f["column"] == "x")["informative_missingness"]
+    assert "z" in [p["predictor"] for p in xf["strongest_predictors"]]
+    assert xf["effect_size"] > 0.2 and xf["missingness_rate"] > 0.05
+    assert xf["n_present"] > 0 and xf["n_missing"] > 0
+    assert xf["validation"]["folds_stable"] is True
+
+
+def test_informative_missingness_e2e_downgrades_committed_to_provisional():
+    # A moderately-missing numeric column whose missingness is informative should
+    # (a) get an informative-missingness data-quality finding, and (b) have any
+    # relationship on it reported provisional (with a warning), not committed.
+    rng = np.random.default_rng(1)
+    n = 500
+    z = rng.uniform(0, 10, n)
+    driver = rng.uniform(0, 10, n)
+    meas = 3.0 * z + rng.normal(0, 0.5, n)   # a real strong relationship z -> meas
+    meas[driver > 9] = np.nan                # ~10% MNAR: stays mineable (numeric_fraction ~0.9)
+    df = pd.DataFrame({"row_id": range(n), "z": z, "driver": driver, "meas": meas})
+    with tempfile.TemporaryDirectory() as td:
+        svc = ResearchMVP(Path(td) / "o.db", Path(td) / "ws")
+        try:
+            p = Path(td) / "d.csv"; df.to_csv(p, index=False)
+            c = svc.create_case(name="mnar", goal="")
+            svc.add_file(c["id"], p); svc.compile_case(c["id"]); svc.run_case(c["id"], auto_approve=True)
+            claims = svc.store.case_claims(c["id"])
+        finally:
+            svc.close()
+    # (a) informative-missingness finding present for meas.
+    im = [cl for cl in claims if (cl.get("finding_detail", {}) or {}).get("informative_missingness")]
+    assert any(cl["finding_detail"]["informative_missingness"]["column"] == "meas" for cl in im)
+    # (b) mined relationships on meas are provisional (not committed), with the warning.
+    mined_types = {"robust_relation", "promising_candidate", "supported_association_candidate"}
+    meas_rel = [cl for cl in claims if "meas" in cl["canonical_text"] and cl["finding_type"] in mined_types]
+    assert meas_rel, "expected a relationship on meas to be mined"
+    for cl in meas_rel:
+        assert cl["verdict"] != "committed", "relationship on an MNAR column must not be committed"
+        assert (cl["finding_detail"] or {}).get("informative_missingness_warning")
+
+
 # --- Repeated-entity (grouping-key) role ------------------------------------
 
 def test_repeated_entity_role_distinct_from_identifier_and_category():
