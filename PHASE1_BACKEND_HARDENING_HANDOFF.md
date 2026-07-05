@@ -38,7 +38,14 @@ Branch: `saas/phase1-backend-direct-access-hardening`
 - `python -m py_compile src/orbita_mvp/api.py src/orbita_mvp/upload_safety.py tests/test_backend_direct_access_hardening.py tests/test_api.py tests/test_tamper_endpoint_security.py` -> passed.
 
 ## Staging Results
-- Pending backend staging deploy and direct backend probes.
+- Deployed backend staging commit: `a160517`.
+- Railway deployment: `d18ea6a2-442c-49ff-8563-a6216d917a6f` -> `SUCCESS`.
+- `/health` public -> `200`.
+- Unauthenticated `/cases` and `/docs` -> `401`.
+- Wrong Basic `/cases` -> `401`.
+- Correct Basic create case -> `200`.
+- Valid direct backend CSV upload -> `200`.
+- Unsafe direct backend uploads -> `400`: `evil.exe`, `evil.csv.exe`, `evil.exe.csv`, `evil.zip`, `../evil.csv`, `C:\evil.csv`, PE magic `.csv`, ZIP magic `.csv`, shebang `.csv`, HTML/script `.csv`.
 
 ## Remaining Risks
 - Railway private networking/internal backend access is still pending.
@@ -49,4 +56,4 @@ Branch: `saas/phase1-backend-direct-access-hardening`
 - Backend-side deletion/export and production hardening checklist remain pending.
 
 ## Exact Next Step
-Commit, deploy this backend branch to staging only, then verify direct backend unsafe uploads are rejected while valid CSV and Basic Auth behavior still work.
+Plan Railway private networking/internal backend access and rotate backend Basic credentials before production.
