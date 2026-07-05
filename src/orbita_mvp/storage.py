@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -151,6 +152,106 @@ class CaseStore:
 
     def case_dir(self, case_id: str) -> Path:
         return self.workspace / "cases" / case_id
+
+    def delete_case(self, case_id: str) -> dict[str, Any]:
+        self.get_case(case_id)
+        case_root = (self.workspace / "cases").resolve()
+        case_dir = self.case_dir(case_id).resolve()
+        if case_dir.parent != case_root or case_dir.name != case_id:
+            raise ValueError("Unsafe case workspace path")
+
+        artifacts_removed = 0
+        if case_dir.exists():
+            artifacts_removed = sum(1 for path in case_dir.rglob("*") if path.is_file())
+
+        conn = self.ledger.db.conn
+        claim_rows = conn.execute(
+            """SELECT DISTINCT claim_id
+               FROM case_claims
+               WHERE case_id = ?""",
+            (case_id,),
+        ).fetchall()
+        claim_ids = [row["claim_id"] for row in claim_rows]
+        owned_claim_ids = [
+            claim_id
+            for claim_id in claim_ids
+            if conn.execute(
+                "SELECT COUNT(*) AS n FROM case_claims WHERE claim_id = ? AND case_id <> ?",
+                (claim_id, case_id),
+            ).fetchone()["n"] == 0
+        ]
+
+        deleted_counts: dict[str, int] = {}
+
+        def delete(sql: str, params: tuple[Any, ...]) -> None:
+            cursor = conn.execute(sql, params)
+            deleted_counts[sql.split()[2]] = deleted_counts.get(sql.split()[2], 0) + cursor.rowcount
+
+        try:
+            conn.execute("BEGIN")
+            delete("DELETE FROM case_reports WHERE case_id = ?", (case_id,))
+            delete("DELETE FROM case_claims WHERE case_id = ?", (case_id,))
+            delete("DELETE FROM case_runs WHERE case_id = ?", (case_id,))
+            delete("DELETE FROM analysis_plans WHERE case_id = ?", (case_id,))
+            delete("DELETE FROM case_files WHERE case_id = ?", (case_id,))
+
+            evidence_ids: list[str] = []
+            if owned_claim_ids:
+                placeholders = ",".join("?" for _ in owned_claim_ids)
+                evidence_rows = conn.execute(
+                    f"SELECT DISTINCT evidence_id FROM attestations WHERE claim_id IN ({placeholders})",
+                    tuple(owned_claim_ids),
+                ).fetchall()
+                evidence_ids = [row["evidence_id"] for row in evidence_rows]
+                delete(f"DELETE FROM contradictions WHERE claim_a IN ({placeholders}) OR claim_b IN ({placeholders})", tuple(owned_claim_ids) * 2)
+                proof_rows = conn.execute(
+                    f"SELECT DISTINCT proof_id FROM proof_premises WHERE premise_claim_id IN ({placeholders})",
+                    tuple(owned_claim_ids),
+                ).fetchall()
+                proof_ids = [row["proof_id"] for row in proof_rows]
+                if proof_ids:
+                    proof_placeholders = ",".join("?" for _ in proof_ids)
+                    delete(f"DELETE FROM proof_premises WHERE proof_id IN ({proof_placeholders})", tuple(proof_ids))
+                    delete(f"DELETE FROM proofs WHERE id IN ({proof_placeholders})", tuple(proof_ids))
+                delete(f"DELETE FROM proof_premises WHERE premise_claim_id IN ({placeholders})", tuple(owned_claim_ids))
+                delete(f"DELETE FROM proof_premises WHERE proof_id IN (SELECT id FROM proofs WHERE conclusion_claim_id IN ({placeholders}))", tuple(owned_claim_ids))
+                delete(f"DELETE FROM proofs WHERE conclusion_claim_id IN ({placeholders})", tuple(owned_claim_ids))
+                delete(f"DELETE FROM attestations WHERE claim_id IN ({placeholders})", tuple(owned_claim_ids))
+                delete(f"DELETE FROM relation_claims WHERE claim_id IN ({placeholders})", tuple(owned_claim_ids))
+                delete(f"DELETE FROM events WHERE entity_id IN ({placeholders})", tuple(owned_claim_ids))
+                delete(f"DELETE FROM claims WHERE id IN ({placeholders})", tuple(owned_claim_ids))
+
+            orphan_evidence_ids = [
+                evidence_id
+                for evidence_id in evidence_ids
+                if conn.execute(
+                    "SELECT COUNT(*) AS n FROM attestations WHERE evidence_id = ?",
+                    (evidence_id,),
+                ).fetchone()["n"] == 0
+            ]
+            if orphan_evidence_ids:
+                evidence_placeholders = ",".join("?" for _ in orphan_evidence_ids)
+                delete(f"DELETE FROM events WHERE entity_id IN ({evidence_placeholders})", tuple(orphan_evidence_ids))
+                delete(f"DELETE FROM evidence WHERE id IN ({evidence_placeholders})", tuple(orphan_evidence_ids))
+
+            delete("DELETE FROM research_cases WHERE id = ?", (case_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        if case_dir.exists():
+            try:
+                shutil.rmtree(case_dir)
+            except Exception as exc:
+                raise RuntimeError("Case artifacts could not be removed") from exc
+
+        return {
+            "deleted": True,
+            "case_id": case_id,
+            "artifacts_removed": artifacts_removed,
+            "records_removed": deleted_counts,
+        }
 
     def update_case(self, case_id: str, **fields: Any) -> dict[str, Any]:
         allowed = {"name", "goal", "domain_hint", "status", "mode"}

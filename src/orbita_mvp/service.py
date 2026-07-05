@@ -266,6 +266,9 @@ class ResearchMVP:
         record = self.ingestor.ingest(file_path, case_dir)
         return self.store.add_file_record(case_id, record)
 
+    def delete_case(self, case_id: str) -> dict[str, Any]:
+        return self.store.delete_case(case_id)
+
     def compile_case(
         self,
         case_id: str,

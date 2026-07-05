@@ -193,7 +193,7 @@ def _guard(callable_, *args, **kwargs):
     try:
         return callable_(*args, **kwargs)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="Unknown resource") from exc
     except (ValueError, TypeError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -228,6 +228,11 @@ def list_cases() -> dict[str, Any]:
 @app.get("/cases/{case_id}")
 def get_case(case_id: str) -> dict[str, Any]:
     return _guard(service.store.get_case, case_id)
+
+
+@app.delete("/cases/{case_id}")
+def delete_case(case_id: str) -> dict[str, Any]:
+    return _guard(service.delete_case, case_id)
 
 
 class CaseUpdate(BaseModel):
