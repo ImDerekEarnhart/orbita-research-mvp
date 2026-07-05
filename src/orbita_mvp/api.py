@@ -26,6 +26,12 @@ from orbita import EvidenceKind, Stance
 from .graph_ui import GRAPH_HTML, build_events, build_graph_data
 from .metrics import higher_is_better, validate_metric
 from .service import ResearchMVP
+from .upload_safety import (
+    MAX_CSV_UPLOAD_BYTES,
+    UploadSafetyError,
+    filename_from_content_disposition,
+    validate_csv_upload,
+)
 
 
 _data_dir = Path("/data") if Path("/data").exists() else Path(".")
@@ -60,13 +66,39 @@ app = FastAPI(
 
 _DEMO_USER = os.getenv("ORBITA_DEMO_USER", "")
 _DEMO_PASS = os.getenv("ORBITA_DEMO_PASS", "")
+_AUTH_OPTIONAL_ENV_VALUES = {"dev", "development", "local", "test"}
+
+
+def _is_public_path(path: str) -> bool:
+    return path in ("/health", "/healthz") or path.startswith("/ui")
+
+
+def _auth_required_when_unconfigured() -> bool:
+    env_values = (
+        os.getenv("APP_ENV", ""),
+        os.getenv("ORBITA_APP_ENV", ""),
+        os.getenv("ORBITA_ENV", ""),
+        os.getenv("RAILWAY_ENVIRONMENT", ""),
+        os.getenv("RAILWAY_ENVIRONMENT_NAME", ""),
+    )
+    return not any(value.strip().lower() in _AUTH_OPTIONAL_ENV_VALUES for value in env_values)
+
+
+def _unauthorized_response() -> Response:
+    return Response(
+        content="Unauthorized",
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="Orbita Demo"'},
+    )
 
 
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
-    if not (_DEMO_USER and _DEMO_PASS):
+    if _is_public_path(request.url.path):
         return await call_next(request)
-    if request.url.path in ("/health", "/healthz") or request.url.path.startswith("/ui"):
+    if not (_DEMO_USER and _DEMO_PASS):
+        if _auth_required_when_unconfigured():
+            return _unauthorized_response()
         return await call_next(request)
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Basic "):
@@ -77,11 +109,7 @@ async def basic_auth(request: Request, call_next):
                 return await call_next(request)
         except Exception:
             pass
-    return Response(
-        content="Unauthorized",
-        status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="Orbita Demo"'},
-    )
+    return _unauthorized_response()
 
 
 @app.get("/")
@@ -233,23 +261,20 @@ def update_file(case_id: str, file_id: str, request: FileUpdate) -> dict[str, An
 
 @app.post("/cases/{case_id}/files")
 def upload_file(case_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
-    suffix = Path(file.filename or "upload.bin").suffix
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
-        shutil.copyfileobj(file.file, temp)
-        temp_path = Path(temp.name)
+    content = file.file.read(MAX_CSV_UPLOAD_BYTES + 1)
+    raw_filename = filename_from_content_disposition(
+        file.headers.get("content-disposition"),
+        file.filename,
+    )
     try:
-        # Preserve the user-facing filename for the ingestor.
-        named = temp_path.with_name(Path(file.filename or temp_path.name).name)
-        if named.exists():
-            named.unlink()
-        temp_path.rename(named)
+        safe_name = validate_csv_upload(raw_filename, file.content_type, content)
+    except UploadSafetyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        named = Path(temp_dir) / safe_name
+        named.write_bytes(content)
         return _guard(service.add_file, case_id, named)
-    finally:
-        for path in {temp_path, locals().get("named", temp_path)}:
-            try:
-                Path(path).unlink(missing_ok=True)
-            except Exception:
-                pass
 
 
 @app.post("/cases/{case_id}/compile")

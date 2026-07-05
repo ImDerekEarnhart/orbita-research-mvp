@@ -18,10 +18,13 @@ def _csv_bytes() -> bytes:
     return ("\n".join(rows) + "\n").encode()
 
 
-def test_browser_api_flow(tmp_path: Path):
+def test_browser_api_flow(tmp_path: Path, monkeypatch):
     old_service = api_module.service
     replacement = ResearchMVP(tmp_path / "api.db", tmp_path / "workspace")
     api_module.service = replacement
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setattr(api_module, "_DEMO_USER", "")
+    monkeypatch.setattr(api_module, "_DEMO_PASS", "")
     try:
         with TestClient(api_module.app) as client:
             assert client.get("/").status_code == 200

@@ -35,6 +35,7 @@ def isolated_client(tmp_path, monkeypatch):
     """
     svc = ResearchMVP(tmp_path / "sec.db", tmp_path / "ws")
     monkeypatch.setattr(api_module, "service", svc)
+    monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setattr(api_module, "_DEMO_USER", "")
     monkeypatch.setattr(api_module, "_DEMO_PASS", "")
 
