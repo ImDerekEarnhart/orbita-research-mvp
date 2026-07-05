@@ -153,6 +153,36 @@ def test_case_delete_removes_observation_ledger_and_counterexamples(svc: Researc
     assert observations.read_observations(case_dir) == []
 
 
+def test_api_delete_populated_phase2b_case_cleans_graph_memory(
+    svc: ResearchMVP, client: TestClient, tmp_path: Path
+):
+    graph_id = "graph_api_delete"
+    case, _run = _run_discovery(svc, tmp_path, graph_id=graph_id)
+    case_dir = svc.store.case_dir(case["id"])
+
+    assert len(svc.store.case_counterexamples(case["id"])) > 0
+    assert svc.store.graph_memory_summary(graph_id)["counterexample_count"] > 0
+    assert (case_dir / observations.LEDGER_FILENAME).exists()
+
+    assert client.delete(f"/cases/{case['id']}").status_code == 401
+    assert client.delete(f"/cases/{case['id']}", headers=_auth(password="wrong")).status_code == 401
+
+    response = client.delete(f"/cases/{case['id']}", headers=_auth())
+    assert response.status_code == 200, response.text
+    assert response.json()["deleted"] is True
+
+    assert client.get(f"/cases/{case['id']}", headers=_auth()).status_code == 404
+    assert svc.store.case_counterexamples(case["id"]) == []
+    assert client.get(f"/graphs/{graph_id}/counterexamples", headers=_auth()).json()["counterexamples"] == []
+    summary = client.get(f"/graphs/{graph_id}/summary", headers=_auth()).json()["summary"]
+    assert summary["claim_count"] == 0
+    assert summary["counterexample_count"] == 0
+    assert summary["observation_count"] == 0
+    assert case["id"] not in summary["observations_by_case"]
+    assert not case_dir.exists()
+    assert observations.read_observations(case_dir) == []
+
+
 # ---------------------------------------------------------------------------
 # B. Counterexample memory
 # ---------------------------------------------------------------------------

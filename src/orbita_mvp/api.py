@@ -104,11 +104,11 @@ async def basic_auth(request: Request, call_next):
     if auth.startswith("Basic "):
         try:
             decoded = base64.b64decode(auth[6:]).decode("utf-8")
-            user, _, pw = decoded.partition(":")
-            if secrets.compare_digest(user, _DEMO_USER) and secrets.compare_digest(pw, _DEMO_PASS):
-                return await call_next(request)
         except Exception:
-            pass
+            return _unauthorized_response()
+        user, _, pw = decoded.partition(":")
+        if secrets.compare_digest(user, _DEMO_USER) and secrets.compare_digest(pw, _DEMO_PASS):
+            return await call_next(request)
     return _unauthorized_response()
 
 
