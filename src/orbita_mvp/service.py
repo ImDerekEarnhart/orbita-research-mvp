@@ -181,6 +181,7 @@ from .model_artifact import (
 )
 from .ingestion import ArtifactIngestor
 from .memory import BeliefMemory
+from . import observations
 from .metrics import higher_is_better, select_best_finding, validate_metric
 from .reporting import ReportCompiler
 from .storage import CaseStore
@@ -265,7 +266,26 @@ class ResearchMVP:
     def add_file(self, case_id: str, file_path: str | Path) -> dict[str, Any]:
         case_dir = self.store.case_dir(case_id) / "uploads"
         record = self.ingestor.ingest(file_path, case_dir)
-        return self.store.add_file_record(case_id, record)
+        stored = self.store.add_file_record(case_id, record)
+        # Phase 2B: observation ledger entry for the dataset profile/import.
+        profile = stored.get("profile", {}) or {}
+        observations.record_observation(
+            self.store.case_dir(case_id),
+            case_id=case_id,
+            source="orbita_mvp.service.add_file",
+            kind=observations.KIND_DATASET_IMPORTED,
+            dataset_ids=[stored["id"]],
+            payload={
+                "original_name": stored.get("original_name"),
+                "sha256": stored.get("sha256"),
+                "artifact_kind": stored.get("artifact_kind"),
+                "parse_status": stored.get("parse_status"),
+                "size_bytes": stored.get("size_bytes"),
+                "row_count": profile.get("row_count"),
+                "column_count": profile.get("column_count"),
+            },
+        )
+        return stored
 
     def delete_case(self, case_id: str) -> dict[str, Any]:
         return self.store.delete_case(case_id)
@@ -350,6 +370,18 @@ class ResearchMVP:
         run_dir = self.store.case_dir(case_id) / "runs" / run_record["id"]
         run_dir.mkdir(parents=True, exist_ok=True)
         ledger_path = run_dir / "discovery_ledger.jsonl"
+
+        # Phase 2B: observation ledger — run start.
+        observations.record_observation(
+            self.store.case_dir(case_id),
+            case_id=case_id,
+            source="orbita_mvp.service.run_case",
+            kind=observations.KIND_RUN_STARTED,
+            graph_id=graph_id,
+            dataset_ids=[selected_file["id"]],
+            run_id=run_record["id"],
+            payload={"plan_id": plan_record["id"], "plan_hash": plan.get("plan_hash")},
+        )
 
         try:
             thresholds = plan.get("thresholds", {})
@@ -720,6 +752,30 @@ class ResearchMVP:
                 dataframe=df,
                 domain=domain,
                 composite_domain=composite_domain if composite_specs else None,
+                graph_id=graph_id,
+            )
+
+            # Phase 2B: observation ledger — per-run receipt summary. Effects
+            # are tallied so "no counterexample found" is visibly not proof.
+            from .receipts import summarize_effects
+            _all_receipts = [
+                r for rs in import_summary.get("receipts_by_candidate", {}).values() for r in rs
+            ]
+            observations.record_observation(
+                self.store.case_dir(case_id),
+                case_id=case_id,
+                source="orbita_mvp.service.run_case",
+                kind=observations.KIND_RUN_RECEIPTS,
+                graph_id=graph_id,
+                dataset_ids=[selected_file["id"]],
+                run_id=run_record["id"],
+                payload={
+                    "candidate_count": len(all_findings),
+                    "survivor_count": len(all_survivor_ids),
+                    "receipt_count": len(_all_receipts),
+                    "effects": summarize_effects(_all_receipts),
+                    "counterexample_count": len(import_summary.get("counterexample_ids", [])),
+                },
             )
 
             # Phase 2A: provenance stamp on this run's claims. Reserved origin
@@ -837,12 +893,28 @@ class ResearchMVP:
             engine_result["reports"] = report_bundle
             for role, artifact in report_bundle.items():
                 self.store.add_report(case_id, run_record["id"], format=role, path=artifact["path"], content_hash=artifact["sha256"])
-            return self.store.finish_run(
+            finished = self.store.finish_run(
                 run_record["id"],
                 result=engine_result,
                 engine_run_id=run_record["id"],
                 ledger_path=str(ledger_path.resolve()),
             )
+            # Phase 2B: observation ledger — run end.
+            observations.record_observation(
+                self.store.case_dir(case_id),
+                case_id=case_id,
+                source="orbita_mvp.service.run_case",
+                kind=observations.KIND_RUN_COMPLETED,
+                graph_id=graph_id,
+                dataset_ids=[selected_file["id"]],
+                run_id=run_record["id"],
+                payload={
+                    "status": finished["status"],
+                    "candidate_count": engine_result.get("candidate_count"),
+                    "survivor_count": engine_result.get("survivor_count"),
+                },
+            )
+            return finished
         except Exception as exc:
             failure = {
                 "run_id": run_record["id"],
@@ -857,6 +929,20 @@ class ResearchMVP:
                 ledger_path=str(ledger_path.resolve()),
                 status="failed",
             )
+            # Phase 2B: run-failed observation must never mask the original error.
+            try:
+                observations.record_observation(
+                    self.store.case_dir(case_id),
+                    case_id=case_id,
+                    source="orbita_mvp.service.run_case",
+                    kind=observations.KIND_RUN_FAILED,
+                    graph_id=graph_id,
+                    dataset_ids=[selected_file["id"]],
+                    run_id=run_record["id"],
+                    payload={"error_type": type(exc).__name__},
+                )
+            except Exception:
+                pass
             raise
 
     def _import_result(
@@ -870,6 +956,7 @@ class ResearchMVP:
         dataframe: "pd.DataFrame | None" = None,
         domain: Any = None,
         composite_domain: Any = None,
+        graph_id: str | None = None,
     ) -> dict[str, Any]:
         from .influence import linear_influence_warning
         from .semantics import (
@@ -1191,6 +1278,8 @@ class ResearchMVP:
 
         candidate_to_claim: dict[str, str] = {}
         claim_ids: list[str] = []
+        counterexample_ids: list[str] = []
+        receipts_by_candidate: dict[str, list[dict[str, Any]]] = {}
         for finding in result.get("findings", []):
             candidate = finding["candidate"]
             payload = candidate.get("payload", {})
@@ -1304,6 +1393,13 @@ class ResearchMVP:
             )
             if informative_missingness_warning:
                 detail["informative_missingness_warning"] = informative_missingness_warning
+            # Phase 2B: falsifier receipts with explicit epistemic effect.
+            # Passing a check is never "supports" unless the finding committed.
+            from .receipts import finding_receipts
+            fals_receipts = finding_receipts(finding, finding_type)
+            if fals_receipts:
+                detail["falsifier_receipts"] = fals_receipts
+                receipts_by_candidate[candidate["id"]] = fals_receipts
             self.store.link_claim(
                 case_id=case_id,
                 run_id=case_run_id,
@@ -1312,6 +1408,45 @@ class ResearchMVP:
                 source_candidate_id=candidate["id"],
                 finding_detail=detail,
             )
+
+            # Phase 2B: counterexample memory. A killed candidate is recorded as
+            # a first-class counterexample linked to claim/case/graph/run/dataset.
+            # Kills that mean "did not clear the bar" challenge the claim; kills
+            # with evidence actively against it refute it. Nothing here mutates
+            # claims or case_claims.
+            killers = [a for a in finding.get("falsifications", []) if a.get("killed")]
+            if killers:
+                overall_effect = "refutes" if finding_type == "falsified_candidate" else "challenges"
+                measurements = {
+                    k: v for k, v in {
+                        "evaluation_metric": evaluation_metric,
+                        "selection_metric_score": finding.get("selection_metric_score"),
+                        "final_validation_metric_score": finding.get("final_validation_metric_score"),
+                    }.items() if v is not None
+                }
+                counterexample = self.store.record_counterexample(
+                    claim_id=claim_id,
+                    case_id=case_id,
+                    graph_id=graph_id,
+                    run_id=case_run_id,
+                    dataset_id=dataset_file["id"],
+                    found_by=killers[0].get("name", "unknown_falsifier"),
+                    failure={
+                        "epistemic_effect": overall_effect,
+                        "finding_type": finding_type,
+                        "final_status": finding.get("final_status"),
+                        "killer_stages": [a.get("name") for a in killers],
+                        "receipts": fals_receipts,
+                    },
+                    world={
+                        "statement": candidate.get("statement"),
+                        "payload": payload,
+                        "dataset_sha256": dataset_file["sha256"],
+                    },
+                    measurements=measurements or None,
+                    minimal_known=False,
+                )
+                counterexample_ids.append(counterexample["id"])
 
         for finding in result.get("findings", []):
             candidate = finding["candidate"]
@@ -1577,6 +1712,8 @@ class ResearchMVP:
             "claim_ids": list(dict.fromkeys(claim_ids)),
             "candidate_to_claim": candidate_to_claim,
             "artifact_count": artifact_count,
+            "counterexample_ids": counterexample_ids,
+            "receipts_by_candidate": receipts_by_candidate,
         }
 
     @staticmethod

@@ -155,6 +155,16 @@ class CaseStore:
                 created_at TEXT NOT NULL
             )"""
         )
+        # Phase 2B: counterexamples become queryable by graph/claim/case.
+        self.ledger.db.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_counterexamples_graph ON counterexamples(graph_id)"
+        )
+        self.ledger.db.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_counterexamples_claim ON counterexamples(claim_id)"
+        )
+        self.ledger.db.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_counterexamples_case ON counterexamples(case_id)"
+        )
 
     def create_case(
         self,
@@ -504,7 +514,10 @@ class CaseStore:
         from .semantics import public_state
 
         rows = self.ledger.db.conn.execute(
-            """SELECT cc.*, c.canonical_text, c.status
+            """SELECT cc.*, c.canonical_text, c.status,
+                      (SELECT COUNT(*) FROM counterexamples cx
+                       WHERE cx.claim_id = cc.claim_id AND cx.graph_id = cc.graph_id)
+                      AS counterexample_count
                FROM case_claims cc JOIN claims c ON c.id = cc.claim_id
                WHERE cc.graph_id = ? ORDER BY cc.created_at""",
             (graph_id,),
@@ -519,6 +532,127 @@ class CaseStore:
             item["origin"] = json.loads(origin_raw) if origin_raw else None
             out.append(item)
         return out
+
+    # ------------------------------------------------------------------
+    # Phase 2B: counterexample memory
+    # ------------------------------------------------------------------
+    def record_counterexample(
+        self,
+        *,
+        claim_id: str,
+        case_id: str,
+        graph_id: str | None,
+        run_id: str | None,
+        dataset_id: str | None,
+        found_by: str,
+        failure: dict[str, Any],
+        world: dict[str, Any] | None = None,
+        measurements: dict[str, Any] | None = None,
+        minimal_known: bool = False,
+    ) -> dict[str, Any]:
+        """Insert one counterexample row. Never touches claims or case_claims."""
+        counterexample_id = new_id("cx")
+        self.ledger.db.conn.execute(
+            """INSERT INTO counterexamples
+               (id, claim_id, case_id, graph_id, run_id, dataset_id,
+                world_json, measurements_json, failure_json, found_by, minimal_known, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                counterexample_id, claim_id, case_id, graph_id, run_id, dataset_id,
+                stable_json(world) if world is not None else None,
+                stable_json(measurements) if measurements is not None else None,
+                stable_json(failure),
+                found_by,
+                1 if minimal_known else 0,
+                utcnow(),
+            ),
+        )
+        self.ledger.db.conn.commit()
+        return self.get_counterexample(counterexample_id)
+
+    def get_counterexample(self, counterexample_id: str) -> dict[str, Any]:
+        row = self.ledger.db.conn.execute(
+            "SELECT * FROM counterexamples WHERE id = ?", (counterexample_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown counterexample: {counterexample_id}")
+        return self._counterexample_row(row)
+
+    @staticmethod
+    def _counterexample_row(row: Any) -> dict[str, Any]:
+        item = dict(row)
+        for src, dst in (("world_json", "world"), ("measurements_json", "measurements"), ("failure_json", "failure")):
+            raw = item.pop(src, None)
+            item[dst] = json.loads(raw) if raw else None
+        item["minimal_known"] = bool(item.get("minimal_known"))
+        return item
+
+    def graph_counterexamples(self, graph_id: str) -> list[dict[str, Any]]:
+        """Counterexamples scoped to one memory graph (never NULL-graph rows)."""
+        rows = self.ledger.db.conn.execute(
+            "SELECT * FROM counterexamples WHERE graph_id = ? ORDER BY created_at",
+            (graph_id,),
+        ).fetchall()
+        return [self._counterexample_row(row) for row in rows]
+
+    def case_counterexamples(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self.ledger.db.conn.execute(
+            "SELECT * FROM counterexamples WHERE case_id = ? ORDER BY created_at",
+            (case_id,),
+        ).fetchall()
+        return [self._counterexample_row(row) for row in rows]
+
+    def graph_memory_summary(self, graph_id: str) -> dict[str, Any]:
+        """Aggregate memory view for one graph: claim verdicts, counterexample
+        counts, observation ledger counts, and which datasets support/refute/
+        challenge claims. Scoped strictly to graph_id — legacy NULL-graph rows
+        and other graphs are never included."""
+        from . import observations
+        from .semantics import public_state
+
+        claims = self.graph_claims(graph_id)
+        counterexamples = self.graph_counterexamples(graph_id)
+
+        verdict_counts: dict[str, int] = {}
+        dataset_relations: dict[str, dict[str, int]] = {}
+
+        def _dataset_bucket(dataset_id: str) -> dict[str, int]:
+            return dataset_relations.setdefault(
+                dataset_id, {"supports": 0, "refutes": 0, "challenges": 0}
+            )
+
+        supporting_verdicts = {"committed", "supported_association"}
+        for claim in claims:
+            verdict = claim.get("verdict") or public_state(claim.get("finding_type"))
+            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+            if verdict in supporting_verdicts:
+                for dataset_id in (claim.get("origin") or {}).get("dataset_ids", []) or []:
+                    _dataset_bucket(dataset_id)["supports"] += 1
+
+        counterexamples_by_found_by: dict[str, int] = {}
+        for cx in counterexamples:
+            found_by = cx.get("found_by") or "unknown"
+            counterexamples_by_found_by[found_by] = counterexamples_by_found_by.get(found_by, 0) + 1
+            if cx.get("dataset_id"):
+                effect = (cx.get("failure") or {}).get("epistemic_effect")
+                key = "refutes" if effect == "refutes" else "challenges"
+                _dataset_bucket(cx["dataset_id"])[key] += 1
+
+        case_ids = sorted({claim["case_id"] for claim in claims})
+        observation_counts = {
+            case_id: observations.observation_count(self.case_dir(case_id))
+            for case_id in case_ids
+        }
+        return {
+            "graph_id": graph_id,
+            "claim_count": len(claims),
+            "claims_by_verdict": verdict_counts,
+            "counterexample_count": len(counterexamples),
+            "counterexamples_by_found_by": counterexamples_by_found_by,
+            "observation_count": sum(observation_counts.values()),
+            "observations_by_case": observation_counts,
+            "dataset_relations": dataset_relations,
+        }
 
     def case_claims(self, case_id: str) -> list[dict[str, Any]]:
         from .semantics import public_state

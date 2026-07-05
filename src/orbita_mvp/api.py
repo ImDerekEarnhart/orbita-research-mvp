@@ -327,8 +327,31 @@ def run_case(case_id: str, request: RunRequest) -> dict[str, Any]:
 @app.get("/graphs/{graph_id}/claims")
 def graph_claims(graph_id: str) -> dict[str, Any]:
     """Claims scoped to one memory graph (Phase 2A). Basic-auth protected like
-    every non-public route; legacy NULL-graph claims are never returned here."""
-    return {"graph_id": graph_id, "claims": _guard(service.store.graph_claims, graph_id)}
+    every non-public route; legacy NULL-graph claims are never returned here.
+    Phase 2B: each claim carries counterexample_count and the response carries
+    the graph memory summary (observations, counterexamples, dataset relations)."""
+    return {
+        "graph_id": graph_id,
+        "claims": _guard(service.store.graph_claims, graph_id),
+        "summary": _guard(service.store.graph_memory_summary, graph_id),
+    }
+
+
+@app.get("/graphs/{graph_id}/summary")
+def graph_summary(graph_id: str) -> dict[str, Any]:
+    """Phase 2B: lightweight graph memory summary — observation ledger counts,
+    counterexample counts, and which datasets support/refute/challenge claims."""
+    return {"graph_id": graph_id, "summary": _guard(service.store.graph_memory_summary, graph_id)}
+
+
+@app.get("/graphs/{graph_id}/counterexamples")
+def graph_counterexamples(graph_id: str) -> dict[str, Any]:
+    """Phase 2B: counterexamples scoped to one memory graph. Read-only; there is
+    deliberately no update or delete route for counterexamples."""
+    return {
+        "graph_id": graph_id,
+        "counterexamples": _guard(service.store.graph_counterexamples, graph_id),
+    }
 
 
 @app.get("/runs/{run_id}")
