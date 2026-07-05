@@ -140,6 +140,7 @@ class ApproveRequest(BaseModel):
 class RunRequest(BaseModel):
     plan_id: str | None = None
     auto_approve: bool = False
+    graph_id: str | None = None
 
 
 class ExternalPlanRequest(BaseModel):
@@ -314,7 +315,20 @@ def revise_plan(plan_id: str, request: PlanRevisionRequest) -> dict[str, Any]:
 
 @app.post("/cases/{case_id}/run")
 def run_case(case_id: str, request: RunRequest) -> dict[str, Any]:
-    return _guard(service.run_case, case_id, plan_id=request.plan_id, auto_approve=request.auto_approve)
+    return _guard(
+        service.run_case,
+        case_id,
+        plan_id=request.plan_id,
+        auto_approve=request.auto_approve,
+        graph_id=request.graph_id,
+    )
+
+
+@app.get("/graphs/{graph_id}/claims")
+def graph_claims(graph_id: str) -> dict[str, Any]:
+    """Claims scoped to one memory graph (Phase 2A). Basic-auth protected like
+    every non-public route; legacy NULL-graph claims are never returned here."""
+    return {"graph_id": graph_id, "claims": _guard(service.store.graph_claims, graph_id)}
 
 
 @app.get("/runs/{run_id}")

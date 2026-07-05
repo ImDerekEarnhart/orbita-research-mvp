@@ -128,6 +128,33 @@ class CaseStore:
             self.ledger.db.conn.execute(
                 "ALTER TABLE case_claims ADD COLUMN finding_detail_json TEXT NOT NULL DEFAULT '{}'"
             )
+        # Phase 2A: memory-graph scoping + provenance fields (nullable; legacy rows keep NULL).
+        if "graph_id" not in cols:
+            self.ledger.db.conn.execute("ALTER TABLE case_claims ADD COLUMN graph_id TEXT")
+        if "origin_json" not in cols:
+            self.ledger.db.conn.execute("ALTER TABLE case_claims ADD COLUMN origin_json TEXT")
+        if "epistemic_status" not in cols:
+            self.ledger.db.conn.execute("ALTER TABLE case_claims ADD COLUMN epistemic_status TEXT")
+        self.ledger.db.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_case_claims_graph ON case_claims(graph_id)"
+        )
+        # Phase 2A placeholder: counterexample memory (no writes until Phase 2B).
+        self.ledger.db.conn.execute(
+            """CREATE TABLE IF NOT EXISTS counterexamples (
+                id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                graph_id TEXT,
+                run_id TEXT,
+                dataset_id TEXT,
+                world_json TEXT,
+                measurements_json TEXT,
+                failure_json TEXT,
+                found_by TEXT,
+                minimal_known INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )"""
+        )
 
     def create_case(
         self,
@@ -450,6 +477,48 @@ class CaseStore:
              case_id, claim_id, source_candidate_id),
         )
         self.ledger.db.conn.commit()
+
+    def stamp_run_claims(
+        self,
+        *,
+        case_id: str,
+        run_id: str,
+        graph_id: str | None,
+        origin: dict[str, Any] | None = None,
+    ) -> int:
+        """Phase 2A provenance stamp: set graph_id/origin_json on all claims of one run.
+
+        Applied once after import so engine call sites stay untouched. Legacy
+        rows (other runs) are never modified.
+        """
+        cursor = self.ledger.db.conn.execute(
+            """UPDATE case_claims SET graph_id = ?, origin_json = ?
+               WHERE case_id = ? AND run_id = ?""",
+            (graph_id, stable_json(origin or {}), case_id, run_id),
+        )
+        self.ledger.db.conn.commit()
+        return cursor.rowcount
+
+    def graph_claims(self, graph_id: str) -> list[dict[str, Any]]:
+        """Claims scoped to a memory graph. Excludes legacy NULL-graph rows."""
+        from .semantics import public_state
+
+        rows = self.ledger.db.conn.execute(
+            """SELECT cc.*, c.canonical_text, c.status
+               FROM case_claims cc JOIN claims c ON c.id = cc.claim_id
+               WHERE cc.graph_id = ? ORDER BY cc.created_at""",
+            (graph_id,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            detail = json.loads(item.pop("finding_detail_json", "{}") or "{}")
+            item["finding_detail"] = detail
+            item["verdict"] = public_state(item.get("finding_type"))
+            origin_raw = item.pop("origin_json", None)
+            item["origin"] = json.loads(origin_raw) if origin_raw else None
+            out.append(item)
+        return out
 
     def case_claims(self, case_id: str) -> list[dict[str, Any]]:
         from .semantics import public_state

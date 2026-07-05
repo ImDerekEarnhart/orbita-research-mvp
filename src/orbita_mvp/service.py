@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -311,7 +312,7 @@ class ResearchMVP:
     # ------------------------------------------------------------------
     # Discovery and import into persistent memory
     # ------------------------------------------------------------------
-    def run_case(self, case_id: str, *, plan_id: str | None = None, auto_approve: bool = False) -> dict[str, Any]:
+    def run_case(self, case_id: str, *, plan_id: str | None = None, auto_approve: bool = False, graph_id: str | None = None) -> dict[str, Any]:
         case = self.store.get_case(case_id)
         if plan_id is None:
             if not case["plans"]:
@@ -719,6 +720,21 @@ class ResearchMVP:
                 dataframe=df,
                 domain=domain,
                 composite_domain=composite_domain if composite_specs else None,
+            )
+
+            # Phase 2A: provenance stamp on this run's claims. Reserved origin
+            # keys are always present; operators stays [] until the operator
+            # registry becomes executable (Phase 2D).
+            self.store.stamp_run_claims(
+                case_id=case_id,
+                run_id=run_record["id"],
+                graph_id=graph_id,
+                origin={
+                    "dataset_ids": [selected_file["id"]],
+                    "engine_version": os.getenv("GIT_COMMIT_SHA", os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")),
+                    "plan_hash": plan.get("plan_hash"),
+                    "operators": [],
+                },
             )
 
             # Attach artifact provenance as evidence nodes in the belief graph.
