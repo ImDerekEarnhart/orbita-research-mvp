@@ -117,14 +117,38 @@ def test_ledger_is_append_only_and_hash_chained(svc: ResearchMVP, tmp_path: Path
     assert not observations.verify_chain(case_dir)
 
 
-def test_case_delete_removes_observation_ledger(svc: ResearchMVP, tmp_path: Path):
+def test_case_delete_removes_observation_ledger_and_counterexamples(svc: ResearchMVP, tmp_path: Path):
     case = svc.store.create_case(name="Doomed", goal="")
     case_dir = svc.store.case_dir(case["id"])
     observations.record_observation(
         case_dir, case_id=case["id"], source="test", kind="manual", payload={}
     )
+    svc.store.ledger.db.conn.execute(
+        """INSERT INTO claims
+           (id, canonical_text, claim_type, status, scope_json, metadata_json, created_at, updated_at)
+           VALUES (?, ?, 'test', 'supported', '{}', '{}', datetime('now'), datetime('now'))""",
+        ("claim_doomed", "doomed claim"),
+    )
+    svc.store.record_counterexample(
+        claim_id="claim_doomed",
+        case_id=case["id"],
+        graph_id="graph_doomed",
+        run_id=None,
+        dataset_id="file_doomed",
+        found_by="test",
+        failure={"epistemic_effect": "challenges"},
+    )
     assert (case_dir / observations.LEDGER_FILENAME).exists()
+    assert len(svc.store.case_counterexamples(case["id"])) > 0
+    assert svc.store.graph_memory_summary("graph_doomed")["counterexample_count"] > 0
+
     svc.delete_case(case["id"])
+
+    with pytest.raises(KeyError):
+        svc.store.get_case(case["id"])
+    assert svc.store.case_counterexamples(case["id"]) == []
+    assert svc.store.graph_counterexamples("graph_doomed") == []
+    assert svc.store.graph_memory_summary("graph_doomed")["counterexample_count"] == 0
     assert not case_dir.exists()
     assert observations.read_observations(case_dir) == []
 

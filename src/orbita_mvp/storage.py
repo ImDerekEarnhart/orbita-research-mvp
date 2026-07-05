@@ -231,6 +231,7 @@ class CaseStore:
             delete("DELETE FROM case_runs WHERE case_id = ?", (case_id,))
             delete("DELETE FROM analysis_plans WHERE case_id = ?", (case_id,))
             delete("DELETE FROM case_files WHERE case_id = ?", (case_id,))
+            delete("DELETE FROM counterexamples WHERE case_id = ?", (case_id,))
 
             evidence_ids: list[str] = []
             if owned_claim_ids:

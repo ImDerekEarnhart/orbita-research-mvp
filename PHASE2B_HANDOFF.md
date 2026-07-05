@@ -14,7 +14,8 @@ Not pushed, not deployed, not merged.
 - `src/orbita_mvp/storage.py` — `record_counterexample` (insert-only),
   `graph_counterexamples`, `case_counterexamples`, `graph_memory_summary`
   (verdict counts, counterexample counts, observation counts, dataset
-  supports/refutes/challenges relations); counterexample indexes.
+  supports/refutes/challenges relations); counterexample indexes; `delete_case`
+  now removes case-owned counterexamples before deleting the case row.
 - `src/orbita_mvp/service.py` — observations at dataset import, run start,
   run receipts, run completed/failed; `_import_result(graph_id=…)` writes one
   counterexample per killed candidate (claim/case/graph/run/dataset linked,
@@ -33,13 +34,17 @@ Not pushed, not deployed, not merged.
   regime_dependent) → challenges.
 - Legacy NULL-graph rows never appear in graph-scoped queries or summaries.
 - No writes ever mutate claims/case_claims from the counterexample path.
+- Pre-deploy review found a lifecycle bug where deleted-case counterexamples
+  remained queryable by case_id/graph_id. Fixed in this branch; regression test
+  proves `delete_case()` removes those rows and the observation workspace.
 
 ## Tests (all pass)
 - `test_phase2b_memory.py` — 12/12: ledger entries+fields, append-only+hash
   chain+tamper detection, delete cascade, counterexample writes on kills,
   no counterexample for committed claims, cross-graph exclusion, auth,
   effect mapping (incl. "passed ≠ supports"), receipts in finding_detail,
-  claims summary + counts, per-graph summary scoping.
+  claims summary + counts, per-graph summary scoping, and counterexample cleanup
+  on case deletion.
 - Regression: full suite 195/195 (includes graph scoping 6/6, data lifecycle,
   direct-access hardening). py_compile clean.
 
