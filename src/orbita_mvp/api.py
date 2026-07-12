@@ -23,6 +23,11 @@ from pydantic import BaseModel, Field
 
 from orbita import EvidenceKind, Stance
 
+from .finite_affine import (
+    MAX_AFFINE_MODULUS,
+    AffineOperator,
+    analyze_compatible_lift_families,
+)
 from .graph_ui import GRAPH_HTML, build_events, build_graph_data
 from .metrics import higher_is_better, validate_metric
 from .service import ResearchMVP
@@ -190,6 +195,28 @@ class DerivationRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class AffineOperatorSpec(BaseModel):
+    modulus: int = Field(ge=2, le=MAX_AFFINE_MODULUS)
+    multiplier: int
+    translation: int
+    label: str = Field(default="", max_length=120)
+
+
+class AffineMultiplierConstraint(BaseModel):
+    residue: int
+    modulus: int = Field(ge=2, le=MAX_AFFINE_MODULUS)
+
+
+class AffineLiftAnalysisRequest(BaseModel):
+    base_operator: AffineOperatorSpec
+    extension_modulus: int = Field(ge=2, le=MAX_AFFINE_MODULUS)
+    reference_operator: AffineOperatorSpec
+    multiplier_constraints: list[AffineMultiplierConstraint] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+
+
 def _guard(callable_, *args, **kwargs):
     try:
         return callable_(*args, **kwargs)
@@ -214,6 +241,29 @@ def health() -> dict[str, Any]:
         "db": str(DB_PATH.resolve()),
         "workspace": str(WORKSPACE.resolve()),
     }
+
+
+@app.post("/analysis/finite-affine/lifts")
+def analyze_finite_affine_lifts(request: AffineLiftAnalysisRequest) -> dict[str, Any]:
+    """Derive and exhaustively verify a bounded finite affine lift family."""
+    base = AffineOperator(**request.base_operator.model_dump())
+    reference = AffineOperator(**request.reference_operator.model_dump())
+    if reference.modulus != request.extension_modulus:
+        raise HTTPException(
+            status_code=400,
+            detail="reference operator must use the extension modulus",
+        )
+    constraints = [
+        (constraint.residue, constraint.modulus)
+        for constraint in request.multiplier_constraints
+    ]
+    return _guard(
+        analyze_compatible_lift_families,
+        base_operator=base,
+        extension_modulus=request.extension_modulus,
+        reference_operator=reference,
+        multiplier_constraints=constraints,
+    )
 
 
 @app.post("/cases")
