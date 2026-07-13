@@ -76,7 +76,7 @@ def _coefficients_from_model(model: dict, payload: dict) -> tuple[float, dict[st
     """Extract (intercept, coefficients, predictor_order) from a refit model dict."""
     kind = payload["kind"]
     intercept = float(model["intercept"])
-    if kind == "linear_association":
+    if kind in {"linear_association", "binary_indicator"}:
         predictor = str(payload["predictor"])
         return intercept, {predictor: float(model["slope"])}, [predictor]
     elif kind == "composite_linear":
@@ -98,7 +98,7 @@ def model_from_artifact(artifact: dict[str, Any], payload: dict[str, Any]) -> di
     """
     kind = artifact["kind"]
     intercept = artifact["intercept"]
-    if kind == "linear_association":
+    if kind in {"linear_association", "binary_indicator"}:
         predictor = str(payload.get("predictor", artifact["predictor_order"][0]))
         return {
             "kind": kind, "valid": True,

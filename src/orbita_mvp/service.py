@@ -13,7 +13,7 @@ import pandas as pd
 def _candidate_columns(payload: dict[str, Any]) -> list[str]:
     """Ordered, de-duplicated list of dataset columns a candidate depends on."""
     cols: list[str] = []
-    for key in ("predictor", "outcome", "group"):
+    for key in ("predictor", "outcome", "group", "contrast_column", "block_column"):
         v = payload.get(key)
         if v:
             cols.append(str(v))
@@ -64,6 +64,20 @@ def _association_evidence(df: pd.DataFrame, payload: dict[str, Any], *, seed: in
     """Effect-size + bootstrap-stability evidence, independent of predictive utility."""
     kind = payload.get("kind")
     rng = np.random.default_rng(seed)
+    if kind in {"binary_indicator", "predeclared_contrast"}:
+        from .contrast import analyze_predeclared_contrast
+        predictor = payload.get("predictor") or payload.get("contrast_column") or payload.get("group")
+        config = {
+            "outcome_column": payload.get("outcome"),
+            "contrast_column": predictor,
+            "positive_level": payload.get("positive_level"),
+            "reference_level": payload.get("reference_level"),
+            "block_column": payload.get("block_column"),
+            "direction": payload.get("contrast_direction") or "two_sided",
+            "primary_effect": payload.get("primary_effect") or "mean_difference",
+            "validation_method": payload.get("validation_method") or "automatic_conservative",
+        }
+        return analyze_predeclared_contrast(df, config, seed=seed)
     if kind == "linear_association":
         pred, out = payload.get("predictor"), payload.get("outcome")
         if pred not in df.columns or out not in df.columns:
@@ -132,6 +146,42 @@ def _association_evidence(df: pd.DataFrame, payload: dict[str, Any], *, seed: in
         # Largest-group reference contrast.
         ref = max(counts, key=counts.get)
         contrasts = {lab: round(means[lab] - means[ref], 4) for lab in means if lab != ref}
+        bootstrap_eta: list[float] = []
+        bootstrap_contrasts: dict[str, list[float]] = {lab: [] for lab in contrasts}
+        grouped_values = {
+            str(label): subset["y"].to_numpy(float) for label, subset in grp
+        }
+        for _ in range(300):
+            sampled_parts = []
+            for label, values in grouped_values.items():
+                picks = rng.integers(0, len(values), len(values))
+                sampled_parts.append(pd.DataFrame({"g": label, "y": values[picks]}))
+            sampled = pd.concat(sampled_parts, ignore_index=True)
+            sampled_overall = float(sampled["y"].mean())
+            sampled_total = float(((sampled["y"] - sampled_overall) ** 2).sum())
+            if sampled_total <= 1e-12:
+                continue
+            sampled_means = {
+                str(label): float(part["y"].mean()) for label, part in sampled.groupby("g")
+            }
+            sampled_between = float(sum(
+                len(part) * (float(part["y"].mean()) - sampled_overall) ** 2
+                for _, part in sampled.groupby("g")
+            ))
+            bootstrap_eta.append(sampled_between / sampled_total)
+            for label in bootstrap_contrasts:
+                bootstrap_contrasts[label].append(sampled_means[label] - sampled_means[ref])
+        eta_ci = (
+            [round(float(np.percentile(bootstrap_eta, 2.5)), 4),
+             round(float(np.percentile(bootstrap_eta, 97.5)), 4)]
+            if bootstrap_eta else None
+        )
+        contrast_stability = {
+            label: round(float(np.mean([
+                (value > 0) == (contrasts[label] > 0) for value in values
+            ])), 4)
+            for label, values in bootstrap_contrasts.items() if values
+        }
         return {
             "effect_size_metric": "eta_squared",
             "effect_size": round(float(eta2), 4),
@@ -140,6 +190,9 @@ def _association_evidence(df: pd.DataFrame, payload: dict[str, Any], *, seed: in
             "group_counts": counts,
             "reference_group": ref,
             "group_contrasts_vs_reference": contrasts,
+            "bootstrap_eta_squared_ci95": eta_ci,
+            "bootstrap_contrast_direction_stability": contrast_stability,
+            "bootstrap_draws": 300,
             "n": int(N),
             "n_groups": int(k),
         }
@@ -172,9 +225,9 @@ from orbita_discovery.judges import GatedJudge
 
 from .compiler import ResearchCompiler, compute_plan_hash, verify_plan_schema_executable
 from .composition import build_backward_eliminated_composites, build_composite_candidates
+from .contrast import PredeclaredContrastJudge, PredeclaredContrastValidationFalsifier
 from .falsifiers import AblationFalsifier, ImprovementFalsifier
 from .model_artifact import (
-    model_from_artifact,
     save_model_artifact,
     serialize_deployment_artifact,
     serialize_selection_artifact,
@@ -210,7 +263,12 @@ def _freeze_selected_models(
     for f in findings:
         if f["final_status"] == "refuted" or any(a["killed"] for a in f["falsifications"]):
             continue
-        outcome = f["candidate"]["payload"].get("outcome")
+        payload = f["candidate"]["payload"]
+        # A predeclared contrast is an inferential comparison, not a deployable
+        # prediction model. It can never become the selected deployment model.
+        if payload.get("kind") == "predeclared_contrast":
+            continue
+        outcome = payload.get("outcome")
         if outcome:
             survivors_by_outcome.setdefault(outcome, []).append(f)
 
@@ -301,6 +359,9 @@ class ResearchMVP:
         confirmation_fraction: float = 0.25,
         final_validation_fraction: float = 0.15,
         target_column: str | None = None,
+        investigation_mode: str = "discovery_scan",
+        predictor_interpretation: str = "auto",
+        contrast_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         case = self.store.get_case(case_id)
         plan = self.compiler.compile(
@@ -312,6 +373,9 @@ class ResearchMVP:
             confirmation_fraction=confirmation_fraction,
             final_validation_fraction=final_validation_fraction,
             target_column=target_column,
+            investigation_mode=investigation_mode,
+            predictor_interpretation=predictor_interpretation,
+            contrast_config=contrast_config,
         )
         return self.store.save_plan(case_id, plan, compiler="orbita-heuristic-compiler/0.1")
 
@@ -397,6 +461,9 @@ class ResearchMVP:
             # Chronological validation axis (a clear ordered calendar/sequence
             # column), when the dataset has one — else random validation.
             time_column = plan.get("chronological_axis") or None
+            analysis_config = gen.get("analysis_config", {}) or {}
+            contrast_config = analysis_config.get("contrast", {}) or {}
+            block_column = contrast_config.get("block_column") or None
 
             domain = UploadedTableDomain(
                 df,
@@ -408,23 +475,36 @@ class ResearchMVP:
                 target_transform=target_transform,
                 evaluation_metric=evaluation_metric,
                 time_column=time_column,
+                block_column=block_column,
             )
-            judge = GatedJudge(
-                commit_at=float(thresholds.get("commit_at", 0.25)),
-                baseline_margin=float(thresholds.get("baseline_margin", 0.05)),
+            is_predeclared_contrast = (
+                analysis_config.get("investigation_mode") == "predeclared_contrast"
             )
-            pairwise_falsifiers = [
-                BaselineFalsifier(margin=float(thresholds.get("baseline_margin", 0.05))),
-                HeldOutFalsifier(min_score=float(thresholds.get("held_out_min", 0.15))),
-                CrossSeedFalsifier(
-                    seeds=int(thresholds.get("cross_seed_count", 9)),
-                    min_median=float(thresholds.get("cross_seed_min", 0.15)),
-                    max_spread=thresholds.get("cross_seed_max_spread", 0.65),
-                ),
-                RepeatedRefitValidator(
-                    seeds=int(thresholds.get("repeated_refit_count", 12)),
-                ),
-            ]
+            if is_predeclared_contrast:
+                judge = PredeclaredContrastJudge()
+                pairwise_falsifiers = [
+                    PredeclaredContrastValidationFalsifier(),
+                    RepeatedRefitValidator(
+                        seeds=int(thresholds.get("repeated_refit_count", 12)),
+                    ),
+                ]
+            else:
+                judge = GatedJudge(
+                    commit_at=float(thresholds.get("commit_at", 0.25)),
+                    baseline_margin=float(thresholds.get("baseline_margin", 0.05)),
+                )
+                pairwise_falsifiers = [
+                    BaselineFalsifier(margin=float(thresholds.get("baseline_margin", 0.05))),
+                    HeldOutFalsifier(min_score=float(thresholds.get("held_out_min", 0.15))),
+                    CrossSeedFalsifier(
+                        seeds=int(thresholds.get("cross_seed_count", 9)),
+                        min_median=float(thresholds.get("cross_seed_min", 0.15)),
+                        max_spread=thresholds.get("cross_seed_max_spread", 0.65),
+                    ),
+                    RepeatedRefitValidator(
+                        seeds=int(thresholds.get("repeated_refit_count", 12)),
+                    ),
+                ]
             # Phase 1: pairwise candidate falsification
             phase1_ledger = Ledger(ledger_path)
             engine = Engine(judge, pairwise_falsifiers, phase1_ledger)
@@ -432,12 +512,12 @@ class ResearchMVP:
             phase1_findings = [finding_to_dict(item) for item in phase1_ledger.entries]
             phase1_survivors = survivors(phase1_ledger)
 
-            # Compute configured-metric scores for phase-1 survivors so that
-            # ImprovementFalsifier can compare in the correct metric units.
-            survivor_metric_scores: dict[str, float] = {}
+            # Compute genuine selection-partition scores for every evaluable
+            # phase-1 candidate. Killed/group candidates must retain a real
+            # score when one exists; unavailable remains None at serialization.
+            phase1_metric_scores: dict[str, float] = {}
             hib = higher_is_better(evaluation_metric)
-            for entry in phase1_survivors:
-                fd = finding_to_dict(entry)
+            for fd in phase1_findings:
                 cid = fd["candidate"]["id"]
                 c_obj = Candidate(
                     id=cid,
@@ -447,9 +527,16 @@ class ResearchMVP:
                 ev = domain.evidence_for(c_obj)
                 train, test = domain.splits(ev, seed=1)
                 model = domain.refit(c_obj, train)
-                if model.get("valid"):
-                    ms = domain.score_metric(c_obj, model, test)
-                    survivor_metric_scores[cid] = ms
+                ms = domain.score_metric_or_none(c_obj, model, test)
+                if ms is not None:
+                    phase1_metric_scores[cid] = ms
+            survivor_ids_for_composition = {
+                finding_to_dict(entry)["candidate"]["id"] for entry in phase1_survivors
+            }
+            survivor_metric_scores = {
+                cid: score for cid, score in phase1_metric_scores.items()
+                if cid in survivor_ids_for_composition
+            }
 
             # Phase 2: composite candidate generation and falsification
             composite_min_predictors = int(thresholds.get("composite_min_predictors", 2))
@@ -489,6 +576,7 @@ class ResearchMVP:
                     target_transform=target_transform,
                     evaluation_metric=evaluation_metric,
                     time_column=time_column,
+                    block_column=block_column,
                 )
                 reduced_specs = build_backward_eliminated_composites(
                     composite_specs,
@@ -511,6 +599,7 @@ class ResearchMVP:
                     target_transform=target_transform,
                     evaluation_metric=evaluation_metric,
                     time_column=time_column,
+                    block_column=block_column,
                 )
                 composite_falsifiers = [
                     ImprovementFalsifier(
@@ -553,22 +642,24 @@ class ResearchMVP:
                             f"invalid results."
                         )
 
-            # Collect selection-partition metric scores for all survivors.
-            # Phase-1 scores are in survivor_metric_scores (computed on the
-            # selection partition via score_metric with seed=1).
-            # Phase-2 composite scores were already computed by
-            # ImprovementFalsifier on the same partition; extract from the
-            # falsification detail to avoid a redundant refit.
-            all_selection_scores: dict[str, float] = dict(survivor_metric_scores)
-            for f in phase2_findings:
-                cid = f["candidate"]["id"]
-                if cid not in all_selection_scores:
-                    imp = next(
-                        (a for a in f["falsifications"] if a["name"] == "improvement"),
-                        None,
+            # Collect selection-partition metric scores for every evaluable
+            # finding, independent of whether the governed verdict survived.
+            all_selection_scores: dict[str, float] = dict(phase1_metric_scores)
+            if composite_specs:
+                for f in phase2_findings:
+                    cid = f["candidate"]["id"]
+                    payload = f["candidate"]["payload"]
+                    c_obj = Candidate(
+                        id=cid,
+                        statement=f["candidate"]["statement"],
+                        payload=payload,
                     )
-                    if imp and imp.get("detail", {}).get("composite_score") is not None:
-                        all_selection_scores[cid] = float(imp["detail"]["composite_score"])
+                    ev = composite_domain.evidence_for(c_obj)
+                    train, test = composite_domain.splits(ev, seed=1)
+                    model = composite_domain.refit(c_obj, train)
+                    ms = composite_domain.score_metric_or_none(c_obj, model, test)
+                    if ms is not None:
+                        all_selection_scores[cid] = ms
 
             # Stamp selection_metric_score onto every finding so it is
             # visible in the ledger and available as a legacy fallback.
@@ -588,21 +679,36 @@ class ResearchMVP:
             # model_artifacts (keyed by outcome_col) is populated here with selection
             # metadata and updated after FV with deployment artifact paths.
             selection_artifacts_by_cid: dict[str, dict[str, Any]] = {}
+            selection_models_by_cid: dict[str, dict[str, Any]] = {}
             model_artifacts: dict[str, dict[str, Any]] = {}
             selected_file_path = selected_file["extracted_path"]
             for finding in all_findings:
-                is_surv = (
-                    finding["final_status"] != "refuted"
-                    and not any(a["killed"] for a in finding["falsifications"])
-                )
-                if not is_surv:
-                    continue
                 cid = finding["candidate"]["id"]
-                kind_str = finding["candidate"]["payload"].get("kind", "")
+                payload = finding["candidate"]["payload"]
+                kind_str = payload.get("kind", "")
                 dom_for_sel = (
                     composite_domain if kind_str == "composite_linear" and composite_specs
                     else domain
                 )
+                try:
+                    c_obj = Candidate(
+                        id=cid,
+                        statement=finding["candidate"]["statement"],
+                        payload=payload,
+                    )
+                    frozen_model = dom_for_sel.refit(c_obj, dom_for_sel.scout)
+                    if frozen_model.get("valid"):
+                        selection_models_by_cid[cid] = frozen_model
+                except Exception:
+                    pass
+                is_surv = (
+                    finding["final_status"] != "refuted"
+                    and not any(a["killed"] for a in finding["falsifications"])
+                )
+                if not is_surv or kind_str not in {
+                    "linear_association", "binary_indicator", "composite_linear", "nonlinear_association"
+                }:
+                    continue
                 try:
                     sel_art = serialize_selection_artifact(
                         run_id=run_record["id"],
@@ -641,55 +747,33 @@ class ResearchMVP:
             # coefficients to the held-out final_validation partition.
             # REPORT-ONLY — these scores do NOT alter selected_model_id,
             # model precedence, feature sets, or coefficients.
-            # No fitting occurs here; model_from_artifact reconstructs the
-            # model dict from stored intercept and coefficients only.
+            # No fitting occurs here; the scout-fitted model was frozen above.
             # ----------------------------------------------------------
-            def _score_from_artifact(
-                finding: dict[str, Any],
-                artifact: dict[str, Any],
-                dom: UploadedTableDomain,
-            ) -> float | None:
-                """Apply stored selection-artifact coefficients to the FV partition."""
-                if len(dom.final_validation) < 3:
-                    return None
+            for finding in all_findings:
+                cid = finding["candidate"]["id"]
                 payload = finding["candidate"]["payload"]
-                model = model_from_artifact(artifact, payload)
-                if not model.get("valid"):
-                    return None
+                kind_str = payload.get("kind", "")
+                dom = (
+                    composite_domain if kind_str == "composite_linear" and composite_specs
+                    else domain
+                )
                 c_obj = Candidate(
-                    id=finding["candidate"]["id"],
+                    id=cid,
                     statement=finding["candidate"]["statement"],
                     payload=payload,
                 )
-                return dom.score_metric(c_obj, model, dom.final_validation)
-
-            for finding in all_findings:
-                is_survivor = (
-                    finding["final_status"] != "refuted"
-                    and not any(a["killed"] for a in finding["falsifications"])
-                )
-                if is_survivor:
-                    cid = finding["candidate"]["id"]
-                    kind_str = finding["candidate"]["payload"].get("kind", "")
-                    dom = (
-                        composite_domain if kind_str == "composite_linear" and composite_specs
-                        else domain
+                try:
+                    fvs = dom.score_metric_or_none(
+                        c_obj,
+                        selection_models_by_cid.get(cid, {}),
+                        dom.final_validation,
                     )
-                    art_entry = selection_artifacts_by_cid.get(cid, {})
-                    sel_art = art_entry.get("artifact") if "error" not in art_entry else None
-                    try:
-                        fvs = _score_from_artifact(finding, sel_art, dom) if sel_art else None
-                    except Exception:
-                        fvs = None
-                    finding["final_validation_metric_score"] = fvs
-                    finding["final_validation_metric"] = evaluation_metric
-                    finding["final_validation_report_only"] = True
-                    finding["evaluation_metric"] = evaluation_metric
-                else:
-                    finding["final_validation_metric_score"] = None
-                    finding["final_validation_metric"] = evaluation_metric
-                    finding["final_validation_report_only"] = True
-                    finding["evaluation_metric"] = evaluation_metric
+                except Exception:
+                    fvs = None
+                finding["final_validation_metric_score"] = fvs
+                finding["final_validation_metric"] = evaluation_metric
+                finding["final_validation_report_only"] = True
+                finding["evaluation_metric"] = evaluation_metric
 
             # Step C: Deployment artifacts — refit on full CSV, created AFTER FV
             # scoring has been recorded.  /predict loads deployment artifacts.
@@ -754,6 +838,14 @@ class ResearchMVP:
                 composite_domain=composite_domain if composite_specs else None,
                 graph_id=graph_id,
             )
+            authoritative_details = import_summary.get("finding_details_by_candidate", {})
+            for finding in all_findings:
+                detail = authoritative_details.get(finding["candidate"]["id"])
+                if not detail:
+                    continue
+                finding["public_verdict"] = detail.get("verdict")
+                finding["verdict_presentation"] = detail.get("verdict_presentation")
+                finding["finding_detail"] = detail
 
             # Phase 2B: observation ledger — per-run receipt summary. Effects
             # are tallied so "no counterexample found" is visibly not proof.
@@ -1119,7 +1211,27 @@ class ResearchMVP:
             support = final_status in {"supported", "challenged", "provisional"} and not any(
                 attack.get("killed") for attack in finding.get("falsifications", [])
             )
-            if support and final_status == "supported":
+            contrast_status = (assoc_by_cid.get(cid) or {}).get("validation_status")
+            if payload.get("kind") == "predeclared_contrast" and contrast_status == "direction_contradicted":
+                prelim[cid] = (
+                    "falsified_candidate",
+                    {"reason": "The observed contrast ran opposite to the predeclared direction."},
+                )
+            elif payload.get("kind") == "predeclared_contrast" and contrast_status == "not_supported":
+                prelim[cid] = (
+                    "not_supported_candidate",
+                    {"reason": "The predeclared validation did not establish the contrast."},
+                )
+            elif payload.get("kind") == "predeclared_contrast" and contrast_status == "not_evaluable":
+                prelim[cid] = (
+                    "untestable_candidate",
+                    {"reason": "The predeclared contrast did not have enough complete groups or blocks."},
+                )
+            elif support and payload.get("kind") in {"binary_indicator", "predeclared_contrast"}:
+                # Binary/contrast findings are review-required simulation
+                # candidates. They never auto-promote a scientific claim.
+                prelim[cid] = ("promising_candidate", None)
+            elif support and final_status == "supported":
                 prelim[cid] = ("robust_relation", None)
             elif support:
                 prelim[cid] = ("promising_candidate", None)
@@ -1277,6 +1389,7 @@ class ResearchMVP:
                 full_data_scores[cid] = None
 
         candidate_to_claim: dict[str, str] = {}
+        finding_details_by_candidate: dict[str, dict[str, Any]] = {}
         claim_ids: list[str] = []
         counterexample_ids: list[str] = []
         receipts_by_candidate: dict[str, list[dict[str, Any]]] = {}
@@ -1340,10 +1453,11 @@ class ResearchMVP:
                     detail=attack.get("detail", {}),
                     run_id=case_run_id,
                 )
-            self.memory.synchronize_status(
-                claim_id,
-                rationale=f"Imported governed discovery result from run {case_run_id}; evidence {evidence_id}",
-            )
+            if payload.get("kind") not in {"binary_indicator", "predeclared_contrast"}:
+                self.memory.synchronize_status(
+                    claim_id,
+                    rationale=f"Imported governed discovery result from run {case_run_id}; evidence {evidence_id}",
+                )
             finding_type, classification_diagnostics = prelim[candidate["id"]]
             functional_form_override = None
             if candidate["id"] in overrides:
@@ -1393,6 +1507,7 @@ class ResearchMVP:
             )
             if informative_missingness_warning:
                 detail["informative_missingness_warning"] = informative_missingness_warning
+            finding_details_by_candidate[candidate["id"]] = detail
             # Phase 2B: falsifier receipts with explicit epistemic effect.
             # Passing a check is never "supports" unless the finding committed.
             from .receipts import finding_receipts
@@ -1714,6 +1829,7 @@ class ResearchMVP:
             "artifact_count": artifact_count,
             "counterexample_ids": counterexample_ids,
             "receipts_by_candidate": receipts_by_candidate,
+            "finding_details_by_candidate": finding_details_by_candidate,
         }
 
     @staticmethod

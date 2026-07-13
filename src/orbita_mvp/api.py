@@ -128,6 +128,17 @@ class CaseCreate(BaseModel):
     domain_hint: str | None = None
 
 
+class ContrastConfigRequest(BaseModel):
+    outcome_column: str
+    contrast_column: str
+    positive_level: str
+    reference_level: str
+    block_column: str | None = None
+    direction: str = "two_sided"
+    primary_effect: str = "mean_difference"
+    validation_method: str = "automatic_conservative"
+
+
 class CompileRequest(BaseModel):
     max_candidates: int = Field(default=60, ge=1, le=500)
     target_transform: str | None = Field(default=None, description="Monotone transform for numeric outcomes before fitting: 'log1p' or null")
@@ -136,6 +147,9 @@ class CompileRequest(BaseModel):
     confirmation_fraction: float = Field(default=0.25, ge=0.05, le=0.5, description="Fraction of rows reserved for model-selection (selection partition)")
     final_validation_fraction: float = Field(default=0.15, ge=0.05, le=0.4, description="Fraction of rows reserved for final unbiased validation (never touched during model selection)")
     target_column: str | None = Field(default=None, description="Explicit outcome column the user intends to predict. When provided, this column is excluded from predictor roles and is the only allowed outcome.")
+    investigation_mode: str = Field(default="discovery_scan", description="discovery_scan, targeted_prediction, or predeclared_contrast")
+    predictor_interpretation: str = Field(default="auto", description="auto, numeric, categorical, binary_indicator, or predeclared_contrast")
+    contrast: ContrastConfigRequest | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -345,6 +359,9 @@ def compile_case(case_id: str, request: CompileRequest) -> dict[str, Any]:
         confirmation_fraction=request.confirmation_fraction,
         final_validation_fraction=request.final_validation_fraction,
         target_column=request.target_column,
+        investigation_mode=request.investigation_mode,
+        predictor_interpretation=request.predictor_interpretation,
+        contrast_config=request.contrast.model_dump() if request.contrast else None,
     )
 
 

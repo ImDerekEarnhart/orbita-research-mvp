@@ -133,6 +133,87 @@ def is_rejected(finding_type: str | None) -> bool:
     return public_state(finding_type) == REJECTED
 
 
+def verdict_presentation(state: str) -> dict[str, Any]:
+    """Authoritative user-facing copy for one stored public verdict."""
+    presentations: dict[str, dict[str, Any]] = {
+        COMMITTED: {
+            "label": "Supported",
+            "headline": "Finding supported",
+            "summary": "This finding survived the configured falsification checks.",
+            "detail_heading": "Why it was supported",
+            "survivor_language": True,
+        },
+        SUPPORTED_ASSOCIATION: {
+            "label": "Supported association",
+            "headline": "Association supported",
+            "summary": "Association evidence is supported; standalone predictive utility is limited.",
+            "detail_heading": "What the evidence supports",
+            "survivor_language": False,
+        },
+        PROVISIONAL: {
+            "label": "Provisional",
+            "headline": "Candidate remains provisional",
+            "summary": "The candidate has encouraging evidence but is not a committed finding.",
+            "detail_heading": "Why review is still required",
+            "survivor_language": False,
+        },
+        REJECTED: {
+            "label": "Refuted",
+            "headline": "Candidate refuted",
+            "summary": "The stored verdict rejected this candidate under the configured checks.",
+            "detail_heading": "Why it was refuted",
+            "survivor_language": False,
+        },
+        NOT_SUPPORTED: {
+            "label": "Not supported",
+            "headline": "Candidate not supported",
+            "summary": "The evidence did not clear the configured support threshold.",
+            "detail_heading": "Why support was not established",
+            "survivor_language": False,
+        },
+        INCONCLUSIVE: {
+            "label": "Inconclusive",
+            "headline": "Result is inconclusive",
+            "summary": "The available validation partition was too limited for a reliable verdict.",
+            "detail_heading": "Why this was not evaluable",
+            "survivor_language": False,
+        },
+        UNRESOLVED: {
+            "label": "Not evaluable",
+            "headline": "Result not evaluable",
+            "summary": "Orbita could not produce a valid governed test for this candidate.",
+            "detail_heading": "What prevented evaluation",
+            "survivor_language": False,
+        },
+        FUNCTIONAL_FORM_REJECTED: {
+            "label": "Form rejected",
+            "headline": "Tested form rejected",
+            "summary": "This functional form failed; that alone does not refute the underlying relationship.",
+            "detail_heading": "Why this form failed",
+            "survivor_language": False,
+        },
+        ARTIFACT: {
+            "label": "Artifact",
+            "headline": "Artifact or dependency signal",
+            "summary": "This result is treated as a structural or data-quality artifact, not an independent finding.",
+            "detail_heading": "Why it is an artifact",
+            "survivor_language": False,
+        },
+        REGIME_DEPENDENT: {
+            "label": "Regime dependent",
+            "headline": "Relationship depends on subgroup",
+            "summary": "The pooled relationship is not valid as a universal directional finding.",
+            "detail_heading": "Where the relationship changes",
+            "survivor_language": False,
+        },
+    }
+    presentation = dict(presentations.get(state, presentations[UNRESOLVED]))
+    combined = " ".join(str(value) for value in presentation.values()).lower()
+    if state != COMMITTED and "surviv" in combined:
+        raise AssertionError(f"Non-committed verdict {state!r} contains survivor language")
+    return presentation
+
+
 # ---------------------------------------------------------------------------
 # Killed-candidate classification: refuted vs. not_supported vs. inconclusive
 # ---------------------------------------------------------------------------
@@ -523,6 +604,7 @@ def derive_finding_record(
         "finding_type": finding_type,
         "verdict": state,
         "verdict_reason": _VERDICT_REASON.get(state, ""),
+        "verdict_presentation": verdict_presentation(state),
         "is_candidate_hypothesis": state in {
             REJECTED, ARTIFACT, PROVISIONAL, UNRESOLVED,
             NOT_SUPPORTED, INCONCLUSIVE, FUNCTIONAL_FORM_REJECTED,
@@ -533,6 +615,9 @@ def derive_finding_record(
         "failed_checks": failed,
         "candidate_score": verdict.get("score"),
         "metric_name": finding.get("selection_metric"),
+        "selection_metric_score": finding.get("selection_metric_score"),
+        "final_validation_metric_score": finding.get("final_validation_metric_score"),
+        "final_validation_report_only": finding.get("final_validation_report_only", True),
         "baseline_score": _check_score(falsifications, "baseline"),
         "held_out_score": _check_score(falsifications, "held_out"),
         "held_out_n": _check_detail(falsifications, "held_out").get("n"),
@@ -578,6 +663,17 @@ def derive_finding_record(
     }
     if association_evidence:
         record["association_evidence"] = association_evidence
+        if candidate.get("payload", {}).get("kind") in {"binary_indicator", "predeclared_contrast"}:
+            record["contrast_analysis"] = {
+                **association_evidence,
+                "governed_validation": {
+                    "public_verdict": state,
+                    "selection_metric": finding.get("selection_metric"),
+                    "selection_metric_score": finding.get("selection_metric_score"),
+                    "final_validation_metric_score": finding.get("final_validation_metric_score"),
+                    "final_validation_report_only": finding.get("final_validation_report_only", True),
+                },
+            }
     if model_family:
         record["model_family"] = model_family
     if missingness:

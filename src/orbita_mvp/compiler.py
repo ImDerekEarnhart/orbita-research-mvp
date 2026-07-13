@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from .contrast import validate_contrast_config, validate_predictor_interpretation
 from .metrics import validate_metric
 from .table_domain import generate_table_candidates
 
@@ -87,7 +88,27 @@ class ResearchCompiler:
         confirmation_fraction: float = 0.25,
         final_validation_fraction: float = 0.15,
         target_column: str | None = None,
+        investigation_mode: str = "discovery_scan",
+        predictor_interpretation: str = "auto",
+        contrast_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        predictor_interpretation = validate_predictor_interpretation(predictor_interpretation)
+        contrast_config = validate_contrast_config(contrast_config)
+        if investigation_mode not in {
+            "discovery_scan", "targeted_prediction", "predeclared_contrast"
+        }:
+            raise ValueError("Unsupported investigation_mode")
+        if investigation_mode == "predeclared_contrast":
+            predictor_interpretation = "predeclared_contrast"
+            if contrast_config is None:
+                raise ValueError("Predeclared contrast mode requires contrast configuration")
+            target_column = contrast_config["outcome_column"]
+        if predictor_interpretation in {"binary_indicator", "predeclared_contrast"} and target_transform:
+            raise ValueError(
+                "Binary indicator and predeclared contrast effects require an untransformed outcome"
+            )
+        if predictor_interpretation == "predeclared_contrast" and evaluation_metric == "rmsle":
+            raise ValueError("RMSLE is not a meaningful default metric for a predeclared contrast")
         validate_metric(evaluation_metric)
         if ablation_metric is not None:
             validate_metric(ablation_metric)
@@ -181,6 +202,8 @@ class ResearchCompiler:
             max_candidates=max_candidates,
             exclude_columns=identifier_columns + repeated_entity_columns,
             target_column=target_column,
+            predictor_interpretation=predictor_interpretation,
+            contrast_config=contrast_config,
             near_copy_r2=near_copy_r2,
             near_copy_corr=near_copy_corr,
             near_derived_r2=near_derived_r2,
@@ -192,6 +215,11 @@ class ResearchCompiler:
         generation["confirmation_fraction"] = confirmation_fraction
         generation["final_validation_fraction"] = final_validation_fraction
         generation["scout_fraction"] = scout_fraction
+        generation["analysis_config"] = {
+            "investigation_mode": investigation_mode,
+            "predictor_interpretation": predictor_interpretation,
+            "contrast": contrast_config,
+        }
 
         quality_findings = self._quality_findings(profile)
         # Informative-missingness (MNAR) diagnostics — a measurement-process

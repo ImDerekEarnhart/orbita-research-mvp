@@ -12,6 +12,12 @@ import pandas as pd
 from orbita_discovery.core import Candidate
 
 from .artifacts import detect_structural_relations, structural_for
+from .contrast import (
+    analyze_predeclared_contrast,
+    encode_contrast,
+    validate_contrast_config,
+    validate_predictor_interpretation,
+)
 from .metrics import compute_metric, higher_is_better, validate_metric
 
 
@@ -197,12 +203,23 @@ def generate_table_candidates(
     seed: int = 20260623,
     exclude_columns: list[str] | None = None,
     target_column: str | None = None,
+    predictor_interpretation: str = "auto",
+    contrast_config: dict[str, Any] | None = None,
     near_copy_r2: float = 0.999,
     near_copy_corr: float = 0.9995,
     near_derived_r2: float = 0.999,
     nonlinear_budget: int = 40,
     max_nonlinear_per_family: int = 4,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    predictor_interpretation = validate_predictor_interpretation(predictor_interpretation)
+    contrast_config = validate_contrast_config(contrast_config)
+    if predictor_interpretation == "predeclared_contrast" and contrast_config is None:
+        raise ValueError("predeclared_contrast requires a contrast configuration")
+    if contrast_config is not None:
+        configured_outcome = contrast_config["outcome_column"]
+        if target_column is not None and target_column != configured_outcome:
+            raise ValueError("target_column must match the predeclared contrast outcome_column")
+        target_column = configured_outcome
     if len(df) < 6:
         raise ValueError("At least 6 rows are required for discovery and held-out checking")
     if target_column is not None and target_column not in df.columns:
@@ -219,16 +236,36 @@ def generate_table_candidates(
     _exclude_as_predictor: set[str] = _exclude | ({target_column} if target_column else set())
     numeric_columns = []        # eligible as predictors
     categorical_columns = []    # eligible as predictors
+    binary_indicator_columns: list[str] = []
     for column in df.columns:
         if str(column) in _exclude_as_predictor:
             continue
         name = str(column)
         numeric_fraction = float(pd.to_numeric(df[column], errors="coerce").notna().mean())
         unique = int(df[column].nunique(dropna=True))
-        if numeric_fraction >= 0.85 and unique >= 3:
-            numeric_columns.append(name)
-        elif 2 <= unique <= min(12, max(3, int(len(df) * 0.2))):
-            categorical_columns.append(name)
+        low_cardinality = 2 <= unique <= min(12, max(3, int(len(df) * 0.2)))
+        numeric = numeric_fraction >= 0.85
+        if predictor_interpretation == "categorical":
+            if low_cardinality:
+                categorical_columns.append(name)
+        elif predictor_interpretation == "binary_indicator":
+            if unique == 2:
+                binary_indicator_columns.append(name)
+                if numeric:
+                    numeric_columns.append(name)
+        elif predictor_interpretation == "predeclared_contrast":
+            # The single declared candidate is assembled below.
+            continue
+        else:
+            # A two-level numeric variable remains numeric. In auto mode it is
+            # represented once as a binary indicator rather than duplicated as
+            # a mathematically equivalent categorical candidate.
+            if numeric and unique >= 2:
+                numeric_columns.append(name)
+                if unique == 2 and predictor_interpretation == "auto":
+                    binary_indicator_columns.append(name)
+            elif low_cardinality and predictor_interpretation == "auto":
+                categorical_columns.append(name)
 
     goal_columns = _goal_columns(goal, [str(c) for c in df.columns]) if goal.strip() else []
     # When an explicit target_column is provided it is always the outcome.
@@ -237,6 +274,69 @@ def generate_table_candidates(
     if target_column and target_column not in goal_columns:
         goal_columns = goal_columns + [target_column]
     scored: list[tuple[float, dict[str, Any]]] = []
+
+    if predictor_interpretation == "predeclared_contrast":
+        assert contrast_config is not None
+        contrast_summary = analyze_predeclared_contrast(scout, contrast_config, seed=seed)
+        if contrast_summary.get("validation_status") == "not_evaluable":
+            raise ValueError(str(contrast_summary.get("reason") or "Predeclared contrast is not evaluable"))
+        contrast_column = contrast_config["contrast_column"]
+        outcome = contrast_config["outcome_column"]
+        spec = {
+            "id": _candidate_id(
+                "predeclared_contrast",
+                contrast_column,
+                str(contrast_config["positive_level"]),
+                str(contrast_config["reference_level"]),
+                outcome,
+            ),
+            "statement": (
+                f"Predeclared simulation contrast for {outcome}: "
+                f"{contrast_column}={contrast_config['positive_level']} is compared with "
+                f"{contrast_column}={contrast_config['reference_level']}."
+            ),
+            "kind": "predeclared_contrast",
+            "group": contrast_column,
+            "contrast_column": contrast_column,
+            "outcome": outcome,
+            "positive_level": contrast_config["positive_level"],
+            "reference_level": contrast_config["reference_level"],
+            "block_column": contrast_config.get("block_column"),
+            "contrast_direction": contrast_config["direction"],
+            "primary_effect": contrast_config["primary_effect"],
+            "validation_method": contrast_config["validation_method"],
+            "scout_metric": contrast_summary,
+            "parents": [],
+            "provenance": {
+                "predictor_interpretation": predictor_interpretation,
+                "predeclared": True,
+                "contrast": contrast_config,
+            },
+        }
+        generation = {
+            "strategy": "locked_scout_then_confirmation",
+            "seed": seed,
+            "scout_fraction": scout_fraction,
+            "scout_rows": len(scout),
+            "confirmation_rows": len(df) - len(scout),
+            "numeric_columns": [],
+            "categorical_columns": [contrast_column],
+            "binary_indicator_columns": [],
+            "goal_columns": goal_columns,
+            "target_column": target_column,
+            "predictor_interpretation": predictor_interpretation,
+            "contrast_config": contrast_config,
+            "generated_candidates": 1,
+            "candidate_budget": max_candidates,
+            "linear_group_budget": max_candidates,
+            "nonlinear_budget": nonlinear_budget,
+            "max_nonlinear_per_family": max_nonlinear_per_family,
+            "linear_group_selected": 1,
+            "nonlinear_selected": 0,
+            "structural_relations": [],
+            "structural_relation_count": 0,
+        }
+        return [spec], generation
 
     # Build numeric columns that CAN appear as outcomes.  When target_column is
     # specified only that column is a valid outcome; otherwise any numeric column is.
@@ -320,12 +420,6 @@ def generate_table_candidates(
                             rel[extra] = artifact[extra]
                     structural_relations.append(rel)
                 continue
-            pair = scout[[x, y]].apply(pd.to_numeric, errors="coerce").dropna()
-            if len(pair) < 5 or pair[x].nunique() < 3 or pair[y].nunique() < 3:
-                continue
-            r = float(pair[x].corr(pair[y]))
-            if not math.isfinite(r):
-                continue
             # Orientation is independent of the linear-correlation strength, so
             # nonlinear forms can be screened even when |r| ≈ 0 (e.g. a
             # symmetric inverted-U has near-zero linear correlation).
@@ -343,11 +437,19 @@ def generate_table_candidates(
             # Hard guard: target_column must not be a predictor.
             if target_column and predictor == target_column:
                 continue
+            pair = scout[[predictor, outcome]].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(pair) < 5 or pair[predictor].nunique() < 2 or pair[outcome].nunique() < 3:
+                continue
+            r = float(pair[predictor].corr(pair[outcome]))
+            if not math.isfinite(r):
+                continue
 
             # Nonlinear candidate family (quadratic / log-x / log-y / log-log).
             # Members of the same relationship family as the linear form; the
             # selection layer picks the preferred form after falsification.
-            nonlinear_specs = _nonlinear_form_specs(scout, predictor, outcome)
+            is_binary_indicator = predictor in binary_indicator_columns
+            is_two_level_numeric = int(scout[predictor].nunique(dropna=True)) == 2
+            nonlinear_specs = [] if is_two_level_numeric else _nonlinear_form_specs(scout, predictor, outcome)
             for nl_score, nl_spec in nonlinear_specs:
                 scored.append((float(nl_score), nl_spec))
 
@@ -360,16 +462,29 @@ def generate_table_candidates(
             if abs(r) < 0.2 and not nonlinear_specs:
                 continue
             direction = "positive" if r >= 0 else "negative"
+            kind = "binary_indicator" if is_binary_indicator else "linear_association"
+            unique_values = sorted(
+                (str(value) for value in scout[predictor].dropna().unique()),
+                key=lambda value: (float(value) if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value) else value),
+            )
             spec = {
-                "id": _candidate_id("linear", predictor, outcome),
-                "statement": f"{predictor} and {outcome} show a stable {direction} linear association.",
-                "kind": "linear_association",
+                "id": _candidate_id("binary" if is_binary_indicator else "linear", predictor, outcome),
+                "statement": (
+                    f"{outcome} differs between the two numeric indicator levels of {predictor}."
+                    if is_binary_indicator
+                    else f"{predictor} and {outcome} show a stable {direction} linear association."
+                ),
+                "kind": kind,
                 "predictor": predictor,
                 "outcome": outcome,
                 "expected_direction": direction,
                 "scout_metric": {"pearson_r": r, "n": int(len(pair))},
                 "parents": [],
+                "provenance": {"predictor_interpretation": predictor_interpretation},
             }
+            if is_binary_indicator:
+                spec["reference_level"] = unique_values[0]
+                spec["positive_level"] = unique_values[-1]
             scored.append((abs(r), spec))
 
     for group in categorical_columns:
@@ -419,7 +534,7 @@ def generate_table_candidates(
     # ------------------------------------------------------------------
     def _fam_key(spec: dict[str, Any]) -> tuple[str, ...]:
         kind = spec.get("kind")
-        if kind in ("linear_association", "nonlinear_association"):
+        if kind in ("linear_association", "binary_indicator", "nonlinear_association"):
             p = re.sub(r"^(log10_|log1p_|log_|ln_)", "", str(spec.get("predictor", "")).lower())
             o = re.sub(r"^(log10_|log1p_|log_|ln_)", "", str(spec.get("outcome", "")).lower())
             return ("assoc", p, o)
@@ -428,7 +543,7 @@ def generate_table_candidates(
         return ("other", spec.get("id", ""))
 
     scored.sort(key=lambda item: (-item[0], item[1]["id"]))
-    linear_group = [(s, sp) for s, sp in scored if sp.get("kind") in ("linear_association", "group_difference")]
+    linear_group = [(s, sp) for s, sp in scored if sp.get("kind") in ("linear_association", "binary_indicator", "group_difference")]
     nonlinear = [(s, sp) for s, sp in scored if sp.get("kind") == "nonlinear_association"]
 
     # 1. Linear + group keep the original global budget (reproduces the
@@ -439,7 +554,7 @@ def generate_table_candidates(
     # Strongest linear member per family (linear_group is already sorted by score).
     strongest_linear: dict[tuple[str, ...], dict[str, Any]] = {}
     for _s, sp in linear_group:
-        if sp.get("kind") == "linear_association":
+        if sp.get("kind") in ("linear_association", "binary_indicator"):
             strongest_linear.setdefault(_fam_key(sp), sp)
 
     # 2. Nonlinear from its OWN budget, capped per family.
@@ -488,8 +603,11 @@ def generate_table_candidates(
         "confirmation_rows": len(df) - len(scout),
         "numeric_columns": numeric_columns,
         "categorical_columns": categorical_columns,
+        "binary_indicator_columns": binary_indicator_columns,
         "goal_columns": goal_columns,
         "target_column": target_column,
+        "predictor_interpretation": predictor_interpretation,
+        "contrast_config": contrast_config,
         "generated_candidates": len(candidates),
         "candidate_budget": max_candidates,
         "linear_group_budget": max_candidates,
@@ -572,6 +690,7 @@ class UploadedTableDomain:
         target_transform: str | None = None,
         evaluation_metric: str = "r2",
         time_column: str | None = None,
+        block_column: str | None = None,
     ):
         if not candidates:
             raise ValueError("The approved plan contains no testable candidates")
@@ -588,25 +707,60 @@ class UploadedTableDomain:
         self.target_transform = target_transform
         self.evaluation_metric = evaluation_metric
         self.time_column = time_column if (time_column and time_column in self.df.columns) else None
+        self.block_column = block_column if (block_column and block_column in self.df.columns) else None
+        self.partition_block_ids: dict[str, list[str]] = {}
 
         n = len(self.df)
-        if self.time_column is not None:
+        if self.block_column is not None:
+            # Block-preserving partitioning below owns the ordering. A matched
+            # condition always takes precedence over a row-level time split.
+            indices = []
+        elif self.time_column is not None:
             # Chronological validation: earliest rows train, latest rows validate.
             order = pd.to_numeric(self.df[self.time_column], errors="coerce")
             indices = list(order.sort_values(kind="mergesort").index)
-        else:
+        elif self.block_column is None:
             indices = list(range(n))
             random.Random(seed).shuffle(indices)
 
-        scout_cut = max(3, min(n - 3, int(n * scout_fraction)))
-        sel_cut = scout_cut + max(1, int(n * confirmation_fraction))
-        # Final validation: whatever remains after scout + selection.
-        # Clamp so we always have at least 1 row in final_validation (if n allows).
-        sel_cut = min(sel_cut, n - 1) if n > scout_cut + 1 else scout_cut + 1
+        if self.block_column is not None:
+            block_values = self.df[self.block_column]
+            block_keys = block_values.astype(str).where(
+                block_values.notna(),
+                pd.Series([f"__missing_block_row_{i}" for i in range(n)], index=self.df.index),
+            )
+            self._block_keys = block_keys
+            blocks = list(dict.fromkeys(block_keys.tolist()))
+            if len(blocks) < 3:
+                raise ValueError("Matched/block validation requires at least three distinct blocks")
+            random.Random(seed).shuffle(blocks)
+            scout_block_cut = max(1, min(len(blocks) - 2, int(len(blocks) * scout_fraction)))
+            selection_block_count = max(1, int(len(blocks) * confirmation_fraction))
+            selection_block_cut = min(
+                len(blocks) - 1,
+                scout_block_cut + selection_block_count,
+            )
+            scout_blocks = blocks[:scout_block_cut]
+            selection_blocks = blocks[scout_block_cut:selection_block_cut]
+            final_blocks = blocks[selection_block_cut:]
+            self.partition_block_ids = {
+                "scout": list(scout_blocks),
+                "selection": list(selection_blocks),
+                "final_validation": list(final_blocks),
+            }
+            self.scout = self.df.loc[block_keys.isin(scout_blocks)].copy()
+            self.selection = self.df.loc[block_keys.isin(selection_blocks)].copy()
+            self.final_validation = self.df.loc[block_keys.isin(final_blocks)].copy()
+        else:
+            scout_cut = max(3, min(n - 3, int(n * scout_fraction)))
+            sel_cut = scout_cut + max(1, int(n * confirmation_fraction))
+            # Final validation: whatever remains after scout + selection.
+            # Clamp so we always have at least 1 row in final_validation (if n allows).
+            sel_cut = min(sel_cut, n - 1) if n > scout_cut + 1 else scout_cut + 1
 
-        self.scout = self.df.iloc[indices[:scout_cut]].copy()
-        self.selection = self.df.iloc[indices[scout_cut:sel_cut]].copy()
-        self.final_validation = self.df.iloc[indices[sel_cut:]].copy()
+            self.scout = self.df.iloc[indices[:scout_cut]].copy()
+            self.selection = self.df.iloc[indices[scout_cut:sel_cut]].copy()
+            self.final_validation = self.df.iloc[indices[sel_cut:]].copy()
 
         # Legacy alias used by tests that directly access .confirmation
         self.confirmation = self.selection
@@ -638,6 +792,15 @@ class UploadedTableDomain:
         if seed in {0, 1} or len(confirmation) < 4:
             return train, confirmation
         rng = np.random.default_rng(seed)
+        if self.block_column is not None and self.block_column in confirmation.columns:
+            blocks = confirmation[self.block_column].astype(str)
+            unique_blocks = list(dict.fromkeys(blocks.tolist()))
+            picks = rng.integers(0, len(unique_blocks), size=len(unique_blocks))
+            sampled = [
+                confirmation.loc[blocks == unique_blocks[index]].copy()
+                for index in picks
+            ]
+            return train, pd.concat(sampled, ignore_index=True)
         picks = rng.integers(0, len(confirmation), size=len(confirmation))
         return train, confirmation.iloc[picks].copy()
 
@@ -656,6 +819,17 @@ class UploadedTableDomain:
         n = len(pool)
         if n < 6:
             return pool.copy(), pool.copy()
+        if self.block_column is not None and self.block_column in pool.columns:
+            block_values = pool[self.block_column].astype(str)
+            blocks = list(dict.fromkeys(block_values.tolist()))
+            if len(blocks) < 3:
+                return pool.copy(), pool.iloc[0:0].copy()
+            np.random.default_rng(1_000_003 + seed).shuffle(blocks)
+            cut = max(1, min(len(blocks) - 1, int(len(blocks) * train_fraction)))
+            train_blocks = set(blocks[:cut])
+            train = pool.loc[block_values.isin(train_blocks)].copy()
+            val = pool.loc[~block_values.isin(train_blocks)].copy()
+            return train, val
         if self.time_column is not None and self.time_column in pool.columns:
             # Chronological repeated-refit: order by time and vary the train/val
             # cut point per seed (train earlier, validate later) — never shuffle
@@ -692,6 +866,29 @@ class UploadedTableDomain:
             return {
                 "kind": kind, "valid": True,
                 "intercept": float(beta[0]), "slope": float(beta[1]),
+                "target_transform": self.target_transform,
+            }
+        if kind in {"binary_indicator", "predeclared_contrast"}:
+            predictor = c.payload.get("predictor") or c.payload.get("contrast_column") or c.payload.get("group")
+            outcome = c.payload["outcome"]
+            encoded = encode_contrast(
+                train,
+                outcome_column=outcome,
+                contrast_column=str(predictor),
+                positive_level=str(c.payload["positive_level"]),
+                reference_level=str(c.payload["reference_level"]),
+            )
+            if len(encoded) < 3 or encoded["__x"].nunique() < 2:
+                return {"kind": kind, "valid": False}
+            y = _apply_transform(encoded["__y"].to_numpy(float), self.target_transform)
+            x = encoded["__x"].to_numpy(float)
+            X = np.column_stack([np.ones(len(x)), x])
+            beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+            return {
+                "kind": kind,
+                "valid": True,
+                "intercept": float(beta[0]),
+                "slope": float(beta[1]),
                 "target_transform": self.target_transform,
             }
         if kind == "composite_linear":
@@ -768,6 +965,28 @@ class UploadedTableDomain:
             y_t = _apply_transform(y_raw[mask].to_numpy(float), self.target_transform)
             return np.stack([y_t, pred])  # [true, pred] for downstream
 
+        if kind in {"binary_indicator", "predeclared_contrast"}:
+            predictor = c.payload.get("predictor") or c.payload.get("contrast_column") or c.payload.get("group")
+            outcome = c.payload["outcome"]
+            encoded = encode_contrast(
+                test,
+                outcome_column=outcome,
+                contrast_column=str(predictor),
+                positive_level=str(c.payload["positive_level"]),
+                reference_level=str(c.payload["reference_level"]),
+            )
+            if len(encoded) < 3 or encoded["__x"].nunique() < 2:
+                return None
+            slope = float(model["slope"])
+            direction = c.payload.get("contrast_direction")
+            if direction == "positive_greater_than_reference" and slope <= 0:
+                return None
+            if direction == "positive_less_than_reference" and slope >= 0:
+                return None
+            y = _apply_transform(encoded["__y"].to_numpy(float), self.target_transform)
+            pred = float(model["intercept"]) + slope * encoded["__x"].to_numpy(float)
+            return np.stack([y, pred])
+
         if kind == "composite_linear":
             predictors = model["predictors"]
             y_name = c.payload["outcome"]
@@ -838,6 +1057,21 @@ class UploadedTableDomain:
         y_orig = _invert_transform(y_t_tf, self.target_transform)
         pred_orig = _invert_transform(pred_tf, self.target_transform)
         return compute_metric(self.evaluation_metric, y_orig, pred_orig)
+
+    def score_metric_or_none(
+        self,
+        c: Candidate,
+        model: dict[str, Any],
+        test: pd.DataFrame,
+    ) -> float | None:
+        """Return a genuine finite metric score, otherwise preserve unavailability."""
+        if not model.get("valid") or len(test) < 3:
+            return None
+        data = self._predict_raw(c, model, test)
+        if data is None:
+            return None
+        value = self.score_metric(c, model, test)
+        return float(value) if math.isfinite(float(value)) else None
 
     def baseline_score(self, test: Any) -> float:
         return 0.0
