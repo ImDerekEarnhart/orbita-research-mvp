@@ -21,7 +21,10 @@ Validation run:
 - Backend regression chunks passed: semantics/target-leakage/composite, two-artifact, phase2b/data-lifecycle/graph-scoping/backend-hardening.
 - Stress representative E2E passed; full stress file exceeds local timeout because it reruns full discovery many times.
 
-Remaining:
-- Deploy staging only after frontend commit is paired.
-- Validate T63 fixture through staging API/UI.
+Staging:
+- Backend deployed to staging: c88fc4f4-4bdc-40b1-874c-e7a858e69408.
+- Direct backend T63 predeclared-contrast live probe passed: run completed, provisional, contrast_analysis and verdict_presentation present.
 - Production untouched.
+
+Remaining:
+- Frontend/worker notes are tracked in the frontend handoff.
